@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"tkan/internal/backend"
+	"tkan/internal/backend/filestore"
 	"tkan/internal/task"
 )
 
@@ -650,7 +651,7 @@ func TestLockTimesOutWithAClearErrorInsteadOfHanging(t *testing.T) {
 	b := be.(*Backend)
 	b.lockTimeout = 150 * time.Millisecond
 
-	release, err := lockFile(p+".lock", time.Second) // another tkan holds the lock
+	release, err := filestore.LockFile(p+".lock", time.Second) // another tkan holds the lock
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +681,7 @@ func TestLockTimesOutWithAClearErrorInsteadOfHanging(t *testing.T) {
 func TestLockWaitsForAShortHolder(t *testing.T) {
 	p := write(t, sample)
 	be, _ := Open(mk(p))
-	release, err := lockFile(p+".lock", time.Second)
+	release, err := filestore.LockFile(p+".lock", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

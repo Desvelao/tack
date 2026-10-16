@@ -1,6 +1,6 @@
 //go:build windows
 
-package csvbackend
+package filestore
 
 import (
 	"fmt"
@@ -9,10 +9,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// lockFile takes an exclusive LockFileEx lock on the sidecar file path (created
+// LockFile takes an exclusive LockFileEx lock on the sidecar file path (created
 // if missing); it fails after timeout if another process keeps it. Compile-
 // checked only: it has not been run on Windows.
-func lockFile(path string, timeout time.Duration) (func(), error) {
+func LockFile(path string, timeout time.Duration) (func(), error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -41,7 +41,7 @@ func lockFile(path string, timeout time.Duration) (func(), error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return func() {
-		_ = windows.UnlockFileEx(h, 0, 1, 0, new(windows.Overlapped))
+		_ = windows.UnLockFileEx(h, 0, 1, 0, new(windows.Overlapped))
 		windows.CloseHandle(h)
 	}, nil
 }

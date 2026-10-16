@@ -15,20 +15,17 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"tkan/internal/backend"
+	"tkan/internal/backend/filestore"
 	"tkan/internal/task"
 )
 
 func init() { backend.RegisterType("csv", Open, ".csv") }
-
-// lockTimeout is how long a write waits for another tkan holding the file lock.
-const lockTimeout = 5 * time.Second
 
 const bom = "\xef\xbb\xbf"
 
@@ -131,11 +128,6 @@ func (s schema) ref(field string) colRef {
 	return colRef{name: field}
 }
 
-type stamp struct {
-	mod  time.Time
-	size int64
-}
-
 // Backend implements backend.Backend (and backend.Watcher) over a CSV file.
 type Backend struct {
 	mu          sync.Mutex
@@ -145,7 +137,7 @@ type Backend struct {
 	colField    []string // source column index -> logical field ("" = extra)
 	extra       []string // source column index -> unique Extra key (for unmapped columns)
 	tasks       []task.Task
-	stamp       stamp
+	stamp       filestore.Stamp
 	crlf        bool          // file uses \r\n record terminators; preserved on write
 	bom         bool          // file starts with a UTF-8 BOM; preserved on write
 	lockTimeout time.Duration // 0 = the default (tests shorten it)
@@ -273,7 +265,7 @@ func (b *Backend) Changed() (bool, error) {
 		}
 		b.lastCheck = now
 	}
-	cur, err := statFile(b.path)
+	cur, err := filestore.StatFile(b.path)
 	if err != nil {
 		return false, err
 	}
@@ -303,9 +295,9 @@ func (b *Backend) mutate(fn func() error) error {
 	// Serialise read-modify-write across processes (the TUI plus scripted calls).
 	timeout := b.lockTimeout
 	if timeout <= 0 {
-		timeout = lockTimeout
+		timeout = filestore.LockTimeout
 	}
-	unlock, err := lockFile(b.path+".lock", timeout)
+	unlock, err := filestore.LockFile(b.path+".lock", timeout)
 	if err != nil {
 		return fmt.Errorf("lock %s: %w", b.path, err)
 	}
@@ -332,7 +324,7 @@ func (b *Backend) mutate(fn func() error) error {
 }
 
 func (b *Backend) refresh() error {
-	cur, err := statFile(b.path)
+	cur, err := filestore.StatFile(b.path)
 	if err != nil {
 		return err
 	}
@@ -340,14 +332,6 @@ func (b *Backend) refresh() error {
 		return nil
 	}
 	return b.reload()
-}
-
-func statFile(path string) (stamp, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return stamp{}, err
-	}
-	return stamp{st.ModTime(), st.Size()}, nil
 }
 
 func field(t *task.Task, name string) *string { return t.FieldPtr(name) }
@@ -532,7 +516,7 @@ func (b *Backend) reload() (err error) {
 		tasks = append(tasks, t)
 	}
 	b.tasks = tasks
-	b.stamp = stamp{st.ModTime(), st.Size()}
+	b.stamp = filestore.Stamp{Mod: st.ModTime(), Size: st.Size()}
 	return nil
 }
 
@@ -565,19 +549,6 @@ func (b *Backend) write() error {
 	}
 	ncols := len(colField)
 
-	// Write through a symlink instead of replacing it with a regular file.
-	target := b.path
-	if real, err := filepath.EvalSymlinks(b.path); err == nil {
-		target = real
-	}
-	dir := filepath.Dir(target)
-	tmp, err := os.CreateTemp(dir, ".tkan-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := func() { tmp.Close(); os.Remove(tmpName) }
-
 	var content bytes.Buffer
 	bw := bufio.NewWriter(&content)
 	var rec bytes.Buffer
@@ -597,7 +568,6 @@ func (b *Backend) write() error {
 	}
 	if b.sch.header {
 		if err := emit(header); err != nil {
-			cleanup()
 			return err
 		}
 	}
@@ -612,12 +582,10 @@ func (b *Backend) write() error {
 			}
 		}
 		if err := emit(row); err != nil {
-			cleanup()
 			return err
 		}
 	}
 	if err := bw.Flush(); err != nil {
-		cleanup()
 		return err
 	}
 	data := content.Bytes()
@@ -627,48 +595,16 @@ func (b *Backend) write() error {
 	if b.bom {
 		data = append([]byte(bom), data...)
 	}
-	if _, err := tmp.Write(data); err != nil {
-		cleanup()
-		return err
-	}
-	// Flush to disk before the rename so a power loss can't leave an empty file.
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if st, err := os.Stat(target); err == nil {
-		_ = os.Chmod(tmpName, st.Mode().Perm())
-	}
-	// Stamp the temp file (rename keeps its mtime and size), so an external
-	// write landing after the rename differs from the stamp and is noticed.
-	cur, err := statFile(tmpName)
+	cur, err := filestore.WriteAtomic(b.path, data)
 	if err != nil {
-		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, target); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	syncDir(dir)
 	if b.sch.header {
 		b.header = header
 	}
 	b.colField = colField
 	b.stamp = cur
 	return nil
-}
-
-// syncDir makes the rename durable; best effort, some filesystems don't support it.
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		d.Close()
-	}
 }
 
 var (

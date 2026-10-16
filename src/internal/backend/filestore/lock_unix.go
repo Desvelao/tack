@@ -1,6 +1,6 @@
 //go:build !windows
 
-package csvbackend
+package filestore
 
 import (
 	"fmt"
@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// lockFile takes an exclusive advisory lock on path (created if missing) and
+// LockFile takes an exclusive advisory lock on path (created if missing) and
 // returns the function that releases it. The lock lives on a sidecar file
 // because the data file itself is replaced by rename on every write. If another
 // process holds it for longer than timeout the call fails instead of hanging.
-func lockFile(path string, timeout time.Duration) (func(), error) {
+func LockFile(path string, timeout time.Duration) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
