@@ -1,0 +1,19 @@
+bin/
+*.tmp
+*.lock
+# personal backlog and config; tkan.example.yaml is the tracked sample
+/tasks.csv
+/tkan.yaml
+/tkan.yml
+/.tkan.yaml
+/.tkan.yml
+.env
+.env.*
+*.pem
+*.key
+.idea/
+.vscode/
+.claude/
+dist/
+coverage.out
+*.exe

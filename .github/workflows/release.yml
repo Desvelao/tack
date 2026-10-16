@@ -1,0 +1,92 @@
+name: release
+
+# On demand (Actions tab > release > Run workflow): builds every binary and keeps
+# them as a workflow artifact. On a vX.Y.Z tag: same, then publishes a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (default: the VERSION file)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          file_version=$(tr -d '[:space:]' < VERSION)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$file_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match VERSION file ($file_version)"
+              exit 1
+            fi
+          else
+            version="${INPUT_VERSION:-$file_version}"
+            version="${version#v}"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a semantic version"
+            exit 1
+          fi
+          script_version=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' install.sh)
+          if [ "$script_version" != "$file_version" ]; then
+            echo "::error::install.sh VERSION ($script_version) does not match the VERSION file ($file_version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check (gofmt, vet, tests)
+        run: make check
+
+      - name: Build all targets
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: make release
+
+      - name: Verify checksums and version stamp
+        working-directory: bin
+        run: |
+          sha256sum -c SHA256SUMS
+          v="tkan ${{ steps.ver.outputs.version }}"
+          case "$(./tkan version)" in "$v"|"$v (built "*")") ;; *) echo "::error::unexpected version output"; exit 1;; esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tkan-${{ steps.ver.outputs.version }}
+          path: bin/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tkan-${{ needs.build.outputs.version }}
+          path: dist
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            $(case "$GITHUB_REF_NAME" in *-*) echo --prerelease;; esac)

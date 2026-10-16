@@ -1,0 +1,37 @@
+name: tkan
+
+x-dev: &dev
+  build:
+    context: .
+    target: dev
+  image: tkan-dev
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  working_dir: /app/src
+  volumes:
+    - .:/app
+    - gomod:/go/pkg/mod
+    - gocache:/go-cache
+
+services:
+  # Interactive shell / TUI runs: `docker compose run --rm dev go run ./cmd/tkan /app/tasks.csv`
+  dev:
+    <<: *dev
+    stdin_open: true
+    tty: true
+
+  test:
+    <<: *dev
+    command: go test ./...
+
+  # Static binary into ./bin. Cross-compile with GOOS/GOARCH/GOARM and OUT, see Makefile.
+  build:
+    <<: *dev
+    environment:
+      GOOS: ${GOOS:-linux}
+      GOARCH: ${GOARCH:-amd64}
+      GOARM: ${GOARM:-}
+    command: go build -trimpath -ldflags="-s -w -X main.version=${VERSION:-dev} -X main.buildDate=${BUILD_DATE:-}" -o /app/${OUT:-bin/tkan} ./cmd/tkan
+
+volumes:
+  gomod:
+  gocache:

@@ -1,0 +1,70 @@
+# tkan.yaml - example configuration. Save it as ./tkan.yaml or pass it with
+# `-c FILE` / $TKAN_CONFIG. Reference: docs/config.md
+
+# Optional: the backend `add` creates in and bare IDs refer to ($TKAN_BACKEND overrides).
+# default_backend: tasks
+
+# The backends to show on one board. Each entry has:
+#   type     csv | custom
+#   name     optional; default is the type plus its 1-based position (csv1, custom2).
+#            Cards show it, and `-b NAME` / NAME:ID selects it on the command line.
+#   options  settings of that type
+backend:
+  - type: csv
+    name: tasks
+    options:
+      source: tasks.csv   # path relative to this file
+      header: true        # false = no header row; then fields MUST be positions
+      fields:             # logical field -> column NAME in the header, or 1-based POSITION
+        id: id            # required
+        title: title      # required
+        status: state     # required: the column that decides the kanban column
+        description: 4    # optional (name or position)
+        priority: priority
+        notes: notes
+        type: type
+        # assignee: owner      # optional: assignee, due, start (YYYY-MM-DD), labels
+        # due: due
+        # Columns that are not listed here are preserved untouched.
+
+  # A command that answers a small JSON protocol (see docs/backends.md).
+  # - type: custom
+  #   name: tracker
+  #   options:
+  #     command: [./tracker.sh, --project, demo]
+  #     timeout: 10s
+  #     poll: 5s          # optional: re-run `list` this often to pick up outside changes (default: never)
+
+board:
+  # Columns, left to right. `values` are the raw status values shown in the
+  # column (default: just the column name). `write` is what a move into the
+  # column stores (default: the first value).
+  columns:
+    - name: Backlog
+      values: [pending, todo, ""]   # "" also catches rows with an empty status
+    - name: Doing
+      values: [in_progress, wip]
+      write: in_progress
+      limit: 3                      # optional WIP limit: warn above 3 cards
+      color: "#ffaf00"              # optional: header / selected-card colour (0-255 or #rrggbb)
+    - name: Done
+      values: [done, closed]
+    - name: Failed
+      values: [failed]
+  # What to do with raw values no column claims:
+  #   append (default) one extra column per value, after the configured ones
+  #   other            one trailing "other" column
+  #   hide             do not show those cards
+  unmapped: append
+  # Fields a plain filter term (`/` in the board, `list -q`) is matched against.
+  # Default shown. Any field, including unmapped CSV columns by name, can be
+  # listed here and targeted explicitly in a filter: priority=high col:doing
+  search: [id, title, description, notes]
+  # Group the cards of each column (z cycles it on the board): priority, type, assignee, labels, ...
+  # group: priority
+  # Saved filters: `v` cycles them on the board, `tkan list -v NAME` applies one.
+  views:
+    - {name: urgent, query: "priority=high col!:done"}
+  # Display order of the cards in each column; backends are never changed.
+  # `-` = descending; a list gives an explicit order. `s` / `S` in the board try others.
+  # sort: [priority: [high, medium, low], -id]

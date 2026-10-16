@@ -1,0 +1,11 @@
+bin/
+.git/
+docs/
+tkan.yaml
+tkan.yml
+.tkan.yaml
+.tkan.yml
+tasks.csv
+.env
+.env.*
+.github/
