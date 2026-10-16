@@ -84,7 +84,42 @@ returns `backend.Example{Section, Statuses, Notes}`:
 | Type | Package | Notes |
 |---|---|---|
 | `csv` | `internal/backend/csv` | `options.source`/`header`/`fields` map the file by header name or position, headerless files, atomic write (fsync + rename, symlinks followed), CRLF, BOM and a missing final newline preserved, writes serialised across processes with an advisory lock on `<file>.lock` (a harmless empty sidecar file; a writer waits up to 5 s for another tkan, then fails with `locked by another tkan`; implemented with flock on Unix and LockFileEx on Windows, the latter never run there), implements `Watcher` |
+| `sqlite` | `internal/backend/sqlite` | a table of a SQLite database, accessed through a SQLite command line tool (no library linked, so the binary stays static); `options.source`/`table`/`fields`/`cli`/`poll` (below); writes in one `BEGIN IMMEDIATE` transaction; implements `Watcher` and `Reloader` |
 | `custom` | `internal/backend/custom` | runs an external command per operation, JSON over stdin/stdout (below); implements `Watcher` only when `options.poll` is set, otherwise press `r` to reload |
+
+## The `sqlite` backend
+
+```yaml
+backend:
+  - type: sqlite
+    options:
+      source: tasks.db
+      table: tasks
+      # cli: sqlite3                          # default: first installed of sqlite3, sqlite
+      fields: {id: key, title: summary, status: state}   # only where the column name differs
+```
+
+tkan does not link a SQLite library. For every operation it starts a SQLite command line tool,
+writes one SQL script to its stdin and reads the rows as JSON (`-json`) from its stdout, so the CLI
+must be installed (`apt install sqlite3`, `apk add sqlite`, `brew install sqlite`, ...) and be
+SQLite 3.33 or newer.
+
+- **Which CLI.** `options.cli` (a program name or a list, no shell) if set; otherwise the first of
+  `sqlite3`, `sqlite` that is on `PATH` and prints JSON. When none works the error lists what was
+  tried. A list lets you run the tool elsewhere, e.g. `[docker, exec, -i, db, sqlite3]` (then
+  `source` is the path inside the container and outside edits are not noticed by `Changed`).
+- **Safety.** Values never travel as SQL text: they are sent as hex literals
+  (`CAST(X'..' AS TEXT)`), so no quote, `;` or leading `.` in a title can alter the statement or reach
+  the CLI as a dot command. Table and column names come from the config and are quoted.
+- **Concurrency.** Writes run in one `BEGIN IMMEDIATE` transaction with a 5 s busy timeout, so
+  several tkan processes (and other programs using the database) are serialised by SQLite itself;
+  there is no lock file. Updates touch only the mapped columns (and extras the task carries).
+- **Changes by others.** `Changed` compares the modification time and size of the database file and
+  its `-wal`; see `poll` in [config.md](config.md#sqlite-options).
+- **Limits.** One process per operation (a start-up cost per `list`/write, noticeable on a Raspberry
+  Pi with a huge table); `WITHOUT ROWID` tables are not supported; rows come back in the table's
+  natural (rowid) order; a database that needs an encryption key or a special build must be
+  reached through `options.cli`.
 
 ## The `custom` backend
 

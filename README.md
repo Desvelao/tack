@@ -2,7 +2,7 @@
 
 A small terminal kanban board for a task backlog, plus non-interactive subcommands
 (`list`, `show`, `add`, `edit`, `set-status`, `delete`, ...) for scripts and AI agents.
-Tasks live in pluggable backends (CSV and a command-based `custom` backend today).
+Tasks live in pluggable backends (CSV, SQLite through its command line tool, and a command-based `custom` backend today).
 A single static binary: runs on Linux, macOS, Windows and Raspberry Pi (ARM), at 80x24.
 
 > Pre-1.0: the config format, CSV schema and CLI may still change.
@@ -72,7 +72,7 @@ tkan set-status 12 Done
 - [docs/usage.md](docs/usage.md): building, keys, subcommands
 - [docs/config.md](docs/config.md): `tkan.yaml`, board columns, config lookup
 - [docs/filter.md](docs/filter.md): filter language
-- [docs/backends.md](docs/backends.md): CSV and custom backends
+- [docs/backends.md](docs/backends.md): CSV, SQLite and custom backends
 - [docs/AGENTS.md](docs/AGENTS.md): using tkan from scripts and agents
 - [AGENTS.md](AGENTS.md): developing this repo
 

@@ -10,7 +10,7 @@
 #   file: audit.jsonl
 
 # The backends to show on one board. Each entry has:
-#   type     csv | custom
+#   type     csv | sqlite | custom
 #   name     optional; default is the type plus its 1-based position (csv1, custom2).
 #            Cards show it, and `-b NAME` / NAME:ID selects it on the command line.
 #   options  settings of that type
@@ -32,6 +32,15 @@ backend:
         # assignee: owner      # optional: assignee, due, start (YYYY-MM-DD), labels
         # due: due
         # Columns that are not listed here are preserved untouched.
+
+  # A SQLite database, through the sqlite3 command line tool (must be installed).
+  # - type: sqlite
+  #   options:
+  #     source: tasks.db    # created by the first `tkan add`
+  #     table: tasks
+  #     # cli: sqlite3      # default: first installed of sqlite3, sqlite
+  #     # poll: watch       # watch | none | seconds, as for csv
+  #     # fields: {title: summary, status: state}   # where column names differ
 
   # A command that answers a small JSON protocol (see docs/backends.md).
   # - type: custom

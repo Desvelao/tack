@@ -14,20 +14,7 @@ import (
 
 func init() { backend.RegisterExample("csv", example) }
 
-// synonyms lists header names recognised for each logical field, best first.
-var synonyms = map[string][]string{
-	"id":          {"id", "key", "ticket", "number", "#"},
-	"title":       {"title", "summary", "name", "subject"},
-	"status":      {"status", "state", "stage", "column"},
-	"description": {"description", "desc", "details", "body"},
-	"priority":    {"priority", "prio", "severity"},
-	"notes":       {"notes", "note", "comment", "comments"},
-	"type":        {"type", "kind", "category"},
-	"assignee":    {"assignee", "owner", "assigned_to", "assigned"},
-	"due":         {"due", "due_date", "deadline"},
-	"start":       {"start", "start_date", "begin"},
-	"labels":      {"labels", "label", "tags", "tag"},
-}
+var synonyms = backend.Synonyms
 
 var plainScalar = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 

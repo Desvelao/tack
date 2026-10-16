@@ -19,6 +19,7 @@ import (
 	"tkan/internal/backend"
 	_ "tkan/internal/backend/csv"    // register the csv backend
 	_ "tkan/internal/backend/custom" // register the custom (command) backend
+	_ "tkan/internal/backend/sqlite" // register the sqlite (CLI) backend
 	"tkan/internal/board"
 	"tkan/internal/config"
 	"tkan/internal/query"

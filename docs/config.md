@@ -72,7 +72,7 @@ Unknown keys are rejected. In particular the former single-backend format (`back
 
 | Key | Default | Meaning |
 |---|---|---|
-| `type` | required | Backend type: `csv` or `custom`. |
+| `type` | required | Backend type: `csv`, `sqlite` or `custom`. |
 | `name` | `<type><position>` | Unique name (case-insensitive; letters, digits, `_`, `.` and `-` only). The default uses the 1-based position in the list: `csv1`, `custom2`, ... Shown on every card and usable as `-b NAME`, `NAME:ID` and the `backend` filter field. |
 | `options` | | Settings of the type, below. |
 
@@ -96,6 +96,22 @@ Logical fields: `id`, `title`, `status` (required), `description`, `priority`, `
   first time a task gets a value for it.
 - Two fields cannot point at the same column.
 - IDs may be any string. New tasks get `max(numeric id) + 1` (so `1` if all ids are like `A-1`).
+
+### `sqlite` options
+
+Needs a SQLite command line tool on the machine (see [backends.md](backends.md#the-sqlite-backend)); tkan links no SQLite library.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `source` | required | Path of the database file (relative to the config). It may not exist yet: the first `add` creates it. |
+| `table` | `tasks` | Table (or view) that holds the tasks. Created with one column per field if it does not exist. |
+| `cli` | first installed of `sqlite3`, `sqlite` | The CLI to run: a program name, or a list (program and arguments, no shell) such as `[docker, exec, -i, db, sqlite3]`. It must understand `-json` (SQLite 3.33 or newer). |
+| `poll` | `watch` | As for csv: `watch` checks the database file (and its `-wal`) every second, `none` reads once at start, a number of seconds checks at most that often. `r` reloads now. |
+| `fields.<field>` | the column named `<field>` | Which column holds the logical field (case-insensitive). `id`, `title` and `status` are required. |
+
+- Unmapped columns are kept as extra fields and left untouched by updates.
+- New tasks get the next rowid when `id` is an `INTEGER PRIMARY KEY`, otherwise `max(numeric id) + 1`.
+- Values are stored as text; an empty field is stored as `''`, never `NULL`. NUL characters are rejected.
 
 ### `custom` options
 

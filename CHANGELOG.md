@@ -5,6 +5,9 @@ before 1.0 the config format, CSV schema and CLI may still change.
 
 ## [Unreleased]
 
+- `sqlite` backend: tasks in a table of a SQLite database, configurable column mapping (`source`, `table`, `fields`), `poll`, and `cli` to choose the SQLite command line tool (default: first installed of `sqlite3`, `sqlite`). It runs the CLI, no SQLite library is linked, so the binary stays static; `tkan init` detects `.db`, `.sqlite` and `.sqlite3` files.
+- The `poll` option parser is shared (`backend.ParsePoll`).
+
 ## [0.1.1] - 2026-10-16
 
 - Audit trail of reloads (ok/error) and create/update/delete, from the board and the subcommands: `A` in the board, `tkan audit`, filterable by `op`, `date`, `details`, `result`, `source`, `backend`, `id`, `session`. In memory by default; `audit.file` (`.jsonl` or `.csv`) keeps it across sessions and marks this and the previous one.

@@ -1,6 +1,6 @@
 # Using tkan from an AI agent
 
-Read this if you need to read or update a task backlog (usually `tasks.csv`) with tkan.
+Read this if you need to read or update a task backlog (usually `tasks.csv`, or a SQLite table: the `sqlite` backend needs the `sqlite3` CLI installed) with tkan.
 If you are changing tkan's own source, read the root `AGENTS.md` instead.
 
 ## Rules

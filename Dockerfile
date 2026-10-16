@@ -3,7 +3,7 @@ ARG GO_VERSION=1.24.13
 
 # dev: toolchain image used by docker-compose (source is bind-mounted).
 FROM golang:${GO_VERSION}-alpine AS dev
-RUN apk add --no-cache git make \
+RUN apk add --no-cache git make sqlite \
     && mkdir -p /go-cache /go/pkg/mod /app && chmod -R 777 /go-cache /go /app
 ENV CGO_ENABLED=0 \
     GOFLAGS=-buildvcs=false \

@@ -28,11 +28,11 @@ func TestPollOptionParsing(t *testing.T) {
 		"":            {},
 		"poll: watch": {},
 		"poll: WATCH": {},
-		"poll: none":  {kind: pollNone},
-		"poll: 5":     {pollEvery, 5 * time.Second},
-		`poll: "5"`:   {pollEvery, 5 * time.Second},
-		"poll: 5s":    {pollEvery, 5 * time.Second},
-		"poll: 1m":    {pollEvery, time.Minute},
+		"poll: none":  {Kind: pollNone},
+		"poll: 5":     {Kind: pollEvery, Interval: 5 * time.Second},
+		`poll: "5"`:   {Kind: pollEvery, Interval: 5 * time.Second},
+		"poll: 5s":    {Kind: pollEvery, Interval: 5 * time.Second},
+		"poll: 1m":    {Kind: pollEvery, Interval: time.Minute},
 	}
 	for y, want := range ok {
 		b, err := Open(csvOpts(t, write(t, pollCSV), y))

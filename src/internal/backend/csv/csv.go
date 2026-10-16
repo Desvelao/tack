@@ -32,9 +32,9 @@ const lockTimeout = 5 * time.Second
 
 const bom = "\xef\xbb\xbf"
 
-var logicalFields = []string{"id", "title", "description", "status", "priority", "notes", "type", "assignee", "due", "start", "labels"}
+var logicalFields = backend.LogicalFields
 
-var required = map[string]bool{"id": true, "title": true, "status": true}
+var required = backend.RequiredFields
 
 // colRef points at a source column by header name or by 1-based position.
 type colRef struct {
@@ -55,50 +55,16 @@ type schema struct {
 	poll   pollMode
 }
 
-// pollMode says when the backend notices changes made to the file by others.
-type pollMode struct {
-	kind     pollKind
-	interval time.Duration // pollEvery only
-}
-
-type pollKind int
+// The poll option is shared with the other backends (see backend.ParsePoll).
+type pollMode = backend.PollMode
 
 const (
-	pollWatch pollKind = iota // check the file on every Changed/List call (default)
-	pollNone                  // read at start (and on Reload) only
-	pollEvery                 // check the file at most once per interval
+	pollWatch = backend.PollWatch
+	pollNone  = backend.PollNone
+	pollEvery = backend.PollEvery
 )
 
-// parsePoll reads options.poll: "watch", "none", a number of seconds or a duration like 5s.
-func parsePoll(v any) (pollMode, error) {
-	bad := func() (pollMode, error) {
-		return pollMode{}, fmt.Errorf(`csv options: poll must be "watch", "none" or a number of seconds (e.g. 5 or 5s), got %v`, v)
-	}
-	switch x := v.(type) {
-	case nil:
-		return pollMode{}, nil
-	case int:
-		if x < 1 {
-			return bad()
-		}
-		return pollMode{pollEvery, time.Duration(x) * time.Second}, nil
-	case string:
-		s := strings.ToLower(strings.TrimSpace(x))
-		switch s {
-		case "watch", "":
-			return pollMode{}, nil
-		case "none":
-			return pollMode{kind: pollNone}, nil
-		}
-		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
-			return pollMode{pollEvery, time.Duration(n) * time.Second}, nil
-		}
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return pollMode{pollEvery, d}, nil
-		}
-	}
-	return bad()
-}
+func parsePoll(v any) (pollMode, error) { return backend.ParsePoll("csv", v) }
 
 type yamlSchema struct {
 	Source string         `yaml:"source"`
@@ -209,7 +175,7 @@ func (b *Backend) List(_ context.Context) ([]task.Task, error) {
 	defer b.mu.Unlock()
 	// With poll: none / N the copy in memory is served until Changed saw a
 	// change or Reload was asked for.
-	if b.sch.poll.kind == pollWatch || b.stale {
+	if b.sch.poll.Kind == pollWatch || b.stale {
 		if err := b.refresh(); err != nil {
 			return nil, err
 		}
@@ -297,12 +263,12 @@ func (b *Backend) Delete(_ context.Context, id string) error {
 func (b *Backend) Changed() (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	switch b.sch.poll.kind {
+	switch b.sch.poll.Kind {
 	case pollNone:
 		return false, nil
 	case pollEvery:
 		now := b.now()
-		if !b.lastCheck.IsZero() && now.Sub(b.lastCheck) < b.sch.poll.interval {
+		if !b.lastCheck.IsZero() && now.Sub(b.lastCheck) < b.sch.poll.Interval {
 			return false, nil
 		}
 		b.lastCheck = now
@@ -384,33 +350,7 @@ func statFile(path string) (stamp, error) {
 	return stamp{st.ModTime(), st.Size()}, nil
 }
 
-func field(t *task.Task, name string) *string {
-	switch name {
-	case "id":
-		return &t.ID
-	case "title":
-		return &t.Title
-	case "description":
-		return &t.Description
-	case "status":
-		return &t.Status
-	case "priority":
-		return &t.Priority
-	case "notes":
-		return &t.Notes
-	case "type":
-		return &t.Type
-	case "assignee":
-		return &t.Assignee
-	case "due":
-		return &t.Due
-	case "start":
-		return &t.Start
-	case "labels":
-		return &t.Labels
-	}
-	return nil
-}
+func field(t *task.Task, name string) *string { return t.FieldPtr(name) }
 
 // extraKeys names every column for Task.Extra: its header, or colN when there
 // is none. Repeated names get a "#2", "#3"... suffix so no two columns share a

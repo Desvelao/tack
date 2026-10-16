@@ -153,3 +153,33 @@ func parseDate(s string) (time.Time, bool) {
 	d, err := time.Parse(DateLayout, strings.TrimSpace(s))
 	return d, err == nil
 }
+
+// FieldPtr returns a pointer to the named logical field ("title", "status",
+// ...), or nil for an unknown name. Backends use it to map columns to fields.
+func (t *Task) FieldPtr(name string) *string {
+	switch name {
+	case "id":
+		return &t.ID
+	case "title":
+		return &t.Title
+	case "description":
+		return &t.Description
+	case "status":
+		return &t.Status
+	case "priority":
+		return &t.Priority
+	case "notes":
+		return &t.Notes
+	case "type":
+		return &t.Type
+	case "assignee":
+		return &t.Assignee
+	case "due":
+		return &t.Due
+	case "start":
+		return &t.Start
+	case "labels":
+		return &t.Labels
+	}
+	return nil
+}

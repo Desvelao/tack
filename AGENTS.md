@@ -8,8 +8,8 @@ read or update a task file, read `docs/AGENTS.md` instead.
 **tkan**: a small Go TUI that shows a task backlog as a kanban board, plus
 non-interactive subcommands (`list`, `show`, `add`, `edit`, `set-status`, `delete`, `count`, `labels`, `statuses`, `config`, `init`, `completion`) for scripts and agents.
 The task stores sit behind a `Backend` interface; the config lists any number of them
-(`backend:` entries with a `type`, optional `name` and `options`). CSV and a command-based
-`custom` backend exist; SQLite / GitHub Projects etc. are expected later.
+(`backend:` entries with a `type`, optional `name` and `options`). CSV, a SQLite one (drives the `sqlite3` CLI, no
+library, to keep the binary static) and a command-based `custom` backend exist; GitHub Projects etc. are expected later.
 
 Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 
@@ -20,6 +20,7 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 - `src/internal/backend`: `Backend` interface, `Spec`/`Factory` type registry, `Set` (combines the configured backends)
 - `src/internal/backend/csv`: the CSV backend (the reference implementation)
 - `src/internal/backend/custom`: runs an external command, JSON over stdin/stdout
+- `src/internal/backend/sqlite`: SQLite table through the sqlite3 CLI (JSON out, SQL on stdin; values as hex literals)
 - `src/internal/board`: raw status value -> kanban column mapping (pure, no backend/UI imports)
 - `src/internal/config`: `tkan.yaml` loading (`backend:` list), config lookup, sample generation (`init.go`)
 - `src/internal/query`: filter language (parser, matcher, `Help()` text used by the TUI and `tkan help filter`)
