@@ -27,7 +27,7 @@ or sidecar file any more: every data source is an entry of the `backend` list. R
 tkan init -source tasks.csv      # writes ./tkan.yaml, derived from the file
 ```
 
-Flags: `-backend TYPE` (default: from the source's extension, else `csv`), `-source SRC`
+Flags: `-backend TYPE` (default: from the source's extension, else `csv`; `yaml` and `markdown` need it), `-source SRC`
 (or a positional `SRC`), `-o PATH` (`-` for stdout; default `./tkan.yaml`), `-force` (overwrite).
 
 With an existing CSV the options list the detected columns (unmatched required fields become
@@ -72,7 +72,7 @@ Unknown keys are rejected. In particular the former single-backend format (`back
 
 | Key | Default | Meaning |
 |---|---|---|
-| `type` | required | Backend type: `csv`, `sqlite` or `custom`. |
+| `type` | required | Backend type: `csv`, `json`, `jsonl`, `yaml`, `markdown`, `sqlite` or `custom`. |
 | `name` | `<type><position>` | Unique name (case-insensitive; letters, digits, `_`, `.` and `-` only). The default uses the 1-based position in the list: `csv1`, `custom2`, ... Shown on every card and usable as `-b NAME`, `NAME:ID` and the `backend` filter field. |
 | `options` | | Settings of the type, below. |
 
@@ -96,6 +96,36 @@ Logical fields: `id`, `title`, `status` (required), `description`, `priority`, `
   first time a task gets a value for it.
 - Two fields cannot point at the same column.
 - IDs may be any string. New tasks get `max(numeric id) + 1` (so `1` if all ids are like `A-1`).
+
+### `json`, `jsonl` and `yaml` options
+
+One file that must already exist (an empty file is fine). `json` holds an array of task objects or an object with a `tasks` array (other top-level keys are kept); `jsonl` has one object per line; `yaml` holds a list of mappings or a mapping with a `tasks` list. `tkan init` guesses `json` from `.json` and `jsonl` from `.jsonl`/`.ndjson`; `yaml` is never guessed from the extension (it would clash with `tkan.yaml`), use `-backend yaml`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `source` | required | Path of the file (relative to the config). |
+| `fields.<field>` | the key named `<field>` | Which key of the objects holds the logical field (case-insensitive). `id`, `title` and `status` are the usual ones; `title` and `status` are written even when empty. |
+| `poll` | `watch` | As for csv: `watch` checks the file every second, `none` reads once at start, a number of seconds checks at most that often. `r` reloads now. |
+| `path` | the top level, or the `tasks` key | `json` and `yaml` only: where the task list lives, as dotted object keys, e.g. `data.tasks` for `{"data": {"tasks": [...]}}`. The value must be a list of task objects; every other key (and, in YAML, comment) is kept on writes. A non-empty file without that path is an error; an empty file (or `{}`) gets it on the first `add`. Keys that contain a dot cannot be addressed; there are no list indexes. `tkan init` fills it in when the file has exactly one nested list of objects. |
+| `indent` | `2` | Spaces per level when writing (`json`: `0` = compact; `jsonl` always writes one compact object per line). |
+
+- Keys that are not mapped are kept in `extra` and written back; numbers, booleans and nested values are restored with their type (nested ones appear as JSON text in `extra`).
+- Ids may be strings or numbers. A file keeps the type its ids have (new `yaml` files use numbers); new tasks get `max(numeric id) + 1`.
+- `labels` is written as a list (as a string when the file already holds strings); on read both forms work. Dates are always `YYYY-MM-DD` strings (quoted in YAML).
+- Writes use a temp file + rename and a `<file>.lock` sidecar, like csv. `yaml` keeps comments outside the task list; comments inside it are lost on a write.
+
+### `markdown` options
+
+A directory with one Markdown file per task; the file name without `.md` is the id, the YAML frontmatter holds the fields and the body is the description (see [backends.md](backends.md#the-markdown-backend)). The directory must already exist.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `source` | required | The directory (relative to the config). |
+| `fields.<field>` | the frontmatter key named `<field>` | Which frontmatter key holds the logical field. `id` and `description` cannot be mapped. |
+| `poll` | `watch` | As for csv. |
+
+- A file without frontmatter is a task whose title is the file name and whose description is the whole text.
+- Hidden files and files not ending in `.md` are ignored. A write leaves an empty `.tkan.lock` in the directory.
 
 ### `sqlite` options
 

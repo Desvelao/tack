@@ -129,10 +129,18 @@ func otherFields(extras []string) []string {
 	return out
 }
 
+// defaultSources is the `source:` written when init gets no location.
+var defaultSources = map[string]string{
+	"json": "tasks.json", "jsonl": "tasks.jsonl", "yaml": "tasks.yaml", "markdown": "tasks", "sqlite": "tasks.db",
+}
+
 // sourceFor picks the `source:` value: relative to the output directory when possible.
 func sourceFor(o InitOptions) string {
 	loc := o.Location
 	if loc == "" {
+		if d, ok := defaultSources[strings.ToLower(o.Backend)]; ok {
+			return d
+		}
 		return "tasks.csv"
 	}
 	if strings.Contains(loc, "://") {

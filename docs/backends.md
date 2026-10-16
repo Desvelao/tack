@@ -84,8 +84,55 @@ returns `backend.Example{Section, Statuses, Notes}`:
 | Type | Package | Notes |
 |---|---|---|
 | `csv` | `internal/backend/csv` | `options.source`/`header`/`fields` map the file by header name or position, headerless files, atomic write (fsync + rename, symlinks followed), CRLF, BOM and a missing final newline preserved, writes serialised across processes with an advisory lock on `<file>.lock` (a harmless empty sidecar file; a writer waits up to 5 s for another tkan, then fails with `locked by another tkan`; implemented with flock on Unix and LockFileEx on Windows, the latter never run there), implements `Watcher` |
+| `json`, `jsonl` | `internal/backend/json` | a JSON file (array, or object with `tasks`) or JSON Lines; built on `internal/backend/filestore` (below); implements `Watcher` and `Reloader` |
+| `yaml` | `internal/backend/yaml` | a YAML list of tasks (or mapping with `tasks`); same engine as `json`; selected with `type: yaml` only (no extension claim) |
+| `markdown` | `internal/backend/markdown` | a directory of `.md` files, one task each (below); implements `Watcher` and `Reloader` |
 | `sqlite` | `internal/backend/sqlite` | a table of a SQLite database, accessed through a SQLite command line tool (no library linked, so the binary stays static); `options.source`/`table`/`fields`/`cli`/`poll` (below); writes in one `BEGIN IMMEDIATE` transaction; implements `Watcher` and `Reloader` |
 | `custom` | `internal/backend/custom` | runs an external command per operation, JSON over stdin/stdout (below); implements `Watcher` only when `options.poll` is set, otherwise press `r` to reload |
+
+## File backends: `json`, `jsonl`, `yaml`
+
+These share `internal/backend/filestore`: a `Store` keeps the tasks of one file in memory and does
+what csv does for safety (see [config.md](config.md#json-jsonl-and-yaml-options) for the options): every
+write takes the `<file>.lock` lock, re-reads the file if it changed (outside edits are merged), applies the
+change, and replaces the file through a temp file + rename in the same directory (symlinks are followed, the
+mode is kept); a failed write leaves the in-memory copy as it was, and a file that no longer parses (or
+repeats an id) keeps the last good state. A backend only provides a `filestore.Codec` (`Decode`/`Encode`)
+and a key mapping (`filestore.Mapping`: record keys <-> task fields, everything else in `Extra`).
+`json` and `yaml` can keep the list inside a larger document (`options.path`, dotted keys): only that list is replaced on a write.
+The csv backend uses the same lock and atomic-write helpers but keeps its own engine for its header,
+BOM and line-ending handling.
+
+## The `markdown` backend
+
+```yaml
+backend:
+  - type: markdown
+    options:
+      source: tasks/        # tasks/12.md, tasks/fix-login.md, ...
+```
+
+```markdown
+---
+title: Fix the login
+status: todo
+labels:
+  - auth
+owner: ann            # not a task field: kept in `extra`
+---
+
+Steps to reproduce...
+```
+
+- The id is the file name without `.md`; new tasks are `max(numeric id) + 1`. `list` order is numeric ids
+  ascending, then the other names alphabetically.
+- Each write replaces one file atomically under a `.tkan.lock` in the directory (hidden, ignored by the
+  scan). A write rewrites the frontmatter from the task's fields: comments inside it are not kept, and
+  `\r\n` becomes `\n`. Writing does not touch the other files.
+- `Changed` compares the name, size and modification time of every `.md` file, so adding, removing or
+  editing a file by hand shows up on the board.
+- The body is the description (outer blank lines trimmed); a `description:` key in the frontmatter wins over
+  the body when it is present.
 
 ## The `sqlite` backend
 

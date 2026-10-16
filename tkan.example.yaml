@@ -10,7 +10,7 @@
 #   file: audit.jsonl
 
 # The backends to show on one board. Each entry has:
-#   type     csv | sqlite | custom
+#   type     csv | json | jsonl | yaml | markdown | sqlite | custom
 #   name     optional; default is the type plus its 1-based position (csv1, custom2).
 #            Cards show it, and `-b NAME` / NAME:ID selects it on the command line.
 #   options  settings of that type
@@ -32,6 +32,15 @@ backend:
         # assignee: owner      # optional: assignee, due, start (YYYY-MM-DD), labels
         # due: due
         # Columns that are not listed here are preserved untouched.
+
+  # A JSON / JSON Lines / YAML file (an array of task objects), or a directory of
+  # Markdown files with frontmatter (file name = id, body = description).
+  # - type: json            # jsonl | yaml | markdown work the same way
+  #   options:
+  #     source: tasks.json  # for markdown: a directory such as tasks/
+  #     # poll: watch       # watch | none | seconds, as for csv
+  #     # path: data.tasks  # json/yaml: where the list is, as dotted keys (default: top level or "tasks")
+  #     # fields: {title: summary, status: state}   # where key names differ
 
   # A SQLite database, through the sqlite3 command line tool (must be installed).
   # - type: sqlite

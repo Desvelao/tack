@@ -17,9 +17,12 @@ import (
 
 	"tkan/internal/audit"
 	"tkan/internal/backend"
-	_ "tkan/internal/backend/csv"    // register the csv backend
-	_ "tkan/internal/backend/custom" // register the custom (command) backend
-	_ "tkan/internal/backend/sqlite" // register the sqlite (CLI) backend
+	_ "tkan/internal/backend/csv"      // register the csv backend
+	_ "tkan/internal/backend/custom"   // register the custom (command) backend
+	_ "tkan/internal/backend/json"     // register the json and jsonl backends
+	_ "tkan/internal/backend/markdown" // register the markdown (file per task) backend
+	_ "tkan/internal/backend/sqlite"   // register the sqlite (CLI) backend
+	_ "tkan/internal/backend/yaml"     // register the yaml backend
 	"tkan/internal/board"
 	"tkan/internal/config"
 	"tkan/internal/query"
