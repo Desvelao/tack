@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"tkan/internal/audit"
 	"tkan/internal/backend"
 	"tkan/internal/board"
 	"tkan/internal/query"
@@ -30,6 +31,7 @@ const (
 	modeHelp
 	modeEdit
 	modeQuick // `f`: waiting for the field to filter by
+	modeAudit // `A`: the audit trail
 )
 
 const pollEvery = time.Second
@@ -59,7 +61,7 @@ func (m *Model) undoLast() {
 	}
 	op := m.undo[len(m.undo)-1]
 	m.undo = m.undo[:len(m.undo)-1]
-	ctx := context.Background()
+	ctx := backend.WithNote(context.Background(), "undo of "+op.what)
 	if op.recreate {
 		t, err := m.be.Create(ctx, op.prev)
 		if err != nil {
@@ -118,6 +120,13 @@ type Model struct {
 	history  []string         // filters applied this session, newest last (up/down in the / prompt)
 	histPos  int              // position while browsing history; len(history) = not browsing
 	view     string           // name of the saved view behind the current filter ("" = none)
+
+	audit        *audit.Log  // nil = no audit view
+	auditQ       query.Query // filter of the audit view
+	auditFilter  string
+	auditY       int    // first visible line of the audit view
+	auditEditing bool   // the audit filter prompt is open
+	reloadErr    string // last reload failure recorded, to log a repeating one once
 }
 
 // editForm is the state of the card edit form (modeEdit).
@@ -154,20 +163,47 @@ func New(be *backend.Set, name string, spec board.Spec) Model {
 	return m
 }
 
-func (m *Model) reload() {
+// WithAudit gives the model the audit trail shown by `A`.
+func (m Model) WithAudit(l *audit.Log) Model {
+	m.audit = l
+	m.be.SetAuditor(l)
+	return m
+}
+
+// refresh reloads and records it in the audit trail. A failure that repeats
+// (the tick retries every second) is recorded once.
+func (m *Model) refresh(reason string) {
+	err := m.reload()
+	m.auditReload(reason, err)
+}
+
+func (m *Model) auditReload(reason string, err error) {
+	if err == nil {
+		m.reloadErr = ""
+		m.be.Audit(audit.OpReload, "", "", nil, fmt.Sprintf("%s: %d tasks", reason, len(m.tasks)))
+		return
+	}
+	if err.Error() != m.reloadErr {
+		m.reloadErr = err.Error()
+		m.be.Audit(audit.OpReload, "", "", err, reason)
+	}
+}
+
+func (m *Model) reload() error {
 	tasks, err := m.be.List(context.Background())
 	var perr *backend.PartialError
+	loadErr := err
 	switch {
 	case errors.As(err, &perr): // show what loaded, say what did not
 		m.notice = "error: " + err.Error()
 	case err != nil:
 		m.notice = "error: " + err.Error()
-		return
+		return err
 	}
 	b, err := board.New(m.spec, m.be.Statuses())
 	if err != nil {
 		m.notice = "error: " + err.Error()
-		return
+		return err
 	}
 	prev, hadSel := m.selected()
 	m.tasks = tasks
@@ -178,6 +214,7 @@ func (m *Model) reload() {
 	if hadSel {
 		m.selectID(prev.Backend, prev.ID)
 	}
+	return loadErr
 }
 
 // columnTotal counts every card in column c, ignoring the filter (WIP limits
@@ -377,11 +414,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.mode == modeBoard {
 			changed, err := m.be.Changed()
-			if err != nil && m.notice == "" {
-				m.notice = "error: " + err.Error()
+			if err != nil {
+				if m.notice == "" {
+					m.notice = "error: " + err.Error()
+				}
+				m.auditReload("auto: checking for changes", err)
 			}
 			if changed {
-				m.reload()
+				m.refresh("auto: file changed")
 			}
 		}
 		return m, tick()
@@ -403,6 +443,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleInput(k)
 	case modeEdit:
 		return m.handleEdit(k)
+	case modeAudit:
+		return m.handleAuditKey(k)
 	case modeQuick:
 		m.mode = modeBoard
 		if key != "esc" {
@@ -538,7 +580,10 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeConfirmDelete
 		}
 	case "r":
-		m.reload()
+		if err := m.be.Reload(); err != nil {
+			m.notice = "error: " + err.Error()
+		}
+		m.refresh("manual")
 		if m.notice == "" { // reload sets an error notice on failure
 			m.notice = "reloaded"
 		}
@@ -547,6 +592,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filter, m.query, m.view = "", query.Query{}, ""
 			m.clamp()
 		}
+	case "A":
+		m.openAudit()
 	case "?":
 		m.helpPage, m.helpBack, m.mode = 0, modeBoard, modeHelp
 	}
@@ -767,7 +814,8 @@ func (m *Model) move(delta int) {
 	}
 	before := t
 	t.Status = m.board.WriteValue(target)
-	if err := m.be.Update(context.Background(), t); err != nil {
+	ctx := backend.WithNote(context.Background(), "moved to "+m.board.Columns[target].Name)
+	if err := m.be.Update(ctx, t); err != nil {
 		m.notice = "error: " + err.Error()
 		return
 	}
@@ -891,7 +939,7 @@ func (m *Model) saveEdit() {
 			return
 		}
 	}
-	if err := m.be.Update(context.Background(), t); err != nil {
+	if err := m.be.Update(backend.WithNote(context.Background(), "edited"), t); err != nil {
 		m.notice = "error: " + err.Error()
 		return
 	}

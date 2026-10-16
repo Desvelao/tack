@@ -20,6 +20,8 @@ type Backend interface {
 }
 
 // Optional: enables live refresh in the TUI (polled about once a second).
+// A backend that may serve a cached copy (csv with `poll: none`/N) can also
+// implement `Reload() error` (backend.Reloader); the board's `r` key calls it.
 type Watcher interface{ Changed() (bool, error) }
 
 // Registered per type name; Spec is one entry of the config's backend list.

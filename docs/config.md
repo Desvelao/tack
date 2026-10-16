@@ -85,6 +85,7 @@ its raw status, whichever backend it comes from. Task IDs only need to be unique
 |---|---|---|
 | `source` | required | Path of the CSV file (must exist). |
 | `header` | `true` | `false`: the file has no header row. Fields must then be given as positions. |
+| `poll` | `watch` | How the board notices outside edits of the file: `watch` checks it every second (modification time and size) and reloads on a change; `none` reads it once at start; a number of seconds (`5`, or `5s`) checks it at most that often. Whatever the value, `r` in the board reloads now and every write re-reads the file first, so outside edits are never overwritten. Subcommands always read the current file. |
 | `fields.<field>` | the column named `<field>` | Which source column holds the logical field. A string is a header name (case-insensitive); a number is a 1-based position. |
 
 Logical fields: `id`, `title`, `status` (required), `description`, `priority`, `notes`, `type`, `assignee`, `due`, `start` (dates as `YYYY-MM-DD`), `labels` (comma-separated). All but the first three are optional.
@@ -244,6 +245,20 @@ no filter; typing a filter with `/` or `esc` leaves the view. On the command lin
 `tkan list -v mine` applies one (case-insensitive) and combines with `-q`
 (`list -v mine -q 'type=fix'` needs both). Names must be unique and the query must parse; field
 names are checked when the view is used, so a typo is reported then.
+
+## Audit trail
+
+```yaml
+audit:
+  file: audit.jsonl     # or audit.csv; relative to this file
+```
+
+Without `audit.file` the audit trail (reloads, creates, updates, deletes; see
+[usage.md](usage.md#audit-trail)) is kept in memory and ends with the run. With it, every run appends
+to the file, so the board shows this session and the previous one. `.jsonl` is one JSON object per
+line; `.csv` has the header `time,session,source,op,backend,id,result,details`. Any other extension is
+a config error. Lines tkan cannot parse are skipped, a file that cannot be written is reported and
+the entries stay in memory. The file may grow; delete or rotate it when you like.
 
 ## Default backend and colour
 

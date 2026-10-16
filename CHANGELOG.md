@@ -5,6 +5,13 @@ before 1.0 the config format, CSV schema and CLI may still change.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+- Audit trail of reloads (ok/error) and create/update/delete, from the board and the subcommands: `A` in the board, `tkan audit`, filterable by `op`, `date`, `details`, `result`, `source`, `backend`, `id`, `session`. In memory by default; `audit.file` (`.jsonl` or `.csv`) keeps it across sessions and marks this and the previous one.
+- csv option `poll`: `watch` (default, as before), `none` (read once; `r` reloads) or a number of seconds between checks for outside edits.
+- Docs: `AGENTS.md` now requires a security review of staged changes (exposed secrets and other concerns) before every commit.
+- Fix: the board did not show external changes to the file (not even with `r`) because the one-shot list cache was also on for the board.
+
 ## [0.1.0] - 2026-10-16
 
 First release.
@@ -17,5 +24,6 @@ First release.
 - Config file `.tkan.yaml` (also `.tkan.yml`, `tkan.yaml`, `tkan.yml`; first found wins), looked up in the working directory, then `~/.tkan.yaml` / `~/.tkan.yml`.
 - Static binaries for Linux (amd64, arm64, armv6, armv7), macOS (amd64, arm64) and Windows (amd64).
 
-[Unreleased]: https://github.com/Desvelao/tkan/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Desvelao/tkan/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Desvelao/tkan/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Desvelao/tkan/releases/tag/v0.1.0

@@ -40,6 +40,7 @@ tkan -c tkan.yaml count -by priority -json        # totals per column|priority|t
 tkan -c tkan.yaml list -ids                     # BACKEND:ID per line; -tsv: tab-separated, escaped
 tkan help list                                     # a command's synopsis and flags (also: tkan version)
 tkan -c tkan.yaml config                        # effective config (YAML)
+tkan -c tkan.yaml audit -q "op=delete date=today" -json   # what was reloaded/changed (needs audit.file to see past runs)
 ```
 
 With several backends, IDs are only unique per backend (unless the config sets `default_backend` or `$TKAN_BACKEND` is set: then bare IDs and `add` use that backend, and `-b`/`NAME:ID` still override): `show`, `set-status`, `edit` and `delete` take

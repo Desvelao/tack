@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"tkan/internal/audit"
 	"tkan/internal/backend"
 	"tkan/internal/board"
 	"tkan/internal/query"
@@ -44,8 +45,25 @@ type Config struct {
 	// `add` creates there); $TKAN_BACKEND overrides it. Default: none, i.e.
 	// the first backend for add and a search through all for IDs.
 	DefaultBackend string `yaml:"default_backend,omitempty"`
+	// Audit configures the audit trail of reloads and writes.
+	Audit AuditSpec `yaml:"audit"`
 
 	Path string `yaml:"-"` // absolute path of the file it was loaded from
+}
+
+// AuditSpec is the `audit:` section. Without a file the trail lives in memory
+// and ends with the run.
+type AuditSpec struct {
+	File string `yaml:"file,omitempty"` // .jsonl or .csv, relative to the config file
+}
+
+// AuditPath is the absolute audit file ("" = in memory only).
+func (c *Config) AuditPath() string {
+	f := strings.TrimSpace(c.Audit.File)
+	if f == "" || filepath.IsAbs(f) {
+		return f
+	}
+	return filepath.Join(c.Dir(), f)
 }
 
 // Load reads and validates a config file. Unknown keys are rejected, so files
@@ -78,6 +96,9 @@ func Load(path string) (*Config, error) {
 	}
 	c.Path = abs
 	if err := c.nameEntries(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if _, err := audit.New(c.AuditPath()); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if c.DefaultBackend != "" {

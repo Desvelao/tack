@@ -40,7 +40,8 @@ func cmdConfig(a *app, out, errw io.Writer) int {
 		Config  string       `yaml:"config"`
 		Backend []backendOut `yaml:"backend"`
 		Board   boardOut     `yaml:"board"`
-	}{Config: a.cfg.Path}
+		Audit   string       `yaml:"audit,omitempty"`
+	}{Config: a.cfg.Path, Audit: a.cfg.AuditPath()}
 	for _, e := range a.cfg.Backends {
 		eff.Backend = append(eff.Backend, backendOut{Name: e.Name, Type: e.Type, Options: e.Options})
 	}

@@ -89,6 +89,9 @@ func Generate(o InitOptions) (string, []string, error) {
 			b.WriteString("      " + line + "\n")
 		}
 	}
+	b.WriteString("\n# Audit trail of reloads and writes (press A in the board, or `tkan audit`).\n")
+	b.WriteString("# Kept in memory unless a file is set; .jsonl or .csv, relative to this file.\n")
+	b.WriteString("# audit:\n#   file: audit.jsonl\n")
 	b.WriteString("\nboard:\n")
 	b.WriteString("  # Columns, left to right. `values` are the raw status values shown in a column;\n")
 	b.WriteString("  # `write` (default: first value) is stored when a card is moved into it.\n")

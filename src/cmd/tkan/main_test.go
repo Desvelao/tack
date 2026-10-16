@@ -1346,3 +1346,87 @@ func TestAddRejectsStartAfterDueAsUsageError(t *testing.T) {
 		t.Fatal("an invalid task was written")
 	}
 }
+
+// The board polls and reloads through Set.List, so open must not cache lists
+// for it (it did once: external edits never showed up).
+func TestOpenForBoardSeesExternalEdits(t *testing.T) {
+	_, file, cfg := setup(t, "id,title,status\n1,A,pending\n", "")
+	a, err := open(cfg, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.be.Close()
+	ctx := context.Background()
+	if ts, _ := a.be.List(ctx); len(ts) != 1 {
+		t.Fatalf("got %d tasks, want 1", len(ts))
+	}
+	if err := os.WriteFile(file, []byte("id,title,status\n1,A,pending\n2,B,pending\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ts, _ := a.be.List(ctx); len(ts) != 2 {
+		t.Fatalf("board list is stale: got %d tasks, want 2", len(ts))
+	}
+}
+
+func TestAuditTrailOfCLIWrites(t *testing.T) {
+	_, _, cfg := setup(t, "id,title,status\n1,A,pending\n2,B,pending\n", baseYAML+"audit: {file: audit.jsonl}\n")
+	for _, args := range [][]string{
+		{"-c", cfg, "set-status", "1", "done"},
+		{"-c", cfg, "add", "-title", "New one"},
+		{"-c", cfg, "delete", "2"},
+		{"-c", cfg, "show", "99"}, // not found: no entry, read only
+	} {
+		do(t, args...)
+	}
+	code, out, errs := do(t, "-c", cfg, "audit")
+	if code != exitOK || errs != "" {
+		t.Fatalf("audit: %d %q", code, errs)
+	}
+	for _, want := range []string{"update", "create", "delete", "status=done", `"New one"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("audit output lacks %q:\n%s", want, out)
+		}
+	}
+	// Each command is its own session, so the last one before this run is "previous".
+	if !strings.Contains(out, "previous") {
+		t.Errorf("no previous session marker:\n%s", out)
+	}
+	_, out, _ = do(t, "-c", cfg, "audit", "-q", "op=delete")
+	if strings.Contains(out, "update") || !strings.Contains(out, "delete") {
+		t.Errorf("filter op=delete:\n%s", out)
+	}
+	code, out, _ = do(t, "-c", cfg, "audit", "-limit", "1", "-json")
+	var rows []struct {
+		Op          string `json:"op"`
+		SessionKind string `json:"session_kind"`
+	}
+	if code != exitOK || json.Unmarshal([]byte(out), &rows) != nil || len(rows) != 1 || rows[0].Op != "delete" {
+		t.Fatalf("-limit 1 -json: %d %s", code, out)
+	}
+	if code, _, errs = do(t, "-c", cfg, "audit", "-q", "nope=1"); code != exitUsage || !strings.Contains(errs, "unknown field") {
+		t.Errorf("bad query: %d %q", code, errs)
+	}
+}
+
+func TestAuditWithoutFileWarns(t *testing.T) {
+	_, _, cfg := setup(t, "id,title,status\n1,A,pending\n", "")
+	code, _, errs := do(t, "-c", cfg, "audit")
+	if code != exitOK || !strings.Contains(errs, "audit.file") {
+		t.Fatalf("%d %q", code, errs)
+	}
+}
+
+func TestAuditFileExtensionIsValidated(t *testing.T) {
+	_, _, cfg := setup(t, "id,title,status\n1,A,pending\n", baseYAML+"audit: {file: audit.log}\n")
+	if code, _, errs := do(t, "-c", cfg, "list"); code != exitError || !strings.Contains(errs, "audit.file") {
+		t.Fatalf("%d %q", code, errs)
+	}
+}
+
+func TestInvalidPollOptionIsRejected(t *testing.T) {
+	_, _, cfg := setup(t, "id,title,status\n1,A,pending\n", "backend:\n  - type: csv\n    options: {source: work.csv, poll: fast}\n")
+	code, _, errs := do(t, "-c", cfg, "list")
+	if code != exitError || !strings.Contains(errs, "poll must be") {
+		t.Fatalf("%d %q", code, errs)
+	}
+}

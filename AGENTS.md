@@ -51,6 +51,13 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 
 - Releasing: bump `VERSION` **and** the `VERSION=` line in `install.sh` (checked by `make check` and CI), and the tag in the README install URL; move the `CHANGELOG.md` entries under the new version.
 - `make test` must pass (also run `make vet`).
+- **Before every commit, check the staged changes for security problems.** Review `git diff --staged`
+  (and any new untracked files being added) for exposed secrets (API keys, tokens, passwords, private
+  keys, `.env` contents, credentials in `tkan.yaml` backend `options`, real backlog data or personal
+  paths/emails in fixtures or docs) and for other concerns (command injection in the `custom` backend,
+  unsafe file permissions or paths, unvalidated input, new dependencies of unknown provenance). Use a
+  scanner such as `gitleaks`/`git secrets` if available. If anything is found, do not commit: remove it
+  (rotate the secret if it was ever pushed) and report it to the user.
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`,
   `chore:`, `refactor:`, `test:`, optional scope like `feat(tui):`; `!` or a `BREAKING CHANGE:` footer for breaking
   changes). End every commit message with the sign-off trailer `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.

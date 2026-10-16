@@ -78,6 +78,8 @@ func (m Model) View() string {
 		return m.helpView()
 	case modeEdit:
 		return m.editView()
+	case modeAudit:
+		return m.auditView()
 	}
 	var b strings.Builder
 	count := fmt.Sprintf("%d tasks", len(m.tasks))
@@ -539,7 +541,7 @@ func keysHelp() string {
 		{"v", "cycle the saved views (board.views), then none"},
 		{"z", "group cards by priority / type / assignee / labels (cycle)"},
 		{"s / S", "sort cards: next field / reverse (display only)"},
-		{"r", "reload from the backend"},
+		{"r / A", "reload from the backend / audit trail of reloads and writes"},
 		{"?", "this help (tab: filter syntax)"},
 		{"q / ctrl+c", "quit"},
 	}

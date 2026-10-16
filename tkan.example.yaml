@@ -4,6 +4,11 @@
 # Optional: the backend `add` creates in and bare IDs refer to ($TKAN_BACKEND overrides).
 # default_backend: tasks
 
+# Audit trail of reloads and writes (press A in the board, or run `tkan audit`).
+# Kept in memory unless a file is set; .jsonl or .csv, relative to this file.
+# audit:
+#   file: audit.jsonl
+
 # The backends to show on one board. Each entry has:
 #   type     csv | custom
 #   name     optional; default is the type plus its 1-based position (csv1, custom2).
@@ -15,6 +20,7 @@ backend:
     options:
       source: tasks.csv   # path relative to this file
       header: true        # false = no header row; then fields MUST be positions
+      # poll: watch      # outside edits: watch (check every second) | none (read once; press r) | SECONDS (e.g. 5)
       fields:             # logical field -> column NAME in the header, or 1-based POSITION
         id: id            # required
         title: title      # required

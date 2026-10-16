@@ -267,3 +267,68 @@ func TestSetListQueriesBackendsConcurrentlyInConfigOrder(t *testing.T) {
 		t.Fatalf("NAME:ID find took %s: it should only ask one backend", took)
 	}
 }
+
+type auditRow struct {
+	op, backend, id, details string
+	failed                   bool
+}
+
+type auditSink struct{ rows []auditRow }
+
+func (a *auditSink) Audit(op, backend, id string, err error, details string) {
+	a.rows = append(a.rows, auditRow{op, backend, id, details, err != nil})
+}
+
+func TestSetAuditsWrites(t *testing.T) {
+	s := NewSet([]Named{{Name: "a", Backend: &fake{tasks: []task.Task{{ID: "1", Title: "One", Status: "x"}}}}})
+	sink := &auditSink{}
+	s.SetAuditor(sink)
+	ctx := WithNote(context.Background(), "moved")
+	if err := s.Update(ctx, task.Task{ID: "1", Title: "One", Status: "y", Backend: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(context.Background(), task.Task{Title: "Two", Status: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(context.Background(), "", "nope"); err == nil {
+		t.Fatal("want not found")
+	}
+	if err := s.Update(context.Background(), task.Task{ID: "1", Backend: "zzz"}); err == nil {
+		t.Fatal("want unknown backend")
+	}
+	want := []auditRow{
+		{"update", "a", "1", `moved "One" status=y`, false},
+		{"create", "a", "new", `"Two" status=x`, false},
+		{"delete", "a", "nope", "", true},
+		{"update", "zzz", "1", "", true},
+	}
+	if len(sink.rows) != len(want) {
+		t.Fatalf("%+v", sink.rows)
+	}
+	for i := range want {
+		if sink.rows[i] != want[i] {
+			t.Errorf("row %d: %+v, want %+v", i, sink.rows[i], want[i])
+		}
+	}
+}
+
+type reloadable struct {
+	fake
+	err   error
+	calls *int
+}
+
+func (r *reloadable) Reload() error { *r.calls++; return r.err }
+
+func TestSetReloadCallsReloadersAndJoinsErrors(t *testing.T) {
+	var n1, n2 int
+	s := NewSet([]Named{
+		{Name: "bad", Backend: &reloadable{err: errors.New("gone"), calls: &n1}},
+		{Name: "ok", Backend: &reloadable{calls: &n2}},
+		{Name: "plain", Backend: &fake{}},
+	})
+	err := s.Reload()
+	if n1 != 1 || n2 != 1 || err == nil || !strings.Contains(err.Error(), "backend bad: gone") {
+		t.Fatalf("calls %d/%d err %v", n1, n2, err)
+	}
+}

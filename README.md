@@ -16,7 +16,7 @@ installs it to `~/.local/bin`. It always installs the exact version of the tag i
 never "latest":
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.1.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.1.1/install.sh | sh
 ```
 
 Options: `-v X.Y.Z` / `$TKAN_VERSION` (another release), `-d DIR` / `$TKAN_INSTALL_DIR` (install
@@ -38,8 +38,8 @@ it to a directory on your `PATH`:
 
 ```sh
 ASSET=tkan          # the asset from the table above
-curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.0/$ASSET
-curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.0/SHA256SUMS
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.1/$ASSET
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.1/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS        # macOS: shasum -a 256 -c SHA256SUMS
 install -Dm755 $ASSET ~/.local/bin/tkan         # or: sudo install -m755 $ASSET /usr/local/bin/tkan
 tkan version

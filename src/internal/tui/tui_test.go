@@ -34,10 +34,16 @@ func newModel(t *testing.T) (Model, *backend.Set) {
 
 func openSet(t *testing.T, paths ...string) *backend.Set {
 	t.Helper()
+	return openSetOpts(t, "", paths...)
+}
+
+// openSetOpts is openSet with extra csv options (YAML text) for every path.
+func openSetOpts(t *testing.T, extra string, paths ...string) *backend.Set {
+	t.Helper()
 	var items []backend.Named
 	for i, p := range paths {
 		var n yaml.Node
-		if err := yaml.Unmarshal([]byte("source: "+strconv.Quote(p)+"\n"), &n); err != nil {
+		if err := yaml.Unmarshal([]byte("source: "+strconv.Quote(p)+"\n"+extra), &n); err != nil {
 			t.Fatal(err)
 		}
 		name := "csv" + strconv.Itoa(i+1)

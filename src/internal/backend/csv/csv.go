@@ -52,12 +52,59 @@ func (r colRef) String() string {
 type schema struct {
 	header bool
 	fields map[string]colRef // logical field -> source column
+	poll   pollMode
+}
+
+// pollMode says when the backend notices changes made to the file by others.
+type pollMode struct {
+	kind     pollKind
+	interval time.Duration // pollEvery only
+}
+
+type pollKind int
+
+const (
+	pollWatch pollKind = iota // check the file on every Changed/List call (default)
+	pollNone                  // read at start (and on Reload) only
+	pollEvery                 // check the file at most once per interval
+)
+
+// parsePoll reads options.poll: "watch", "none", a number of seconds or a duration like 5s.
+func parsePoll(v any) (pollMode, error) {
+	bad := func() (pollMode, error) {
+		return pollMode{}, fmt.Errorf(`csv options: poll must be "watch", "none" or a number of seconds (e.g. 5 or 5s), got %v`, v)
+	}
+	switch x := v.(type) {
+	case nil:
+		return pollMode{}, nil
+	case int:
+		if x < 1 {
+			return bad()
+		}
+		return pollMode{pollEvery, time.Duration(x) * time.Second}, nil
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		switch s {
+		case "watch", "":
+			return pollMode{}, nil
+		case "none":
+			return pollMode{kind: pollNone}, nil
+		}
+		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
+			return pollMode{pollEvery, time.Duration(n) * time.Second}, nil
+		}
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return pollMode{pollEvery, d}, nil
+		}
+	}
+	return bad()
 }
 
 type yamlSchema struct {
 	Source string         `yaml:"source"`
 	Header *bool          `yaml:"header"`
 	Fields map[string]any `yaml:"fields"`
+	Poll   any            `yaml:"poll"`
 }
 
 func parseSchema(spec backend.Spec) (s schema, source string, err error) {
@@ -74,6 +121,9 @@ func parseSchema(spec backend.Spec) (s schema, source string, err error) {
 	source = spec.Resolve(ys.Source)
 	if ys.Header != nil {
 		s.header = *ys.Header
+	}
+	if s.poll, err = parsePoll(ys.Poll); err != nil {
+		return s, "", err
 	}
 	known := map[string]bool{}
 	for _, f := range logicalFields {
@@ -134,6 +184,9 @@ type Backend struct {
 	bom         bool          // file starts with a UTF-8 BOM; preserved on write
 	lockTimeout time.Duration // 0 = the default (tests shorten it)
 	noFinalNL   bool          // file did not end with a newline; preserved on write
+	lastCheck   time.Time     // poll: every N seconds, when the file was last examined
+	stale       bool          // poll none/N: a change was seen, the next List re-reads
+	now         func() time.Time
 }
 
 // Open loads path. The file must already exist.
@@ -142,7 +195,7 @@ func Open(spec backend.Spec) (backend.Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Backend{path: path, sch: sch}
+	b := &Backend{path: path, sch: sch, now: time.Now}
 	if err := b.reload(); err != nil {
 		return nil, err
 	}
@@ -154,8 +207,13 @@ func (b *Backend) Close() error { return nil }
 func (b *Backend) List(_ context.Context) ([]task.Task, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if err := b.refresh(); err != nil {
-		return nil, err
+	// With poll: none / N the copy in memory is served until Changed saw a
+	// change or Reload was asked for.
+	if b.sch.poll.kind == pollWatch || b.stale {
+		if err := b.refresh(); err != nil {
+			return nil, err
+		}
+		b.stale = false
 	}
 	out := make([]task.Task, len(b.tasks))
 	for i, t := range b.tasks {
@@ -239,11 +297,36 @@ func (b *Backend) Delete(_ context.Context, id string) error {
 func (b *Backend) Changed() (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	switch b.sch.poll.kind {
+	case pollNone:
+		return false, nil
+	case pollEvery:
+		now := b.now()
+		if !b.lastCheck.IsZero() && now.Sub(b.lastCheck) < b.sch.poll.interval {
+			return false, nil
+		}
+		b.lastCheck = now
+	}
 	cur, err := statFile(b.path)
 	if err != nil {
 		return false, err
 	}
-	return cur != b.stamp, nil
+	changed := cur != b.stamp
+	if changed {
+		b.stale = true
+	}
+	return changed, nil
+}
+
+// Reload implements backend.Reloader: re-read the file now, whatever poll says.
+func (b *Backend) Reload() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.reload(); err != nil {
+		return err
+	}
+	b.stale = false
+	return nil
 }
 
 // mutate re-reads the file if it changed on disk (so edits made by another
@@ -648,4 +731,7 @@ func syncDir(dir string) {
 	}
 }
 
-var _ backend.Watcher = (*Backend)(nil)
+var (
+	_ backend.Watcher  = (*Backend)(nil)
+	_ backend.Reloader = (*Backend)(nil)
+)

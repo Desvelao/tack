@@ -104,15 +104,38 @@ tkan stops and suggests `tkan init`.
 | `v` | cycle the saved views from `board.views` in the config, then back to no filter ([config.md](config.md#saved-views)) |
 | `z` | group the cards of every column by priority, type, assignee, labels, then off (`board.group` sets a default) |
 | `s` / `S` | sort cards (display only): `s` next field, `S` reverse; the header shows the sort. `board.sort` in the config sets the default |
-| `r` | reload (needed for `custom` backends unless they set `poll`) |
+| `r` | reload now (needed for `custom` backends unless they set `poll`, and for CSV files with `poll: none` or a long `poll`) |
+| `A` | audit trail of reloads and writes ([below](#audit-trail)); `/` filters it, `esc` clears the filter, then goes back |
 | `?` | help: keys, then (`tab`) the filter syntax |
 | `q` / `ctrl+c` | quit |
 
 The board refreshes by itself within ~1 s when a CSV file changes on disk (for example when an
-AI agent updates it). If the terminal is narrower than all columns, columns are paged
+AI agent updates it); the csv option `poll` ([config.md](config.md)) changes that to every N seconds or never. If the terminal is narrower than all columns, columns are paged
 horizontally; the focused column is always visible, and a strip under the title lists every
 column with its card count and number key (`1 Todo 5 · 2 Doing 2 · ...`, shortened to `N:count` on
 very narrow terminals).
+
+## Audit trail
+
+tkan records what it does: every reload (`ok` or `error`, and whether it was manual or because the
+file changed) and every create, update and delete, from the board and from the subcommands. Idle
+polling records nothing, and an error that repeats on every poll is recorded once.
+Each entry has a time, an operation (`create`, `update`, `delete`, `reload`), the backend and task
+ID, a result (`ok`/`error`) and details (for example `moved to done "Fix login" status=done`).
+
+By default the trail lives in memory and ends with the run. Set `audit.file` to a `.jsonl` or
+`.csv` file ([config.md](config.md#audit-trail)) to keep it: the view (`A`) then lists every session
+newest first under headings, `this session` and `previous session` first, older ones by start date.
+A session is one run of tkan (the board, or one subcommand).
+
+Filter with the usual query language ([filter.md](filter.md)). Fields: `op`, `date` (`YYYY-MM-DD`,
+so `date>=2026-10-01`, `date=today`, `date>=today-7d` work), `time`, `details`, `result`, `source`
+(`tui`/`cli`), `backend`, `id`, `session` (`current`, `previous` or an id). A plain word matches
+`details`, `op` or `date`. Examples: `op=delete`, `result=error`, `op:update date=today login`,
+`session=previous -reload`.
+
+`tkan audit [-q QUERY] [-limit N] [-json]` prints the same entries oldest first (`-limit N` keeps
+the last N). Without `audit.file` it can only show its own run.
 
 ## Non-interactive commands
 
@@ -126,6 +149,7 @@ tkan [-c CONFIG] set-status ID... STATUS [-b NAME] [-json]
 tkan [-c CONFIG] add -title T [-b NAME] [-description D] [-priority P] [-type Y] [-notes N] [-assignee A] [-due DATE] [-start DATE] [-labels L] [-status S] [-json] [-description-file F] [-notes-file F]
 tkan [-c CONFIG] edit ID [-b NAME] [-status S] [-add-label L] [-rm-label L] [-json] [-description-file F] [-notes-file F] [-title T] [-description D] [-priority P] [-type Y] [-notes N] [-assignee A] [-due DATE] [-start DATE] [-labels L]
 tkan [-c CONFIG] delete ID... [-b NAME] [-n]
+tkan [-c CONFIG] audit [-q QUERY] [-limit N] [-json]
 tkan [-c CONFIG] config
 tkan help [filter|COMMAND]        # COMMAND: that command's synopsis and flags
 tkan version

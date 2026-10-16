@@ -24,6 +24,7 @@ type Set struct {
 	items []Named
 
 	mu      sync.Mutex
+	audit   Auditor                // nil = no audit trail
 	caching bool                   // see CacheLists
 	cache   map[string][]task.Task // backend name -> its last successful list
 }
@@ -197,8 +198,57 @@ func (s *Set) route(name string) (Backend, error) {
 	return b, nil
 }
 
+// Auditor receives one call per audited action; op is create, update, delete
+// or reload, err is nil on success. The audit package's Log implements it.
+type Auditor interface {
+	Audit(op, backend, id string, err error, details string)
+}
+
+type noteKey struct{}
+
+// WithNote attaches a human note (for example "moved to done") to the audit
+// entries of the writes made with the returned context.
+func WithNote(ctx context.Context, note string) context.Context {
+	return context.WithValue(ctx, noteKey{}, note)
+}
+
+// SetAuditor makes the Set report its writes to a; nil turns auditing off.
+func (s *Set) SetAuditor(a Auditor) { s.audit = a }
+
+// Audit records an action done on top of the Set (the board's reloads); it
+// does nothing without an auditor.
+func (s *Set) Audit(op, backend, id string, err error, details string) {
+	if s.audit != nil {
+		s.audit.Audit(op, backend, id, err, details)
+	}
+}
+
+// auditWrite records a write with the task's title and the context note.
+func (s *Set) auditWrite(ctx context.Context, op, backend string, t task.Task, err error) {
+	if s.audit == nil {
+		return
+	}
+	if backend == "" && len(s.items) > 0 {
+		backend = s.items[0].Name
+	} else if c, ok := s.canonical(backend); ok {
+		backend = c
+	}
+	var parts []string
+	if note, _ := ctx.Value(noteKey{}).(string); note != "" {
+		parts = append(parts, note)
+	}
+	if t.Title != "" {
+		parts = append(parts, fmt.Sprintf("%q", t.Title))
+	}
+	if op != "delete" && t.Status != "" {
+		parts = append(parts, "status="+t.Status)
+	}
+	s.audit.Audit(op, backend, t.ID, err, strings.Join(parts, " "))
+}
+
 // Update stores t in the backend named by t.Backend.
-func (s *Set) Update(ctx context.Context, t task.Task) error {
+func (s *Set) Update(ctx context.Context, t task.Task) (err error) {
+	defer func() { s.auditWrite(ctx, "update", t.Backend, t, err) }()
 	b, err := s.route(t.Backend)
 	if err != nil {
 		return err
@@ -208,7 +258,14 @@ func (s *Set) Update(ctx context.Context, t task.Task) error {
 }
 
 // Create stores t in the backend named by t.Backend (default: the first one).
-func (s *Set) Create(ctx context.Context, t task.Task) (task.Task, error) {
+func (s *Set) Create(ctx context.Context, t task.Task) (res task.Task, err error) {
+	defer func() {
+		at := t
+		if err == nil {
+			at = res
+		}
+		s.auditWrite(ctx, "create", at.Backend, at, err)
+	}()
 	// One rule for every backend (custom ones included); csv checks it again.
 	if err := t.Validate(); err != nil {
 		return task.Task{}, err
@@ -231,7 +288,8 @@ func (s *Set) Create(ctx context.Context, t task.Task) (task.Task, error) {
 }
 
 // Delete removes the task id from the named backend.
-func (s *Set) Delete(ctx context.Context, name, id string) error {
+func (s *Set) Delete(ctx context.Context, name, id string) (err error) {
+	defer func() { s.auditWrite(ctx, "delete", name, task.Task{ID: id}, err) }()
 	b, err := s.route(name)
 	if err != nil {
 		return err
@@ -328,6 +386,21 @@ func (s *Set) Changed() (bool, error) {
 		}
 	}
 	return changed, errors.Join(errs...)
+}
+
+// Reload makes every backend that can serve a cached copy re-read its store
+// (the board's `r` key). Every reloader runs even if one fails; errors are joined.
+func (s *Set) Reload() error {
+	var errs []error
+	for _, it := range s.items {
+		if r, ok := it.Backend.(Reloader); ok {
+			if err := r.Reload(); err != nil {
+				errs = append(errs, fmt.Errorf("backend %s: %w", it.Name, err))
+			}
+		}
+	}
+	s.invalidate()
+	return errors.Join(errs...)
 }
 
 // Close closes every backend, returning the first error.

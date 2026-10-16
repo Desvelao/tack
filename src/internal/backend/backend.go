@@ -44,6 +44,12 @@ type Watcher interface {
 	Changed() (bool, error)
 }
 
+// Reloader is optionally implemented by backends that may serve a cached copy
+// (see the csv `poll` option); Reload re-reads the store now.
+type Reloader interface {
+	Reload() error
+}
+
 // Spec is one entry of the config's `backend:` list, handed to a Factory.
 type Spec struct {
 	Type    string    // backend type, lower case ("csv", "custom")

@@ -2,7 +2,7 @@
 # tkan installer: downloads one pinned release for this OS/arch, verifies its
 # checksum and installs it. Fetch it from the tag you want, so the script and
 # the binary have the same version:
-#   curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.1.0/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.1.1/install.sh | sh
 #
 # Usage: install.sh [-v VERSION] [-d DIR]
 #   -v VERSION  release to install, X.Y.Z (default: the version of this script,
@@ -10,7 +10,7 @@
 #   -d DIR      install directory (default: $TKAN_INSTALL_DIR or ~/.local/bin)
 set -eu
 
-VERSION="0.1.0" # keep in sync with the VERSION file (checked by make check and CI)
+VERSION="0.1.1" # keep in sync with the VERSION file (checked by make check and CI)
 REPO="Desvelao/tkan"
 
 say() { printf '%s\n' "$*"; }

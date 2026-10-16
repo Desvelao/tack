@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"tkan/internal/audit"
 	"tkan/internal/backend"
 	_ "tkan/internal/backend/csv"    // register the csv backend
 	_ "tkan/internal/backend/custom" // register the custom (command) backend
@@ -61,6 +62,7 @@ Usage:
   tkan [-c CONFIG] edit ID [-b NAME] [-status S] [-add-label L] [-rm-label L] [-title T] [-description D] [-priority P] [-type Y] [-notes N] [-assignee A] [-due DATE] [-start DATE] [-labels L]
                                                 change only the fields given (-assignee "" clears one)
   tkan [-c CONFIG] delete ID... [-b NAME] [-n]
+  tkan [-c CONFIG] audit [-q QUERY] [-limit N] [-json]   print the audit trail of reloads and writes (fields: op date time details result source backend id session)
   tkan [-c CONFIG] config                    print the effective configuration (YAML)
   tkan help [filter|COMMAND]                 this text, the filter query syntax, or a command's flags
   tkan version                               print the version (also: tkan -version)
@@ -106,6 +108,7 @@ func commandTable() []command {
 		{name: "add", online: cmdAdd},
 		{name: "edit", online: cmdEdit},
 		{name: "delete", online: cmdDelete},
+		{name: "audit", online: cmdAudit},
 		{name: "config", online: func(_ context.Context, a *app, _ []string, out, errw io.Writer) int {
 			if a == nil { // `help config`: the command has no flags
 				return exitOK
@@ -138,6 +141,7 @@ type app struct {
 	be             *backend.Set
 	spec           board.Spec
 	cfg            *config.Config
+	audit          *audit.Log
 }
 
 // find locates a task like Set.Find, but a bare ID falls back to the default
@@ -200,7 +204,7 @@ func run(args []string, out, errw io.Writer) int {
 		return cmd.offline(rest, out, errw)
 	}
 
-	a, err := open(*cfgPath)
+	a, err := open(*cfgPath, cmd.online == nil)
 	if err != nil {
 		fmt.Fprintln(errw, "tkan:", err)
 		return exitError
@@ -208,7 +212,7 @@ func run(args []string, out, errw io.Writer) int {
 	defer a.be.Close()
 
 	if cmd.online == nil { // no subcommand: the interactive board
-		if _, err := tea.NewProgram(tui.New(a.be, filepath.Base(a.cfg.Path), a.spec), tea.WithAltScreen()).Run(); err != nil {
+		if _, err := tea.NewProgram(tui.New(a.be, filepath.Base(a.cfg.Path), a.spec).WithAudit(a.audit), tea.WithAltScreen()).Run(); err != nil {
 			fmt.Fprintln(errw, "tkan:", err)
 			return exitError
 		}
@@ -226,8 +230,10 @@ func hasColumnSort(s board.Spec) bool {
 	return false
 }
 
-// open loads the config and opens its backends.
-func open(cfgPath string) (*app, error) {
+// open loads the config and opens its backends. interactive is the board: it
+// must not cache lists (reloads would show stale data), unlike the one-shot
+// subcommands.
+func open(cfgPath string, interactive bool) (*app, error) {
 	path, err := config.Locate(cfgPath)
 	if err != nil {
 		return nil, err
@@ -251,8 +257,19 @@ func open(cfgPath string) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	be.CacheLists() // one CLI invocation: list each backend at most once between writes
-	a := &app{be: be, spec: spec, cfg: cfg}
+	if !interactive { // one CLI invocation: list each backend at most once between writes
+		be.CacheLists()
+	}
+	log, err := audit.New(cfg.AuditPath())
+	if err != nil {
+		be.Close()
+		return nil, err
+	}
+	if interactive {
+		log.SetSource("tui")
+	}
+	be.SetAuditor(log)
+	a := &app{be: be, spec: spec, cfg: cfg, audit: log}
 	a.defaultBackend = cfg.DefaultBackend
 	if env := strings.TrimSpace(os.Getenv("TKAN_BACKEND")); env != "" {
 		a.defaultBackend = env
