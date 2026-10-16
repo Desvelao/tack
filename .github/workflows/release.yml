@@ -64,7 +64,7 @@ jobs:
           v="tkan ${{ steps.ver.outputs.version }}"
           case "$(./tkan version)" in "$v"|"$v (built "*")") ;; *) echo "::error::unexpected version output"; exit 1;; esac
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tkan-${{ steps.ver.outputs.version }}
           path: bin/*
