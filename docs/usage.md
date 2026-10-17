@@ -109,6 +109,12 @@ tkan stops and suggests `tkan init`.
 | `?` | help: keys, then (`tab`) the filter syntax |
 | `q` / `ctrl+c` | quit |
 
+**Confirmation of writes.** After a move, edit, new card, delete or undo the bottom line says what the backend
+did: a green `OK` (for example `OK    moved #3 to done`, gone after about 4 seconds or at the next key) or a bold red
+`FAIL` with the backend's error (`FAIL  locked by another tkan ...`), which stays until the next key. The words
+carry the meaning when colours are off (`NO_COLOR`); a long message is cut with `…` to the terminal width. The audit
+trail (`A`) keeps the full text.
+
 The board refreshes by itself within ~1 s when a CSV file changes on disk (for example when an
 AI agent updates it); the csv option `poll` ([config.md](config.md)) changes that to every N seconds or never. If the terminal is narrower than all columns, columns are paged
 horizontally; the focused column is always visible, and a strip under the title lists every

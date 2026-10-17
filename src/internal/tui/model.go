@@ -53,6 +53,27 @@ func (m *Model) pushUndo(op undoOp) {
 	}
 }
 
+type noticeKind int
+
+const (
+	noticeInfo noticeKind = iota
+	noticeOK
+	noticeFail
+)
+
+// okLifetime is how long a success confirmation stays on screen (polled by tickMsg).
+const okLifetime = 4 * time.Second
+
+func (m *Model) setNotice(kind noticeKind, text string) {
+	m.notice, m.noticeKind, m.noticeAt = text, kind, m.clock()
+}
+
+// ok reports a backend write that succeeded; fail one that did not.
+func (m *Model) ok(text string)   { m.setNotice(noticeOK, text) }
+func (m *Model) fail(text string) { m.setNotice(noticeFail, text) }
+
+func (m *Model) clearNotice() { m.notice, m.noticeKind = "", noticeInfo }
+
 // undoLast reverses the most recent move, edit or delete.
 func (m *Model) undoLast() {
 	if len(m.undo) == 0 {
@@ -65,27 +86,31 @@ func (m *Model) undoLast() {
 	if op.recreate {
 		t, err := m.be.Create(ctx, op.prev)
 		if err != nil {
-			m.notice = "undo failed: " + err.Error()
+			m.fail("undo failed: " + err.Error())
 			return
 		}
-		m.reload()
+		if m.reload() != nil {
+			return
+		}
 		m.selectID(t.Backend, t.ID)
-		m.notice = "undid " + op.what
+		m.ok("undid " + op.what)
 		if t.ID != op.prev.ID {
 			m.notice += fmt.Sprintf(" (restored as #%s, the old #%s is gone)", t.ID, op.prev.ID)
 		}
 		return
 	}
 	if err := m.be.Update(ctx, op.prev); err != nil {
-		m.notice = "undo failed: " + err.Error()
+		m.fail("undo failed: " + err.Error())
 		return
 	}
-	m.reload()
+	if m.reload() != nil {
+		return
+	}
 	if !m.selectID(op.prev.Backend, op.prev.ID) && m.filter != "" {
-		m.notice = "undid " + op.what + hiddenHint
+		m.ok("undid " + op.what + hiddenHint)
 		return
 	}
-	m.notice = "undid " + op.what
+	m.ok("undid " + op.what)
 }
 
 type tickMsg time.Time
@@ -112,14 +137,18 @@ type Model struct {
 	width    int
 	height   int
 	notice   string
-	edit     editForm
-	detailY  int              // first visible line of the detail view
-	groupBy  string           // field the cards of a column are grouped by ("" = none)
-	now      func() time.Time // clock for due-date flags; nil = time.Now
-	undo     []undoOp         // newest last; u pops one
-	history  []string         // filters applied this session, newest last (up/down in the / prompt)
-	histPos  int              // position while browsing history; len(history) = not browsing
-	view     string           // name of the saved view behind the current filter ("" = none)
+	// noticeKind says how the notice is drawn (OK / FAIL / plain); noticeAt is
+	// when it was set, so an OK fades after okLifetime while a FAIL stays until a key.
+	noticeKind noticeKind
+	noticeAt   time.Time
+	edit       editForm
+	detailY    int              // first visible line of the detail view
+	groupBy    string           // field the cards of a column are grouped by ("" = none)
+	now        func() time.Time // clock for due-date flags; nil = time.Now
+	undo       []undoOp         // newest last; u pops one
+	history    []string         // filters applied this session, newest last (up/down in the / prompt)
+	histPos    int              // position while browsing history; len(history) = not browsing
+	view       string           // name of the saved view behind the current filter ("" = none)
 
 	audit        *audit.Log  // nil = no audit view
 	auditQ       query.Query // filter of the audit view
@@ -195,14 +224,14 @@ func (m *Model) reload() error {
 	loadErr := err
 	switch {
 	case errors.As(err, &perr): // show what loaded, say what did not
-		m.notice = "error: " + err.Error()
+		m.fail("error: " + err.Error())
 	case err != nil:
-		m.notice = "error: " + err.Error()
+		m.fail("error: " + err.Error())
 		return err
 	}
 	b, err := board.New(m.spec, m.be.Statuses())
 	if err != nil {
-		m.notice = "error: " + err.Error()
+		m.fail("error: " + err.Error())
 		return err
 	}
 	prev, hadSel := m.selected()
@@ -412,11 +441,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.edit.inputs[i].Width = m.editWidth()
 		}
 	case tickMsg:
+		if m.noticeKind == noticeOK && m.clock().Sub(m.noticeAt) >= okLifetime {
+			m.clearNotice() // a success fades; a failure stays until a key
+		}
 		if m.mode == modeBoard {
 			changed, err := m.be.Changed()
 			if err != nil {
 				if m.notice == "" {
-					m.notice = "error: " + err.Error()
+					m.fail("error: " + err.Error())
 				}
 				m.auditReload("auto: checking for changes", err)
 			}
@@ -436,7 +468,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" {
 		return m, tea.Quit
 	}
-	m.notice = ""
+	m.clearNotice()
 
 	switch m.mode {
 	case modeNew, modeFilter:
@@ -455,12 +487,13 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key == "y" || key == "Y" {
 			if t, ok := m.selected(); ok {
 				if err := m.be.Delete(context.Background(), t.Backend, t.ID); err != nil {
-					m.notice = "error: " + err.Error()
+					m.fail("error: " + err.Error())
 				} else {
-					m.notice = "deleted #" + t.ID + " (u undoes)"
 					m.pushUndo(undoOp{what: "delete of #" + t.ID, prev: t, recreate: true})
+					if m.reload() == nil {
+						m.ok("deleted #" + t.ID + " (u undoes)")
+					}
 				}
-				m.reload()
 			}
 		}
 		m.mode = modeBoard
@@ -581,7 +614,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "r":
 		if err := m.be.Reload(); err != nil {
-			m.notice = "error: " + err.Error()
+			m.fail("error: " + err.Error())
 		}
 		m.refresh("manual")
 		if m.notice == "" { // reload sets an error notice on failure
@@ -630,10 +663,9 @@ func (m Model) handleInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if val != "" {
 			t, err := m.be.Create(context.Background(), task.Task{Title: val, Status: m.board.WriteValue(m.col), Backend: m.be.Names()[m.target]})
 			if err != nil {
-				m.notice = "error: " + err.Error()
-			} else {
-				m.notice = "created #" + t.ID
-				m.reload()
+				m.fail("error: " + err.Error())
+			} else if m.reload() == nil {
+				m.ok("created #" + t.ID)
 				if !m.selectID(t.Backend, t.ID) && m.filter != "" {
 					m.notice += hiddenHint
 				}
@@ -816,12 +848,14 @@ func (m *Model) move(delta int) {
 	t.Status = m.board.WriteValue(target)
 	ctx := backend.WithNote(context.Background(), "moved to "+m.board.Columns[target].Name)
 	if err := m.be.Update(ctx, t); err != nil {
-		m.notice = "error: " + err.Error()
+		m.fail("error: " + err.Error())
 		return
 	}
 	m.pushUndo(undoOp{what: "move of #" + t.ID, prev: before})
-	m.reload()
-	m.notice = fmt.Sprintf("moved #%s to %s", t.ID, m.board.Columns[target].Name)
+	if m.reload() != nil {
+		return
+	}
+	m.ok(fmt.Sprintf("moved #%s to %s", t.ID, m.board.Columns[target].Name))
 	if lim, over := m.board.Over(target, m.columnTotal(target)); over {
 		m.notice += fmt.Sprintf(" (over its limit of %d)", lim)
 	}
@@ -930,22 +964,24 @@ func (m *Model) saveEdit() {
 		}
 	}
 	if t.Title == "" {
-		m.notice = "title cannot be empty"
+		m.fail("title cannot be empty")
 		return
 	}
 	for name, v := range map[string]string{"due": t.Due, "start": t.Start} {
 		if _, err := time.Parse("2006-01-02", v); v != "" && err != nil {
-			m.notice = fmt.Sprintf("%s: use YYYY-MM-DD", name)
+			m.fail(fmt.Sprintf("%s: use YYYY-MM-DD", name))
 			return
 		}
 	}
 	if err := m.be.Update(backend.WithNote(context.Background(), "edited"), t); err != nil {
-		m.notice = "error: " + err.Error()
+		m.fail("error: " + err.Error())
 		return
 	}
 	m.pushUndo(undoOp{what: "edit of #" + t.ID, prev: m.edit.orig})
 	m.mode = modeBoard
-	m.reload()
+	if m.reload() != nil {
+		return
+	}
 	m.selectID(t.Backend, t.ID)
-	m.notice = "saved #" + t.ID
+	m.ok("saved #" + t.ID)
 }

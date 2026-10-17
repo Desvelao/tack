@@ -5,6 +5,8 @@ before 1.0 the config format, CSV schema and CLI may still change.
 
 ## [Unreleased]
 
+- TUI: writes (move, edit, new, delete, undo) now report `OK` (green, fades after ~4 s) or `FAIL` (bold red, stays until a key) with the backend error, cut to the terminal width; a failed re-read after a write is no longer hidden by the success message.
+
 ## [0.1.1] - 2026-10-16
 
 - Audit trail of reloads (ok/error) and create/update/delete, from the board and the subcommands: `A` in the board, `tkan audit`, filterable by `op`, `date`, `details`, `result`, `source`, `backend`, `id`, `session`. In memory by default; `audit.file` (`.jsonl` or `.csv`) keeps it across sessions and marks this and the previous one.

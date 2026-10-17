@@ -24,6 +24,8 @@ var (
 	cardSty   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(dim).Padding(0, 1)
 	cardSel   = cardSty.BorderForeground(accent)
 	metaSty   = lipgloss.NewStyle().Foreground(dim)
+	okSty     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "114"})
+	failSty   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"})
 	noteSty   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "215"})
 	helpSty   = lipgloss.NewStyle().Foreground(dim)
 )
@@ -133,7 +135,7 @@ func (m Model) View() string {
 	case modeFilter:
 		b.WriteString("filter> " + m.input.View() + "\n")
 		if m.notice != "" {
-			b.WriteString(noteSty.Render(m.notice))
+			b.WriteString(m.renderNotice())
 		} else {
 			b.WriteString(helpSty.Render("enter apply · empty clears · esc cancel · ? on an empty prompt: syntax help"))
 		}
@@ -145,7 +147,7 @@ func (m Model) View() string {
 		}
 	default:
 		if m.notice != "" {
-			b.WriteString(noteSty.Render(m.notice))
+			b.WriteString(m.renderNotice())
 		} else {
 			b.WriteString(helpSty.Render("←→ column  ↑↓ card  H/L move  enter open  e edit  n new  d delete  / filter  r reload  ? help  q quit"))
 		}
@@ -234,6 +236,35 @@ func (m Model) dueStyle(t task.Task, c int) lipgloss.Style {
 		return soonSty
 	}
 	return metaSty
+}
+
+// renderNotice draws the notice by kind: "OK" in green after a successful
+// write, "FAIL" in bold red after a failed one (the words carry the meaning
+// without colour), anything else in the plain note colour. One line, cut with an
+// ellipsis to the terminal width.
+func (m Model) renderNotice() string {
+	tag, text := "", m.notice
+	switch m.noticeKind {
+	case noticeOK:
+		tag = "OK    "
+	case noticeFail:
+		tag, text = "FAIL  ", strings.TrimPrefix(text, "error: ")
+	}
+	if r := []rune(tag + text); m.width > 0 && len(r) > m.width {
+		r = append(r[:m.width-1], '…')
+		if n := len([]rune(tag)); len(r) <= n {
+			tag, text = string(r), ""
+		} else {
+			text = string(r[n:])
+		}
+	}
+	switch m.noticeKind {
+	case noticeOK:
+		return okSty.Bold(true).Render(tag) + text
+	case noticeFail:
+		return failSty.Render(tag + text)
+	}
+	return noteSty.Render(text)
 }
 
 // clock is the current time; tests replace Model.now.
@@ -582,7 +613,7 @@ func (m Model) editView() string {
 	}
 	b.WriteString("\n")
 	if m.notice != "" {
-		b.WriteString(noteSty.Render(m.notice))
+		b.WriteString(m.renderNotice())
 	} else {
 		b.WriteString(helpSty.Render("tab/↓ next · shift+tab/↑ prev · enter save · esc cancel · dates: YYYY-MM-DD"))
 	}
