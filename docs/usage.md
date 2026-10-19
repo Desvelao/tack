@@ -22,8 +22,12 @@ make clean         # remove ./bin
 make shell         # dev container with the source mounted at /app
 ```
 
+`make install-backends` copies the backend scripts (`contrib/backends/*/tkan-*.sh`) to
+`~/.local/share/tkan/backends` (`PREFIX=/usr/local` for `/usr/local/share/tkan/backends`).
+
 To install a published release instead of building, use `install.sh` (see the README): it
-downloads the pinned release for your OS/arch and verifies its checksum.
+downloads the pinned release for your OS/arch and verifies its checksum, and with `-b sqlite` it installs
+the backend scripts too ([Backend scripts](../README.md#backend-scripts)).
 
 `tkan version` (or `tkan -version`) prints the build version. Builds stamp
 `VERSION`: on a `vX.Y.Z` tag that is `X.Y.Z`, otherwise `git describe` output, or

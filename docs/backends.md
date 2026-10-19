@@ -138,9 +138,27 @@ BOM and line-ending handling.
 
 ## SQLite: the `tkan-sqlite.sh` script
 
-SQLite is provided as a script for the [`custom` backend](#the-custom-backend), shipped as `contrib/backends/sqlite/tkan-sqlite.sh`. Copy it
-next to your `tkan.yaml`, or anywhere and give its path. It needs `bash`, `jq` and the `sqlite3`
+SQLite is provided as a script for the [`custom` backend](#the-custom-backend), shipped as `contrib/backends/sqlite/tkan-sqlite.sh`
+and as the `tkan-sqlite.sh` asset of every release. It needs `bash`, `jq` and the `sqlite3`
 command line tool (3.38 or newer, for the JSON functions); tkan links no SQLite library.
+
+**Getting the script.** Any of these, then use its path in `command:` (or keep it next to `tkan.yaml` and use `./tkan-sqlite.sh`):
+
+```sh
+# the installer, checksum verified; -s skips the tkan binary, -B DIR picks the directory
+curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.2.0/install.sh | sh -s -- -s -b sqlite
+#   -> ~/.local/share/tkan/backends/tkan-sqlite.sh
+
+# by hand from the release
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/tkan-sqlite.sh
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS && install -Dm755 tkan-sqlite.sh ~/.local/share/tkan/backends/tkan-sqlite.sh
+
+# from a clone of the repository
+cp contrib/backends/sqlite/tkan-sqlite.sh ./ && chmod +x tkan-sqlite.sh      # or: make install-backends
+```
+
+On Windows run it under WSL or Git Bash.
 
 ```yaml
 backend:

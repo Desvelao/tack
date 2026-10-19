@@ -22,7 +22,7 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 - `src/internal/backend/custom`: runs an external command, JSON over stdin/stdout
 - `src/internal/backend/filestore`: lock, atomic write and the whole-file `Store`/`Codec`/`Mapping` shared by json, jsonl and yaml
 - `src/internal/backend/json`, `yaml`: JSON / JSON Lines, YAML list backends
-- `contrib/backends/sqlite`: the SQLite backend as a `custom` script (`tkan-sqlite.sh`) and its tests
+- `contrib/backends/sqlite`: the SQLite backend as a `custom` script (`tkan-sqlite.sh`) and its tests; `make release` ships every `contrib/backends/*/tkan-*.sh` as a release asset and `install.sh -b NAME` installs it (`contrib/install-test.sh`, `make test-install`; add a new script's name to `known` in `install.sh`)
 - `src/internal/fleet`: claims -> one row per agent and task (state, since, left, avatar frame); pure, drawn by the `F` view and `tkan fleet`
 - `src/internal/claim`: claim/lease rules (who holds a task, the guarded claim/release write) shared by `claim`, `next`, `run` and the TUI
 - `src/internal/board`: raw status value -> kanban column mapping (pure, no backend/UI imports)

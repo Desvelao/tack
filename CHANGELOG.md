@@ -7,6 +7,7 @@ before 1.0 the config format, CSV schema and CLI may still change.
 
 ## [0.2.0] - 2026-10-19
 
+- Feat: the installer can fetch the backend scripts: `install.sh -b sqlite` (or `-b all`, `$TKAN_BACKENDS`) installs `tkan-sqlite.sh` to `~/.local/share/tkan/backends` (`-B DIR` / `$TKAN_BACKEND_DIR`), `-s` skips the binary. The scripts are release assets listed in `SHA256SUMS` (`make release` adds them), everything is verified before anything is installed. `make install-backends` copies them from a clone. README and `docs/backends.md` explain the installer, manual download and `cp` routes; `contrib/install-test.sh` (`make test-install`, part of `make check`) tests the installer against a fake release.
 - Feat: SQLite is provided as the script `contrib/backends/sqlite/tkan-sqlite.sh` (bash, jq and `sqlite3`) for the `custom` backend: configurable column mapping (`TKAN_SQLITE_FIELDS`), extra columns kept, atomic claims and writes of only the changed columns; `tkan init -backend sqlite` writes its entry. `make test-contrib` tests it.
 - Feat: the `custom` backend implements `backend.Patcher`: an `update` also carries `base` (the task as the caller read it), so a command that writes only the differing fields keeps another writer's change to a different field. Commands that ignore `base` replace the whole record as before.
 - Feat: a `backend:` entry with `command: [./tool.sh]` is a `custom` backend, no `type` needed (`type: custom` with `options.command` is equivalent, but not both). `tkan init -backend custom` writes it.

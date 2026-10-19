@@ -20,7 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.2.0/install.sh | s
 ```
 
 Options: `-v X.Y.Z` / `$TKAN_VERSION` (another release), `-d DIR` / `$TKAN_INSTALL_DIR` (install
-directory, default `~/.local/bin`). Linux (x86-64, arm64, ARMv7, ARMv6) and macOS (Intel, Apple
+directory, default `~/.local/bin`), `-b NAMES` / `$TKAN_BACKENDS` and `-B DIR` / `$TKAN_BACKEND_DIR`
+(backend scripts, see [Backend scripts](#backend-scripts)). Pass options to a piped script with `sh -s --`, for
+example `... | sh -s -- -d /usr/local/bin`. Linux (x86-64, arm64, ARMv7, ARMv6) and macOS (Intel, Apple
 silicon) are supported; on Windows use the manual steps below.
 
 To do it by hand, download the binary for your platform from the
@@ -57,6 +59,39 @@ Build it yourself (needs only Docker):
 ```sh
 make build && make install      # ./bin/tkan, then ~/.local/bin/tkan
 ```
+
+Or copy a binary you built (`make build` writes `bin/tkan`) by hand: `cp bin/tkan ~/.local/bin/tkan`.
+
+### Backend scripts
+
+Backends that are not compiled in ship as scripts for the [`custom` backend](docs/backends.md#the-custom-backend);
+today that is SQLite (`tkan-sqlite.sh`, needs `bash`, `jq` and `sqlite3`). They are assets of every release,
+listed in the same `SHA256SUMS` as the binaries, so there are several ways to get one:
+
+- **With the installer** (checksum verified, nothing is installed if any file fails): add `-b sqlite` (or
+  `-b all`). They go to `~/.local/share/tkan/backends` (`-B DIR` to change it). With `-s` only the scripts are
+  installed, for a tkan you already have:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.2.0/install.sh | sh -s -- -b sqlite
+  curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.2.0/install.sh | sh -s -- -s -b all -B ~/bin
+  ```
+
+- **By hand** from the release:
+
+  ```sh
+  curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/tkan-sqlite.sh
+  curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/SHA256SUMS
+  sha256sum --ignore-missing -c SHA256SUMS        # macOS: shasum -a 256 -c SHA256SUMS
+  install -Dm755 tkan-sqlite.sh ~/.local/share/tkan/backends/tkan-sqlite.sh
+  ```
+
+- **From a clone**: `cp contrib/backends/sqlite/tkan-sqlite.sh ~/.local/share/tkan/backends/` (make the
+  directory first, and `chmod +x` the file), or `make install-backends` (to `$PREFIX/share/tkan/backends`,
+  default `~/.local/share/tkan/backends`).
+
+Then point the config at the file, or copy it next to `tkan.yaml` and use a relative path
+(`command: [./tkan-sqlite.sh, tasks.db, tasks]`). See [SQLite](docs/backends.md#sqlite-the-tkan-sqlitesh-script).
 
 ## Quick start
 

@@ -8,7 +8,7 @@ export BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 PREFIX ?= $(HOME)/.local
 
 .PHONY: test-contrib check-version build build-arm build-armv7 build-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64 release \
-	install clean test race check tidy shell fmt vet
+	install install-backends test-install clean test race check tidy shell fmt vet
 build:
 	$(DC) run --rm build
 build-arm:   # Raspberry Pi Zero W / 1
@@ -24,12 +24,18 @@ build-darwin-arm64:
 build-windows-amd64:
 	GOOS=windows GOARCH=amd64 OUT=bin/tkan-windows-amd64.exe $(DC) run --rm build
 # Every binary plus bin/SHA256SUMS.
+# The backend scripts (contrib/backends/*/tkan-*.sh) are release assets too, checksummed like the binaries.
 release: build build-arm build-armv7 build-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64
+	cp contrib/backends/*/tkan-*.sh bin/
 	cd bin && sha256sum tkan tkan-* > SHA256SUMS
 # Copy the host-arch binary to $(PREFIX)/bin (default ~/.local/bin): make install [PREFIX=/usr/local]
 install: build
 	install -d "$(PREFIX)/bin"
 	install -m 0755 bin/tkan "$(PREFIX)/bin/tkan"
+# Copy the backend scripts to $(PREFIX)/share/tkan/backends: make install-backends [PREFIX=/usr/local]
+install-backends:
+	install -d "$(PREFIX)/share/tkan/backends"
+	install -m 0755 contrib/backends/*/tkan-*.sh "$(PREFIX)/share/tkan/backends/"
 clean:
 	rm -rf bin
 test:
@@ -43,6 +49,7 @@ check: check-version
 	$(DC) run --rm dev go vet ./...
 	$(DC) run --rm test
 	$(MAKE) test-contrib
+	$(MAKE) test-install
 # Every place that names the release must agree with the VERSION file.
 check-version:
 	@v="$$(tr -d '[:space:]' < VERSION)"; \
@@ -50,6 +57,9 @@ check-version:
 	stale="$$(grep -on '/v[0-9]\+\.[0-9]\+\.[0-9]\+/' README.md | grep -v "/v$$v/" || true)"; \
 	test -z "$$stale" || { echo "README.md install URLs are not v$$v:"; echo "$$stale"; exit 1; }; \
 	grep -q "^## \[$$v\]" CHANGELOG.md || { echo "CHANGELOG.md has no '## [$$v]' heading"; exit 1; }
+# The installer against a fake release tree (no network).
+test-install:
+	$(DC) run --rm dev sh -c 'cd /app && sh contrib/install-test.sh'
 # The race detector needs cgo: it runs in its own image with a C compiler.
 race:
 	$(DC) run --rm race

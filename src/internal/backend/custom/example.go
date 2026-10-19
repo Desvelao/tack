@@ -28,6 +28,6 @@ func sqliteExample(string) (backend.Example, error) {
 		Section: "# env: {TKAN_SQLITE_FIELDS: \"id=key,title=summary,status=state\"}   # only where a column name differs from the field\n" +
 			"# poll: 5s             # re-run `list` this often to notice outside changes (default: never; press r)\n" +
 			"# timeout: 10s",
-		Notes: []string{"sqlite: copy contrib/backends/sqlite/tkan-sqlite.sh next to this file (needs bash, jq and sqlite3)"},
+		Notes: []string{"sqlite: get tkan-sqlite.sh with `install.sh -s -b sqlite` or copy it from contrib/backends/sqlite next to this file (needs bash, jq and sqlite3; see docs/backends.md)"},
 	}, nil
 }

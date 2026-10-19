@@ -1,6 +1,6 @@
 # Using tkan from an AI agent
 
-Read this if you need to read or update a task backlog (usually `tasks.csv`; it can also be a JSON/JSON Lines/YAML file, or a SQLite table through the `contrib/backends/sqlite` script, which needs bash, jq and the `sqlite3` CLI) with tkan.
+Read this if you need to read or update a task backlog (usually `tasks.csv`; it can also be a JSON/JSON Lines/YAML file, or a SQLite table through the `contrib/backends/sqlite` script, which needs bash, jq and the `sqlite3` CLI and is installed with `install.sh -b sqlite`, see docs/backends.md) with tkan.
 If you are changing tkan's own source, read the root `AGENTS.md` instead.
 
 ## Rules
