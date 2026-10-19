@@ -146,17 +146,6 @@ func TestTimeoutKillsChildrenOfTheScript(t *testing.T) {
 	}
 }
 
-func TestOutputIsBounded(t *testing.T) {
-	w := &capWriter{max: 10}
-	n, err := w.Write([]byte("0123456789abcdef"))
-	if n != 16 || err != nil || w.buf.String() != "0123456789" || !w.truncated {
-		t.Fatalf("n=%d err=%v buf=%q truncated=%v", n, err, w.buf.String(), w.truncated)
-	}
-	if n, _ := w.Write([]byte("more")); n != 4 || w.buf.Len() != 10 {
-		t.Fatalf("after cap: n=%d len=%d", n, w.buf.Len())
-	}
-}
-
 func TestBackgroundChildDoesNotTurnSuccessIntoAnError(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
@@ -348,10 +337,27 @@ func TestPollSurfacesCommandFailure(t *testing.T) {
 }
 
 func TestInvalidPollIsRejected(t *testing.T) {
-	for _, v := range []string{"abc", "0s", "-1s"} {
-		if _, _, err := open(t, script, "poll: "+v+"\n"); err == nil || !strings.Contains(err.Error(), "invalid poll") {
+	for _, v := range []string{"abc", "0s", "-1s", "0", "-3", "soon"} {
+		if _, _, err := open(t, script, "poll: "+v+"\n"); err == nil || !strings.Contains(err.Error(), "poll must be") {
 			t.Errorf("poll %q: %v", v, err)
 		}
+	}
+}
+
+func TestPollAcceptsTheSharedForms(t *testing.T) {
+	for v, want := range map[string]time.Duration{
+		"5": 5 * time.Second, `"5"`: 5 * time.Second, "5s": 5 * time.Second, "250ms": 250 * time.Millisecond,
+		"none": 0, "watch": 0, `""`: 0,
+	} {
+		be, _, err := open(t, script, "poll: "+v+"\n")
+		if err != nil {
+			t.Errorf("poll %s: %v", v, err)
+			continue
+		}
+		if got := be.(*Backend).poll; got != want {
+			t.Errorf("poll %s: interval %v, want %v", v, got, want)
+		}
+		be.Close()
 	}
 }
 
@@ -369,5 +375,67 @@ func TestCloseStopsThePoller(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not return")
+	}
+}
+
+// writableScript is counterScript whose update stores the new title.
+const writableScript = `#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"op":"update"'*) echo "$req" | sed 's/.*"title":"\([^"]*\)".*/\1/' > "$PWD/title"; echo '{}' ;;
+  *) echo '{"tasks":[{"id":"1","title":"'$(cat "$PWD/title")'","status":"todo"}]}' ;;
+esac
+`
+
+func TestPollIgnoresOwnWrites(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "title"), []byte("a"), 0o644)
+	be, _, err := openIn(t, dir, writableScript, "poll: 50ms\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer be.Close()
+	w := watcher(t, be)
+	tasks, err := be.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Changed() // starts the poller
+	tasks[0].Title = "b"
+	if err := be.Update(context.Background(), tasks[0]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if c, err := w.Changed(); c || err != nil {
+		t.Fatalf("own write reported as an outside change: %v, %v", c, err)
+	}
+	// An outside change after the write is still noticed.
+	os.WriteFile(filepath.Join(dir, "title"), []byte("c"), 0o644)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if c, _ := w.Changed(); c {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("outside change after own write was not noticed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestLazyOpenDoesNotRunTheCommand(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tool.sh"), []byte("#!/bin/sh\ntouch ran\necho '{\"tasks\":[]}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var n yaml.Node
+	if err := yaml.Unmarshal([]byte("command: [./tool.sh]\n"), &n); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.OpenSpec(backend.Spec{Type: "custom", Name: "tool", Options: *n.Content[0], BaseDir: dir, Lazy: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
+		t.Fatal("a lazy open ran the command")
 	}
 }

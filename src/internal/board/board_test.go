@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"tkan/internal/task"
 )
 
 func spec() Spec {
@@ -89,10 +91,11 @@ func TestLookupPrefersNameThenValue(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	cases := map[string]Spec{
-		"duplicate column": {Columns: []ColumnSpec{{Name: "a"}, {Name: "A"}}},
-		"mapped to both":   {Columns: []ColumnSpec{{Name: "a", Values: []string{"x"}}, {Name: "b", Values: []string{"X"}}}},
-		"name is required": {Columns: []ColumnSpec{{Name: " "}}},
-		"unmapped":         {Unmapped: "nope"},
+		"duplicate column":               {Columns: []ColumnSpec{{Name: "a"}, {Name: "A"}}},
+		"mapped to both":                 {Columns: []ColumnSpec{{Name: "a", Values: []string{"x"}}, {Name: "b", Values: []string{"X"}}}},
+		"name is required":               {Columns: []ColumnSpec{{Name: " "}}},
+		"unmapped":                       {Unmapped: "nope"},
+		"board.agents[1]: name is empty": {Agents: []string{"claude", " "}},
 		`write "inprogress" is not one of its values`: {Columns: []ColumnSpec{{Name: "Doing", Values: []string{"in_progress", "wip"}, Write: "inprogress"}}},
 	}
 	for want, s := range cases {
@@ -203,5 +206,31 @@ func TestDuplicateValueMessagesAndWriteSpelling(t *testing.T) {
 	}
 	if got := b.WriteValue(0); got != "WIP" {
 		t.Fatalf("write spelled %q, want the value's own spelling WIP", got)
+	}
+}
+
+func TestDeps(t *testing.T) {
+	b, err := New(DefaultSpec(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := []task.Task{
+		{ID: "1", Status: "done", Backend: "a"},
+		{ID: "2", Status: "failed", Backend: "a"},
+		{ID: "3", Status: "pending", Backend: "a", BlockedBy: "1"},
+		{ID: "4", Status: "pending", Backend: "a", BlockedBy: " 2 , 3,3, 9,4"},
+		{ID: "5", Status: "pending", Backend: "b", BlockedBy: "3"}, // ids refer to the own backend
+	}
+	d := b.Deps(tasks)
+	if !d.Known() || (Deps{}).Known() {
+		t.Fatal("Known")
+	}
+	for i, want := range []string{"", "", "", "2,3", ""} {
+		if got := strings.Join(d.Blockers(tasks[i]), ","); got != want {
+			t.Errorf("#%s: blockers %q, want %q (failed is not finished; unknown and own ids do not block)", tasks[i].ID, got, want)
+		}
+	}
+	if !d.Blocked(tasks[3]) || d.Blocked(tasks[2]) || (Deps{}).Blocked(tasks[3]) {
+		t.Error("Blocked")
 	}
 }

@@ -157,3 +157,51 @@ func TestEmptyIDRejectedAndSymlinkKept(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// flock is tied to the process, so the lock file a crashed tkan leaves behind
+// holds nothing and the next writer is not kept out.
+func TestStaleLockFileDoesNotBlock(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x.lock")
+	if err := os.WriteFile(p, []byte("pid 4242 died here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := LockFile(p, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("a leftover lock file blocked: %v", err)
+	}
+	// While held, a second taker times out; after the release it gets in.
+	if _, err := LockFile(p, 100*time.Millisecond); err == nil {
+		t.Fatal("a held lock was taken twice")
+	}
+	unlock()
+	again, err := LockFile(p, 500*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again()
+}
+
+func TestStampHashesOnlySmallRecentFiles(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(p, []byte("todo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := StatFile(p)
+	if err != nil || a.Hash == 0 {
+		t.Fatalf("recent small file: %+v, %v; want a hash", a, err)
+	}
+	st, _ := os.Stat(p)
+	if err := os.WriteFile(p, []byte("done"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(p, st.ModTime(), st.ModTime())
+	b, _ := StatFile(p)
+	if a == b || a.Hash == b.Hash {
+		t.Fatalf("same-size edit with restored mtime not told apart: %+v vs %+v", a, b)
+	}
+	old := time.Now().Add(-time.Hour)
+	_ = os.Chtimes(p, old, old)
+	if c, _ := StatFile(p); c.Hash != 0 {
+		t.Fatalf("old file hashed: %+v", c)
+	}
+}

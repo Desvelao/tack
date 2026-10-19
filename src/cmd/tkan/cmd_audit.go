@@ -22,7 +22,8 @@ type auditOut struct {
 func cmdAudit(_ context.Context, a *app, args []string, out, errw io.Writer) int {
 	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	fs.SetOutput(errw)
-	q := fs.String("q", "", "filter query; fields: "+strings.Join(audit.Fields, " ")+" (see: tkan help filter)")
+	q := fs.String("q", "", "filter query; fields: "+strings.Join(audit.Fields, " ")+" (what they mean: tkan help filter audit)")
+	fs.Usage = fieldsUsage(fs, "Fields of -q", audit.FieldDocs, audit.SearchFields)
 	limit := fs.Int("limit", 0, "show only the last N matching entries (0 = all)")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if code, ok := parseNoArgs(fs, args, errw); !ok {

@@ -3,12 +3,24 @@ package query
 import (
 	"strings"
 
+	"tkan/internal/board"
 	"tkan/internal/task"
 )
 
+// DerivedFields are computed from the whole task list, not stored: blocked
+// ("yes" while a task of blocked_by is not finished, else "no") and ready (the
+// opposite).
+var DerivedFields = []string{"blocked", "ready"}
+
+// RunningField is "yes" while a background action started from the board runs
+// on the task, else "no". Only the board knows its runs: it supplies the value
+// (TaskLookup leaves the field unknown, so elsewhere only running= matches).
+const RunningField = "running"
+
 // TaskLookup exposes a task's fields to Match. column is the board column the
-// task is shown in ("" if hidden).
-func TaskLookup(t task.Task, column string) Lookup {
+// task is shown in ("" if hidden); deps answers blocked and ready (with the
+// zero Deps they are unknown, so they match only field=).
+func TaskLookup(t task.Task, column string, deps board.Deps) Lookup {
 	return func(field string) (string, bool) {
 		switch field {
 		case "id":
@@ -33,6 +45,20 @@ func TaskLookup(t task.Task, column string) Lookup {
 			return t.Start, true
 		case "labels":
 			return t.Labels, true
+		case "blocked_by":
+			return t.BlockedBy, true
+		case "lease":
+			return t.Lease, true
+		case "claimed_at":
+			return t.ClaimedAt, true
+		case "blocked", "ready":
+			if !deps.Known() {
+				return "", false
+			}
+			if deps.Blocked(t) == (field == "blocked") {
+				return "yes", true
+			}
+			return "no", true
 		case "column":
 			return column, true
 		case "backend":
@@ -48,19 +74,23 @@ func TaskLookup(t task.Task, column string) Lookup {
 }
 
 // KnownFields lists every field name usable in a query for these tasks:
-// the logical fields, "column", "backend", and the keys of any extra columns.
+// the logical fields, "column", "backend", the DerivedFields, RunningField and
+// the keys of any extra columns.
 func KnownFields(tasks []task.Task) []string {
 	names := append([]string(nil), LogicalFields...)
 	names = append(names, "column", "backend")
+	names = append(names, DerivedFields...)
+	names = append(names, RunningField)
 	for _, t := range tasks {
 		for k := range t.Extra {
 			names = append(names, k)
 		}
 	}
 	// keep the logical fields first, in their natural order
-	known := names[:len(LogicalFields)+2]
+	cut := len(LogicalFields) + 2 + len(DerivedFields) + 1
+	known := names[:cut]
 	var extras []string
-	for _, n := range sortedUnique(names[len(LogicalFields)+2:]) {
+	for _, n := range sortedUnique(names[cut:]) {
 		if !contains(known, n) {
 			extras = append(extras, n)
 		}

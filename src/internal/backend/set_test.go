@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,7 +83,7 @@ func TestSetTagsRoutesAndFinds(t *testing.T) {
 	}
 
 	t1, _ := s.Find(ctx, "b", "1")
-	t1.Status = "done"
+	t1.Title, t1.Status = "t1", "done"
 	if err := s.Update(ctx, t1); err != nil || b.tasks[0].Status != "done" || a.tasks[0].Status != "x" {
 		t.Fatalf("update routed wrongly: %v %+v %+v", err, a.tasks, b.tasks)
 	}
@@ -190,7 +191,7 @@ func TestSetCacheListsUntilAWrite(t *testing.T) {
 		t.Fatalf("cached: %d backend lists, want 1", n)
 	}
 	t1, _ := s.Find(ctx, "", "1")
-	t1.Status = "y"
+	t1.Title, t1.Status = "t1", "y"
 	if err := s.Update(ctx, t1); err != nil {
 		t.Fatal(err)
 	}
@@ -330,5 +331,263 @@ func TestSetReloadCallsReloadersAndJoinsErrors(t *testing.T) {
 	err := s.Reload()
 	if n1 != 1 || n2 != 1 || err == nil || !strings.Contains(err.Error(), "backend bad: gone") {
 		t.Fatalf("calls %d/%d err %v", n1, n2, err)
+	}
+}
+
+func TestSetUpdateValidates(t *testing.T) {
+	a := &fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}
+	s := NewSet([]Named{{Name: "a", Type: "fake", Backend: a}})
+	ctx := context.Background()
+	for name, bad := range map[string]task.Task{
+		"empty title": {ID: "1", Title: "  ", Status: "y"},
+		"bad due":     {ID: "1", Title: "one", Due: "tomorrow"},
+		"start>due":   {ID: "1", Title: "one", Start: "2026-02-01", Due: "2026-01-01"},
+	} {
+		if err := s.Update(ctx, bad); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if a.tasks[0].Title != "one" || a.tasks[0].Status != "x" {
+		t.Fatalf("a rejected update reached the backend: %+v", a.tasks)
+	}
+	if err := s.Update(ctx, task.Task{ID: "1", Title: "one", Status: "y", Due: "2026-01-02"}); err != nil || a.tasks[0].Status != "y" {
+		t.Fatalf("valid update: %v %+v", err, a.tasks)
+	}
+}
+
+// failing lists with an error until ok is set.
+type flaky struct {
+	fake
+	lists int
+	fail  bool
+}
+
+func (f *flaky) List(ctx context.Context) ([]task.Task, error) {
+	f.lists++
+	if f.fail {
+		return nil, errors.New("down")
+	}
+	return f.fake.List(ctx)
+}
+
+func TestSetCacheSkipsFailuresAndHandsOutCopies(t *testing.T) {
+	f := &flaky{fake: fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}, fail: true}
+	s := NewSet([]Named{{Name: "a", Backend: f}})
+	s.CacheLists()
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		var perr *PartialError
+		if _, err := s.List(ctx); !errors.As(err, &perr) {
+			t.Fatalf("want PartialError, got %v", err)
+		}
+	}
+	if f.lists != 2 {
+		t.Fatalf("a failed list must not be cached: %d calls, want 2", f.lists)
+	}
+	f.fail = false
+	first, err := s.List(ctx)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("%v %+v", err, first)
+	}
+	first[0].Title = "scribbled" // a caller changing its result must not reach the cache
+	again, _ := s.List(ctx)
+	if f.lists != 3 || again[0].Title != "one" {
+		t.Fatalf("lists %d, cached title %q", f.lists, again[0].Title)
+	}
+}
+
+func TestSetFailedWriteInvalidatesCache(t *testing.T) {
+	n := 0
+	b := &counting{fake: fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}, lists: &n}
+	s := NewSet([]Named{{Name: "a", Backend: b}})
+	s.CacheLists()
+	ctx := context.Background()
+	s.List(ctx)
+	if err := s.Update(ctx, task.Task{ID: "nope", Title: "t", Backend: "a"}); !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	s.List(ctx)
+	if n != 2 {
+		t.Fatalf("a write, even a failed one, may have changed the store: %d lists, want 2", n)
+	}
+}
+
+type failing struct{ fake }
+
+func (*failing) List(context.Context) ([]task.Task, error) { return nil, errors.New("down") }
+
+type lockedSink struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (l *lockedSink) Audit(string, string, string, error, string) {
+	l.mu.Lock()
+	l.n++
+	l.mu.Unlock()
+}
+
+// Run with -race: lists of several backends, Audit and SetAuditor at the same time.
+func TestSetConcurrentUseIsRaceFree(t *testing.T) {
+	var items []Named
+	for _, name := range []string{"a", "b", "c"} {
+		items = append(items, Named{Name: name, Backend: &fake{tasks: []task.Task{{ID: "1", Title: name, Status: "x"}}}})
+	}
+	items = append(items, Named{Name: "bad", Backend: &failing{}})
+	s := NewSet(items)
+	s.CacheLists()
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				switch (i + j) % 3 {
+				case 0:
+					var perr *PartialError
+					if _, err := s.List(ctx); !errors.As(err, &perr) {
+						t.Errorf("want PartialError, got %v", err)
+					}
+				case 1:
+					s.SetAuditor(&lockedSink{})
+				case 2:
+					s.Audit("reload", "", "", nil, "x")
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// patching records which write path the Set took.
+type patching struct {
+	fake
+	patched, updated int
+}
+
+func (p *patching) Patch(_ context.Context, base, t task.Task) error {
+	p.patched++
+	return p.fake.Update(context.Background(), t)
+}
+
+func (p *patching) Update(ctx context.Context, t task.Task) error {
+	p.updated++
+	return p.fake.Update(ctx, t)
+}
+
+func TestSetUpdatePatchesOnlyWhenItKnowsTheOriginal(t *testing.T) {
+	p := &patching{fake: fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}}
+	s := NewSet([]Named{{Name: "a", Backend: p}})
+	edited := task.Task{ID: "1", Title: "one", Status: "y"}
+	if err := s.Update(context.Background(), edited); err != nil || p.updated != 1 || p.patched != 0 {
+		t.Fatalf("without the original: %v updated=%d patched=%d", err, p.updated, p.patched)
+	}
+	ctx := WithOld(context.Background(), task.Task{ID: "1", Title: "one", Status: "x"})
+	if err := s.Update(ctx, edited); err != nil || p.updated != 1 || p.patched != 1 {
+		t.Fatalf("with the original: %v updated=%d patched=%d", err, p.updated, p.patched)
+	}
+}
+
+// partlyBroken lists its good tasks together with a LoadError.
+type partlyBroken struct{ fake }
+
+func (p *partlyBroken) List(ctx context.Context) ([]task.Task, error) {
+	ts, _ := p.fake.List(ctx)
+	return ts, &LoadError{Errs: []error{errors.New("2.md: bad frontmatter")}}
+}
+
+func TestSetKeepsTheTasksThatLoadedNextToALoadError(t *testing.T) {
+	s := NewSet([]Named{{Name: "md", Backend: &partlyBroken{fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}}}, {Name: "ok", Backend: &fake{tasks: []task.Task{{ID: "9", Title: "nine", Status: "x"}}}}})
+	s.CacheLists()
+	ctx := context.Background()
+	got, err := s.List(ctx)
+	var perr *PartialError
+	if !errors.As(err, &perr) || len(perr.Names) != 1 || perr.Names[0] != "md" || !strings.Contains(err.Error(), "2.md") {
+		t.Fatalf("want a PartialError for md, got %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("the healthy tasks must stay: %+v", got)
+	}
+	// A bare ID still resolves: every backend answered, one only had a damaged file.
+	if tk, err := s.Find(ctx, "", "9"); err != nil || tk.Backend != "ok" {
+		t.Fatalf("find: %v %+v", err, tk)
+	}
+	if tk, err := s.Find(ctx, "md", "1"); err != nil || tk.Title != "one" {
+		t.Fatalf("find in md: %v %+v", err, tk)
+	}
+}
+
+func TestSetTracksOnlyWritesThatSucceeded(t *testing.T) {
+	f := &fake{tasks: []task.Task{{ID: "1", Title: "one", Status: "x"}}}
+	s := NewSet([]Named{{Name: "a", Backend: f}})
+	var events []WriteEvent
+	s.SetWriteListener(func(ev WriteEvent) { events = append(events, ev) }, true)
+	ctx := context.Background()
+
+	if err := s.Update(ctx, task.Task{ID: "nope", Title: "t", Backend: "a"}); err == nil {
+		t.Fatal("update of a missing task succeeded")
+	}
+	if w := s.TakeWritten(); len(w) != 0 {
+		t.Fatalf("a failed write was recorded as ours: %v", w)
+	}
+	if len(events) != 1 || events[0].Err == nil || events[0].Op != OpUpdate {
+		t.Fatalf("events %+v", events)
+	}
+
+	// needOld: the previous task is looked up when the caller did not pass it.
+	if err := s.Update(ctx, task.Task{ID: "1", Title: "one", Status: "y", Backend: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if ev := events[1]; !ev.HasOld || ev.Old.Status != "x" || ev.New.Status != "y" || ev.Err != nil {
+		t.Fatalf("event %+v", ev)
+	}
+	created, err := s.Create(ctx, task.Task{Title: "two", Status: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := s.TakeWritten()
+	if !w[Key("a", "1")] || !w[Key("a", created.ID)] || len(w) != 2 {
+		t.Fatalf("written %v", w)
+	}
+	if again := s.TakeWritten(); len(again) != 0 {
+		t.Fatalf("TakeWritten must clear: %v", again)
+	}
+	if err := s.Delete(ctx, "a", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if ev := events[len(events)-1]; ev.Op != OpDelete || !ev.HasOld || ev.Old.Title != "one" {
+		t.Fatalf("delete event %+v", ev)
+	}
+	if present, ok := s.TakeWritten()[Key("a", "1")]; !ok || present {
+		t.Fatalf("a delete must be recorded as gone: ok=%v present=%v", ok, present)
+	}
+	s.SetWriteListener(nil, false)
+	if w := s.TakeWritten(); w != nil {
+		t.Fatalf("without a listener nothing is tracked: %v", w)
+	}
+}
+
+// stubBackend is a lock-less backend (no Patcher), like custom.
+type stubBackend struct {
+	Backend
+	tasks   []task.Task
+	updated int
+}
+
+func (s *stubBackend) List(context.Context) ([]task.Task, error) { return s.tasks, nil }
+func (s *stubBackend) Update(context.Context, task.Task) error   { s.updated++; return nil }
+
+func TestSetUpdateChecksTheGuardForABackendWithoutPatch(t *testing.T) {
+	st := &stubBackend{tasks: []task.Task{{ID: "1", Title: "A", Status: "doing"}}}
+	s := NewSet([]Named{{Name: "x", Backend: st}})
+	ctx := WithExpect(context.Background(), "status", "todo")
+	err := s.Update(ctx, task.Task{ID: "1", Title: "A", Status: "done", Backend: "x"})
+	if !errors.Is(err, ErrPrecondition) || st.updated != 0 {
+		t.Fatalf("err %v, updated %d", err, st.updated)
+	}
+	ctx = WithExpect(context.Background(), "status", "doing")
+	if err := s.Update(ctx, task.Task{ID: "1", Title: "A", Status: "done", Backend: "x"}); err != nil || st.updated != 1 {
+		t.Fatalf("err %v, updated %d", err, st.updated)
 	}
 }

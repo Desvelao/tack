@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"tkan/internal/backend"
+	"tkan/internal/backend/backendtest"
 	"tkan/internal/task"
 )
 
@@ -216,5 +218,160 @@ func TestExample(t *testing.T) {
 	}
 	if len(ex.Statuses) != 2 || ex.Statuses[0] != "Todo" {
 		t.Fatalf("statuses %v", ex.Statuses)
+	}
+}
+
+func TestStructuredLogicalFieldKeepsItsType(t *testing.T) {
+	p := tmp(t, "t.json", `[{"id": 1, "title": {"a": 1}, "status": "todo", "due": [2026, 1, 2]}, {"id": 2, "title": "plain", "status": "todo"}]`)
+	b := openJSON(t, p, "")
+	ctx := context.Background()
+	got, err := b.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0].Status = "doing"
+	if err := b.Update(ctx, got[0]); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	s := string(data)
+	if !strings.Contains(s, `"title": {`) || !strings.Contains(s, `"due": [`) || strings.Contains(s, `"title": "{`) || strings.Contains(s, `"due": "[`) {
+		t.Errorf("structure rewritten as a string:\n%s", s)
+	}
+	// Typing over it makes it plain text, as for any other field.
+	got, _ = b.List(ctx)
+	got[0].Title = "{not json"
+	got[1].Title = `{"b":2}`
+	for _, x := range got[:2] {
+		if err := b.Update(ctx, x); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, _ = os.ReadFile(p)
+	if !strings.Contains(string(data), `"title": "{not json"`) || !strings.Contains(string(data), `"title": "{\"b\":2}"`) {
+		t.Errorf("edited text must be a string:\n%s", data)
+	}
+}
+
+func TestCaseDifferingKeysKeepBothValues(t *testing.T) {
+	p := tmp(t, "t.json", `[{"id": 1, "Title": "upper", "title": "lower", "status": "todo"}, {"id": 2, "title": "exact", "TITLE": "shout", "status": "todo"}, {"id": 3, "TITLE": "first", "Title": "second", "status": "todo"}]`)
+	b := openJSON(t, p, "")
+	ctx := context.Background()
+	got, err := b.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct{ title, extraKey, extra string }{{"lower", "Title", "upper"}, {"exact", "TITLE", "shout"}, {"first", "Title", "second"}}
+	for i, w := range want {
+		if got[i].Title != w.title || got[i].Extra[w.extraKey] != w.extra {
+			t.Errorf("task %d: title %q extra %v, want %q and %s=%q", i+1, got[i].Title, got[i].Extra, w.title, w.extraKey, w.extra)
+		}
+		got[i].Status = "doing"
+		if err := b.Update(ctx, got[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, _ := os.ReadFile(p)
+	for _, v := range []string{"upper", "lower", "exact", "shout", "first", "second"} {
+		if !strings.Contains(string(data), `"`+v+`"`) {
+			t.Errorf("value %q lost after the write:\n%s", v, data)
+		}
+	}
+}
+
+func TestPatchKeepsAConcurrentChangeToAnotherField(t *testing.T) {
+	p := tmp(t, "t.json", sample)
+	reader, writer := openJSON(t, p, ""), openJSON(t, p, "")
+	backendtest.CheckPatch(t, reader, writer, func() { bump(p) })
+}
+
+// bump moves the file's time stamp forward so a second change in the same clock tick is seen.
+func bump(p string) {
+	future := time.Now().Add(time.Duration(time.Now().UnixNano()%1000+2) * time.Second)
+	_ = os.Chtimes(p, future, future)
+}
+
+func TestConcurrentWritersOnJSONAndJSONLines(t *testing.T) {
+	for _, c := range []struct{ name, file, content string }{
+		{"json", "t.json", "[]\n"},
+		{"jsonl", "t.jsonl", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := tmp(t, c.file, c.content)
+			open := func() backend.Backend {
+				b, err := backend.OpenSpec(spec(t, c.name, p, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			}
+			backendtest.CheckConcurrentWriters(t, open, filepath.Dir(p), 4, 12)
+		})
+	}
+}
+
+func TestCompareAndSetOneClaimWins(t *testing.T) {
+	p := tmp(t, "t.json", sample)
+	var hs []backend.Backend
+	for i := 0; i < 6; i++ {
+		hs = append(hs, openJSON(t, p, ""))
+	}
+	backendtest.CheckCompareAndSet(t, hs)
+	backendtest.CheckClaimRace(t, hs)
+}
+
+func TestIDsNotReused(t *testing.T) {
+	for _, c := range []struct{ name, file, content string }{
+		{"json", "t.json", "[]\n"},
+		{"jsonl", "t.jsonl", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := tmp(t, c.file, c.content)
+			open := func() backend.Backend {
+				b, err := backend.OpenSpec(spec(t, c.name, p, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			}
+			backendtest.CheckIDsNotReused(t, open, p+".nextid")
+		})
+	}
+}
+
+// blocked_by is a list like labels: numbers stay numbers (the ids are), a
+// comma-separated string stays a string.
+func TestBlockedByList(t *testing.T) {
+	p := tmp(t, "t.json", `[
+  {"id": 1, "title": "a", "status": "todo"},
+  {"id": 2, "title": "b", "status": "todo", "blocked_by": [1, "x-3"]},
+  {"id": 3, "title": "c", "status": "todo", "depends": "1, 2"}
+]`)
+	b := openJSON(t, p, "fields: {blocked_by: depends}\n")
+	ctx := context.Background()
+	got, err := b.List(ctx)
+	if err != nil || got[2].BlockedBy != "1, 2" || got[1].Extra["blocked_by"] != `[1,"x-3"]` {
+		t.Fatalf("list: %+v %v", got, err)
+	}
+	b = openJSON(t, p, "")
+	if got, err = b.List(ctx); err != nil || got[1].BlockedBy != "1,x-3" {
+		t.Fatalf("list: %+v %v", got, err)
+	}
+	x := got[0]
+	x.BlockedBy = "2, 3"
+	if err := b.Update(ctx, x); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	for _, want := range []string{`"blocked_by": [`, `"x-3"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("missing %s in:\n%s", want, data)
+		}
+	}
+	if got, _ = openJSON(t, p, "").List(ctx); got[0].BlockedBy != "2,3" || got[1].BlockedBy != "1,x-3" {
+		t.Fatalf("after write: %q %q\n%s", got[0].BlockedBy, got[1].BlockedBy, data)
+	}
+	if !strings.Contains(strings.Join(strings.Fields(string(data)), ""), `"blocked_by":[2,3]`) {
+		t.Errorf("numeric ids not written as numbers:\n%s", data)
 	}
 }

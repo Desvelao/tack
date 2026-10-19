@@ -22,6 +22,10 @@ func (m *Model) openAudit() {
 func (m Model) handleAuditKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := k.String()
 	if m.auditEditing {
+		if key == "?" && m.input.Value() == "" {
+			m.openFilterHelp(modeAudit, "Audit fields", audit.FieldDocs, audit.SearchFields)
+			return m, nil
+		}
 		switch key {
 		case "esc":
 			m.auditEditing = false
@@ -95,9 +99,13 @@ func (m Model) auditView() string {
 	}
 	head := titleSty.Render("tkan audit") + metaSty.Render(fmt.Sprintf("  %d/%d entries · %s", len(entries), total, where))
 	if m.auditFilter != "" {
-		head += noteSty.Render("  filter: " + m.auditFilter)
+		head += filterSty.Render("  filter: " + m.auditFilter)
 	}
 
+	opW := 6 // wide enough for the longest op shown (hook:EVENT ops are long)
+	for _, e := range entries {
+		opW = max(opW, min(len(e.Op), 28))
+	}
 	var lines []string
 	last := ""
 	for i := len(entries) - 1; i >= 0; i-- { // newest first
@@ -113,10 +121,10 @@ func (m Model) auditView() string {
 		if e.ID != "" {
 			target += " #" + e.ID
 		}
-		line := fmt.Sprintf("%s  %-6s %-6s %-14s %s", e.Time.Local().Format("01-02 15:04:05"), e.Op, e.Result, trim(target, 14), e.Details)
+		line := fmt.Sprintf("%s  %-*s %-6s %-14s %s", e.Time.Local().Format("01-02 15:04:05"), opW, e.Op, e.Result, trim(target, 14), e.Details)
 		line = trim(line, m.width-1)
 		if e.Result == audit.ResultError {
-			line = noteSty.Render(line)
+			line = failSty.Render(line)
 		}
 		lines = append(lines, line)
 	}
@@ -143,23 +151,14 @@ func (m Model) auditView() string {
 	bottom := helpSty.Render(foot)
 	switch {
 	case m.auditEditing:
-		bottom = m.input.View() + "  " + helpSty.Render("fields: "+strings.Join(audit.Fields, " ")+" · enter apply · esc cancel")
+		bottom = m.input.View() + "  " + helpSty.Render("? fields and syntax · enter apply · esc cancel")
 	case m.notice != "":
-		bottom = noteSty.Render(m.notice)
+		bottom = m.renderNotice()
 	case err != nil:
-		bottom = noteSty.Render("error: " + err.Error())
+		bottom = failSty.Render("error: " + err.Error())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, head, "", strings.Join(lines, "\n"), bottom)
 }
 
-// trim cuts s to w runes.
-func trim(s string, w int) string {
-	if w < 1 {
-		w = 1
-	}
-	r := []rune(s)
-	if len(r) <= w {
-		return s
-	}
-	return string(r[:w-1]) + "…"
-}
+// trim cuts s to w terminal cells (at least one).
+func trim(s string, w int) string { return cut(s, max(w, 1)) }

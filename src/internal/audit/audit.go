@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"tkan/internal/backend/filestore"
 	"tkan/internal/query"
 )
 
@@ -26,10 +27,21 @@ const (
 	OpUpdate = "update"
 	OpDelete = "delete"
 	OpReload = "reload"
+	OpRun    = "run"    // a configured action was started on a task
+	OpReport = "report" // an agent reported on a task (`tkan report`)
 
-	ResultOK    = "ok"
-	ResultError = "error"
+	// OpHookPrefix starts the op of a hook run; the event follows it
+	// (see HookOp), so `op:hook` finds every hook and
+	// `op=hook:task.moved` the ones fired by that event.
+	OpHookPrefix = "hook:"
+
+	ResultOK      = "ok"
+	ResultError   = "error"
+	ResultSkipped = "skipped" // a hook event dropped by a limit (max_parallel, unique, ...)
 )
+
+// HookOp is the op of a hook run fired by event, e.g. "hook:task.moved".
+func HookOp(event string) string { return OpHookPrefix + event }
 
 // Fields are the names usable in an audit filter.
 var Fields = []string{"op", "date", "time", "details", "result", "source", "backend", "id", "session"}
@@ -37,7 +49,23 @@ var Fields = []string{"op", "date", "time", "details", "result", "source", "back
 // SearchFields are what a plain word of a filter is matched against.
 var SearchFields = []string{"details", "op", "date"}
 
+// FieldDocs say what each of Fields is, for the filter help.
+var FieldDocs = []query.FieldDoc{
+	{Name: "op", Desc: "create, update, delete, reload, run, or hook:EVENT"},
+	{Name: "date", Desc: "local day of the entry, YYYY-MM-DD: date=today"},
+	{Name: "time", Desc: "local date and time, YYYY-MM-DD HH:MM:SS"},
+	{Name: "details", Desc: "what happened: title, status, note, error text"},
+	{Name: "result", Desc: "ok, error or skipped (a hook event dropped by a limit)"},
+	{Name: "source", Desc: "who did it: tui, cli, mcp, or hook (started by a hook)"},
+	{Name: "backend", Desc: "name of the backend the entry is about"},
+	{Name: "id", Desc: "id of the task the entry is about"},
+	{Name: "session", Desc: "current, previous, or the id of an older session"},
+}
+
 var seq atomic.Uint32
+
+// lockWait is how long a CSV append waits for another process writing the same file.
+const lockWait = 5 * time.Second
 
 // maxMemory bounds the entries kept in memory for this session.
 const maxMemory = 5000
@@ -46,7 +74,7 @@ const maxMemory = 5000
 type Entry struct {
 	Time    time.Time `json:"time"`
 	Session string    `json:"session"`
-	Source  string    `json:"source"` // tui | cli
+	Source  string    `json:"source"` // tui | cli | mcp | hook
 	Op      string    `json:"op"`
 	Backend string    `json:"backend,omitempty"`
 	ID      string    `json:"id,omitempty"`
@@ -59,6 +87,7 @@ type Entry struct {
 type Log struct {
 	mu      sync.Mutex
 	path    string // "" = memory only
+	maxSize int64  // bytes; the file is rotated to path+".1" past it (0 = never)
 	csv     bool
 	session string
 	source  string
@@ -92,6 +121,18 @@ func New(path string) (*Log, error) {
 func (l *Log) SetSource(s string) {
 	l.mu.Lock()
 	l.source = s
+	l.mu.Unlock()
+}
+
+// SetMaxSize makes the file rotate: an append that finds it larger than kib
+// KiB first renames it to path+".1" (replacing the previous one), so the trail
+// takes at most about twice that. 0 or less never rotates.
+func (l *Log) SetMaxSize(kib int) {
+	l.mu.Lock()
+	l.maxSize = int64(kib) << 10
+	if kib <= 0 {
+		l.maxSize = 0
+	}
 	l.mu.Unlock()
 }
 
@@ -149,6 +190,21 @@ func (l *Log) Err() error {
 
 func (l *Log) appendFile(e Entry) error {
 	var buf bytes.Buffer
+	// The lock decides the CSV header from the file size (two processes starting on
+	// an empty file must not both look before either has written) and keeps a
+	// rotation from racing with another process's append.
+	if l.csv || l.maxSize > 0 {
+		unlock, err := filestore.LockFile(l.path+".lock", lockWait)
+		if err != nil {
+			return fmt.Errorf("audit log: %w", err)
+		}
+		defer unlock()
+		if st, err := os.Stat(l.path); err == nil && l.maxSize > 0 && st.Size() > l.maxSize {
+			if err := os.Rename(l.path, l.path+".1"); err != nil {
+				return fmt.Errorf("audit log: rotate: %w", err)
+			}
+		}
+	}
 	if l.csv {
 		if st, err := os.Stat(l.path); err != nil || st.Size() == 0 {
 			buf.WriteString("time,session,source,op,backend,id,result,details\n")
@@ -164,7 +220,7 @@ func (l *Log) appendFile(e Entry) error {
 		buf.Write(b)
 		buf.WriteByte('\n')
 	}
-	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("audit log: %w", err)
 	}

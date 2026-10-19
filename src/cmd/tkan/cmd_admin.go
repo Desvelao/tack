@@ -32,9 +32,11 @@ func cmdConfig(a *app, out, errw io.Writer) int {
 		Columns  []board.Column   `yaml:"columns"`
 	}
 	type backendOut struct {
-		Name    string    `yaml:"name"`
-		Type    string    `yaml:"type"`
-		Options yaml.Node `yaml:"options,omitempty"`
+		Name     string    `yaml:"name"`
+		Type     string    `yaml:"type"`
+		Command  []string  `yaml:"command,omitempty"`
+		Options  yaml.Node `yaml:"options,omitempty"`
+		Disabled bool      `yaml:"disabled,omitempty"`
 	}
 	eff := struct {
 		Config  string       `yaml:"config"`
@@ -43,7 +45,7 @@ func cmdConfig(a *app, out, errw io.Writer) int {
 		Audit   string       `yaml:"audit,omitempty"`
 	}{Config: a.cfg.Path, Audit: a.cfg.AuditPath()}
 	for _, e := range a.cfg.Backends {
-		eff.Backend = append(eff.Backend, backendOut{Name: e.Name, Type: e.Type, Options: e.Options})
+		eff.Backend = append(eff.Backend, backendOut{Name: e.Name, Type: e.Type, Command: e.Command, Options: e.Options, Disabled: e.Disabled})
 	}
 	eff.Board = boardOut{Unmapped: a.spec.Unmapped, Search: a.spec.Search, Group: a.spec.Group, Views: a.spec.Views, Columns: b.Columns}
 	for _, k := range a.spec.Sort {
@@ -138,7 +140,7 @@ func cmdInit(args []string, out, errw io.Writer) int {
 	if *force {
 		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	}
-	f, err := os.OpenFile(dest, flags, 0o644)
+	f, err := os.OpenFile(dest, flags, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			fmt.Fprintf(errw, "tkan: %s already exists (use -force to overwrite)\n", dest)

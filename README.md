@@ -2,7 +2,7 @@
 
 A small terminal kanban board for a task backlog, plus non-interactive subcommands
 (`list`, `show`, `add`, `edit`, `set-status`, `delete`, ...) for scripts and AI agents.
-Tasks live in pluggable backends (CSV, JSON / JSON Lines / YAML files, a directory of Markdown files, SQLite through its command line tool, and a command-based `custom` backend today).
+Tasks live in pluggable backends (CSV, JSON / JSON Lines / YAML files, and a command-based `custom` backend, which also runs the SQLite script in `contrib/`).
 A single static binary: runs on Linux, macOS, Windows and Raspberry Pi (ARM), at 80x24.
 
 > Pre-1.0: the config format, CSV schema and CLI may still change.
@@ -16,7 +16,7 @@ installs it to `~/.local/bin`. It always installs the exact version of the tag i
 never "latest":
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.1.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Desvelao/tkan/v0.2.0/install.sh | sh
 ```
 
 Options: `-v X.Y.Z` / `$TKAN_VERSION` (another release), `-d DIR` / `$TKAN_INSTALL_DIR` (install
@@ -38,8 +38,8 @@ it to a directory on your `PATH`:
 
 ```sh
 ASSET=tkan          # the asset from the table above
-curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.1/$ASSET
-curl -LO https://github.com/Desvelao/tkan/releases/download/v0.1.1/SHA256SUMS
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/$ASSET
+curl -LO https://github.com/Desvelao/tkan/releases/download/v0.2.0/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS        # macOS: shasum -a 256 -c SHA256SUMS
 install -Dm755 $ASSET ~/.local/bin/tkan         # or: sudo install -m755 $ASSET /usr/local/bin/tkan
 tkan version
@@ -72,7 +72,7 @@ tkan set-status 12 Done
 - [docs/usage.md](docs/usage.md): building, keys, subcommands
 - [docs/config.md](docs/config.md): `tkan.yaml`, board columns, config lookup
 - [docs/filter.md](docs/filter.md): filter language
-- [docs/backends.md](docs/backends.md): CSV, JSON, JSON Lines, YAML, Markdown, SQLite and custom backends
+- [docs/backends.md](docs/backends.md): CSV, JSON, JSON Lines, YAML and custom backends (with the SQLite script)
 - [docs/AGENTS.md](docs/AGENTS.md): using tkan from scripts and agents
 - [AGENTS.md](AGENTS.md): developing this repo
 

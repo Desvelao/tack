@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"tkan/internal/backend"
+	"tkan/internal/backend/backendtest"
 	"tkan/internal/backend/filestore"
 	"tkan/internal/task"
 )
@@ -465,6 +466,30 @@ func TestCreateValidatesAndUpdateKeepsOmittedExtra(t *testing.T) {
 	}
 }
 
+// Update keeps an extra the copy lacks (it may never have seen it); only Patch,
+// which knows the copy the caller read, can remove one.
+func TestPatchRemovesAnExtraThatUpdateKeeps(t *testing.T) {
+	p := write(t, sample)
+	b, _ := Open(mk(p))
+	ctx := context.Background()
+	tasks, _ := b.List(ctx)
+	base := tasks[0]
+	edited := base.Clone()
+	delete(edited.Extra, "owner")
+	if err := b.Update(ctx, edited); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := b.List(ctx); got[0].Extra["owner"] != "ann" {
+		t.Fatalf("Update dropped the extra: %+v", got[0].Extra)
+	}
+	if err := b.(backend.Patcher).Patch(ctx, base, edited); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := b.List(ctx); got[0].Extra["owner"] != "" {
+		t.Fatalf("Patch kept the extra: %+v", got[0].Extra)
+	}
+}
+
 func TestTrailingBlankLineAndEmptyFile(t *testing.T) {
 	p := write(t, "id,title,status\n1,A,pending\n\n")
 	b, err := Open(mk(p))
@@ -689,4 +714,62 @@ func TestLockWaitsForAShortHolder(t *testing.T) {
 	if _, err := be.Create(context.Background(), task.Task{Title: "patient", Status: "pending"}); err != nil {
 		t.Fatalf("a holder that lets go within the timeout must not fail the write: %v", err)
 	}
+}
+
+func TestPatchKeepsAConcurrentChangeToAnotherField(t *testing.T) {
+	p := write(t, sample)
+	reader, _ := Open(mk(p))
+	writer, _ := Open(mk(p))
+	backendtest.CheckPatch(t, reader, writer, func() {
+		future := time.Now().Add(time.Duration(time.Now().UnixNano()%1000+2) * time.Second)
+		_ = os.Chtimes(p, future, future)
+	})
+}
+
+func TestCompareAndSetOneClaimWins(t *testing.T) {
+	p := write(t, sample)
+	var hs []backend.Backend
+	for i := 0; i < 6; i++ {
+		b, err := Open(mk(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hs = append(hs, b)
+	}
+	backendtest.CheckCompareAndSet(t, hs)
+}
+
+func TestClaimRaceOneWins(t *testing.T) {
+	p := write(t, "id,title,status,assignee,lease\n1,A,todo,,\n2,B,todo,,\n")
+	var hs []backend.Backend
+	for i := 0; i < 6; i++ {
+		b, err := Open(mk(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hs = append(hs, b)
+	}
+	backendtest.CheckClaimRace(t, hs)
+	if b := hs[0].(backend.FieldStorer); !b.Stores("lease") || !b.Stores("assignee") {
+		t.Fatal("Stores misses the lease or assignee column")
+	}
+	b, err := Open(mk(write(t, "id,title,status\n1,A,todo\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.(backend.FieldStorer).Stores("lease") {
+		t.Fatal("Stores reports a lease column the file does not have")
+	}
+}
+
+func TestIDsNotReused(t *testing.T) {
+	p := write(t, "id,title,status\n")
+	open := func() backend.Backend {
+		b, err := Open(mk(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	backendtest.CheckIDsNotReused(t, open, p+".nextid")
 }

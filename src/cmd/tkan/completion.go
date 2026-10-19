@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"tkan/internal/action"
 )
 
 // visibleCommands are the subcommands users see (hidden ones start with "__").
@@ -76,6 +78,14 @@ func cmdComplete(ctx context.Context, a *app, args []string, out, _ io.Writer) i
 				fmt.Fprintln(out, n)
 			}
 		}
+	case "actions":
+		for _, n := range action.Names(a.cfg.AllActions()) {
+			fmt.Fprintln(out, n)
+		}
+	case "hooks":
+		for _, s := range a.cfg.AllHooks() {
+			fmt.Fprintln(out, s.Name)
+		}
 	case "backends":
 		for _, n := range a.be.Names() {
 			fmt.Fprintln(out, n)
@@ -109,7 +119,7 @@ func cmdCompletion(args []string, out, errw io.Writer) int {
 		names = append(names, c.name)
 		flags[c.name] = commandFlags(c)
 	}
-	topics := append([]string{"filter"}, names...)
+	topics := append([]string{"filter", "events"}, names...)
 	switch args[0] {
 	case "bash":
 		writeBash(out, names, flags, topics)
@@ -133,7 +143,7 @@ func dashed(flags []string) string {
 }
 
 // idCommands take task IDs as positional arguments.
-var idCommands = []string{"show", "set-status", "edit", "delete"}
+var idCommands = []string{"show", "set-status", "edit", "delete", "run", "claim", "release", "report"}
 
 func writeBash(out io.Writer, names []string, flags map[string][]string, topics []string) {
 	fmt.Fprint(out, `_tkan() {
@@ -173,9 +183,21 @@ func writeBash(out io.Writer, names []string, flags map[string][]string, topics 
 					extra += `
         COMPREPLY+=($(compgen -W "$(tkan "${cfg[@]}" __complete columns 2>/dev/null)" -- "$cur"))`
 				}
+				if n == "run" {
+					extra += `
+        COMPREPLY+=($(compgen -W "$(tkan "${cfg[@]}" __complete actions 2>/dev/null)" -- "$cur"))`
+				}
 				extra += `
       fi`
 			}
+		}
+		if n == "hooks" {
+			extra = `
+      if [[ $cur != -* ]]; then
+        local IFS=$'\n'
+        COMPREPLY+=($(compgen -W "test $(tkan "${cfg[@]}" __complete hooks 2>/dev/null)
+$(tkan "${cfg[@]}" __complete ids 2>/dev/null)" -- "$cur"))
+      fi`
 		}
 		fmt.Fprintf(out, "    %s)\n      COMPREPLY=($(compgen -W \"%s\" -- \"$cur\"))%s\n      ;;\n", n, dashed(flags[n]), extra)
 	}
@@ -201,7 +223,13 @@ func writeZsh(out io.Writer, names []string, flags map[string][]string, topics [
 				if n == "set-status" {
 					extra += "\n      [[ $PREFIX != -* ]] && compadd -- ${(f)\"$(tkan $cfg __complete columns 2>/dev/null)\"}"
 				}
+				if n == "run" {
+					extra += "\n      [[ $PREFIX != -* ]] && compadd -- ${(f)\"$(tkan $cfg __complete actions 2>/dev/null)\"}"
+				}
 			}
+		}
+		if n == "hooks" {
+			extra = "\n      [[ $PREFIX != -* ]] && compadd -- test ${(f)\"$(tkan $cfg __complete hooks 2>/dev/null)\"} ${(f)\"$(tkan $cfg __complete ids 2>/dev/null)\"}"
 		}
 		fmt.Fprintf(out, "    %s)\n      compadd -- %s%s\n      ;;\n", n, dashed(flags[n]), extra)
 	}
@@ -219,8 +247,10 @@ func writeFish(out io.Writer, names []string, flags map[string][]string, topics 
 			fmt.Fprintf(out, "complete -c tkan -n '__fish_seen_subcommand_from %s' -o %s\n", n, f)
 		}
 	}
-	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from list count labels set-status edit add; and __fish_prev_arg_in -status' -a '(tkan (__tkan_cfg) __complete columns 2>/dev/null)'\n")
-	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from show set-status edit delete add; and __fish_prev_arg_in -b' -a '(tkan (__tkan_cfg) __complete backends 2>/dev/null)'\n")
-	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from show set-status edit delete' -a '(tkan (__tkan_cfg) __complete ids 2>/dev/null)'\n")
+	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from list count labels set-status edit add claim release next; and __fish_prev_arg_in -status' -a '(tkan (__tkan_cfg) __complete columns 2>/dev/null)'\n")
+	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from show set-status edit delete add run claim release hooks; and __fish_prev_arg_in -b' -a '(tkan (__tkan_cfg) __complete backends 2>/dev/null)'\n")
+	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from show set-status edit delete run claim release' -a '(tkan (__tkan_cfg) __complete ids 2>/dev/null)'\n")
+	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from run' -a '(tkan (__tkan_cfg) __complete actions 2>/dev/null)'\n")
 	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from set-status' -a '(tkan (__tkan_cfg) __complete columns 2>/dev/null)'\n")
+	fmt.Fprint(out, "complete -c tkan -f -n '__fish_seen_subcommand_from hooks' -a 'test (tkan (__tkan_cfg) __complete hooks 2>/dev/null) (tkan (__tkan_cfg) __complete ids 2>/dev/null)'\n")
 }

@@ -41,7 +41,7 @@ func LockFile(path string, timeout time.Duration) (func(), error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return func() {
-		_ = windows.UnLockFileEx(h, 0, 1, 0, new(windows.Overlapped))
+		_ = windows.UnlockFileEx(h, 0, 1, 0, new(windows.Overlapped))
 		windows.CloseHandle(h)
 	}, nil
 }

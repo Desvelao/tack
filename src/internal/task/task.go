@@ -32,6 +32,15 @@ type Task struct {
 	Due         string `json:"due,omitempty"`    // ISO date, YYYY-MM-DD
 	Start       string `json:"start,omitempty"`  // ISO date, YYYY-MM-DD
 	Labels      string `json:"labels,omitempty"` // comma-separated
+	// BlockedBy lists the ids (same backend) of the tasks that must be finished
+	// before this one is ready, comma-separated. board.Deps says which still block.
+	BlockedBy string `json:"blocked_by,omitempty"`
+	// Lease is when the claim on the task (Assignee) runs out, RFC 3339 UTC;
+	// empty for no claim or one that does not expire (see internal/claim).
+	Lease string `json:"lease,omitempty"`
+	// ClaimedAt is when the current claim started, RFC 3339 UTC; empty when
+	// unknown (a store without the column, a hand-set assignee).
+	ClaimedAt string `json:"claimed_at,omitempty"`
 
 	// Backend names the configured backend the task belongs to. It is filled in
 	// by backend.Set; stores neither read nor persist it.
@@ -54,9 +63,10 @@ func (t Task) Clone() Task {
 	return t
 }
 
-// Validate checks what a new task must satisfy: a title, and Due/Start (when
-// set) as YYYY-MM-DD. Status stays free text. Stores call it on Create only:
-// existing rows may predate these rules and must still be movable.
+// Validate checks what a stored task must satisfy: a title, and Due/Start (when
+// set) as YYYY-MM-DD. Status stays free text. backend.Set calls it on every
+// Create and Update, so a row that already breaks these rules (an empty title,
+// a bad date) has to be fixed before it can be written again, moves included.
 func (t Task) Validate() error {
 	if strings.TrimSpace(t.Title) == "" {
 		return fmt.Errorf("title cannot be empty")
@@ -88,6 +98,21 @@ func (t Task) LabelList() []string {
 		if k := strings.ToLower(l); l != "" && !seen[k] {
 			seen[k] = true
 			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// BlockedByList splits BlockedBy like LabelList does (commas, trimmed, no
+// empty entries or repeats; ids compare exactly).
+func (t Task) BlockedByList() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, id := range strings.Split(t.BlockedBy, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
 		}
 	}
 	return out
@@ -180,6 +205,46 @@ func (t *Task) FieldPtr(name string) *string {
 		return &t.Start
 	case "labels":
 		return &t.Labels
+	case "blocked_by":
+		return &t.BlockedBy
+	case "lease":
+		return &t.Lease
+	case "claimed_at":
+		return &t.ClaimedAt
 	}
 	return nil
+}
+
+// FieldNames are the logical fields in their usual order.
+var FieldNames = []string{"id", "title", "description", "status", "priority", "notes", "type", "assignee", "due", "start", "labels", "blocked_by", "lease", "claimed_at"}
+
+// Merge applies to cur only what edited changed relative to base: each logical
+// field and extra key whose value differs between the two. Whatever someone
+// else changed in cur meanwhile, and edited did not touch, is kept. The ID and
+// the Backend are cur's.
+func Merge(cur, base, edited Task) Task {
+	out := cur.Clone()
+	for _, f := range FieldNames {
+		if f == "id" {
+			continue
+		}
+		b, e := base, edited
+		if *b.FieldPtr(f) != *e.FieldPtr(f) {
+			*out.FieldPtr(f) = *e.FieldPtr(f)
+		}
+	}
+	for k, v := range edited.Extra {
+		if bv, ok := base.Extra[k]; !ok || bv != v {
+			if out.Extra == nil {
+				out.Extra = map[string]string{}
+			}
+			out.Extra[k] = v
+		}
+	}
+	for k := range base.Extra {
+		if _, ok := edited.Extra[k]; !ok {
+			delete(out.Extra, k)
+		}
+	}
+	return out
 }

@@ -15,3 +15,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: gofmt, vet, tests
         run: make check
+      - name: race detector
+        run: make race

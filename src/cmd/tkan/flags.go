@@ -148,6 +148,7 @@ var taskFields = []fieldSpec{
 	{"due", "DATE", "due date, YYYY-MM-DD", func(t *task.Task) *string { return &t.Due }},
 	{"start", "DATE", "start date, YYYY-MM-DD", func(t *task.Task) *string { return &t.Start }},
 	{"labels", "L", "comma-separated labels", func(t *task.Task) *string { return &t.Labels }},
+	{"blocked-by", "IDS", "ids (same backend) of tasks to finish first, comma-separated", func(t *task.Task) *string { return &t.BlockedBy }},
 }
 
 // fieldUsage renders the field flags for a usage line, e.g.

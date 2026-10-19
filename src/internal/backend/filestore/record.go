@@ -26,14 +26,15 @@ type Record []Field
 // Mapping converts Records to Tasks and back. The record keys of the logical
 // fields default to their names and can be renamed with options.fields; every
 // other key is kept in Task.Extra. It also remembers what the file looked like
-// (which keys held non-strings, whether labels were a list) so a write keeps
+// (which keys held non-strings, whether labels and blocked_by were lists) so a write keeps
 // the file's conventions. Not safe for concurrent use: the Store serialises it.
 type Mapping struct {
-	names        map[string]string // logical field -> record key
-	byKey        map[string]string // lower-cased record key -> logical field
-	typed        map[string]bool   // record keys that held non-string values
-	labelsString bool              // labels were seen as a comma-separated string
-	defaults     []string          // record keys written as non-strings until the file says otherwise
+	names      map[string]string // logical field -> record key
+	byKey      map[string]string // lower-cased record key -> logical field
+	typed      map[string]bool   // record keys that held non-string values
+	structured map[string]bool   // key+value of logical fields that held a list or object (see Task)
+	listString map[string]bool   // list fields (labels, blocked_by) seen as a comma-separated string
+	defaults   []string          // record keys written as non-strings until the file says otherwise
 }
 
 // DefaultTyped makes the record key of a logical field (e.g. "id") be written
@@ -45,7 +46,7 @@ func (m *Mapping) DefaultTyped(field string) {
 
 // NewMapping validates an options.fields table (logical field -> record key).
 func NewMapping(typ string, fields map[string]string) (*Mapping, error) {
-	m := &Mapping{names: map[string]string{}, byKey: map[string]string{}, typed: map[string]bool{}}
+	m := &Mapping{names: map[string]string{}, byKey: map[string]string{}, typed: map[string]bool{}, structured: map[string]bool{}, listString: map[string]bool{}}
 	known := map[string]bool{}
 	for _, f := range backend.LogicalFields {
 		known[f] = true
@@ -74,40 +75,58 @@ func NewMapping(typ string, fields map[string]string) (*Mapping, error) {
 // Reset forgets what the previous file looked like; call it before decoding.
 func (m *Mapping) Reset() {
 	m.typed = map[string]bool{}
+	m.structured = map[string]bool{}
 	for _, k := range m.defaults {
 		m.typed[k] = true
 	}
-	m.labelsString = false
+	m.listString = map[string]bool{}
 }
 
-// Task builds a task from a record.
+// Task builds a task from a record. Keys are matched to logical fields without
+// regard to case; when a record has two keys for one field (Title and title)
+// the one spelled exactly like the mapped key (else the first) is the field and
+// the other stays in Extra, so no value is lost on the next write.
 func (m *Mapping) Task(r Record) task.Task {
 	var t task.Task
+	setBy := map[string]Field{} // logical field -> the record field that set it
+	keep := func(f Field) {
+		if t.Extra == nil {
+			t.Extra = map[string]string{}
+		}
+		t.Extra[f.Key] = f.Text
+		if f.Typed {
+			m.typed[f.Key] = true
+		}
+	}
 	for _, f := range r {
 		logical, ok := m.byKey[strings.ToLower(f.Key)]
 		if !ok {
-			if t.Extra == nil {
-				t.Extra = map[string]string{}
-			}
-			t.Extra[f.Key] = f.Text
-			if f.Typed {
-				m.typed[f.Key] = true
-			}
+			keep(f)
 			continue
 		}
+		if prev, dup := setBy[logical]; dup {
+			if f.Key != m.names[logical] || prev.Key == m.names[logical] {
+				keep(f)
+				continue
+			}
+			keep(prev) // f is spelled exactly like the mapped key: it takes the field
+		}
+		setBy[logical] = f
 		text := f.Text
 		switch {
-		case f.Typed && logical == "labels":
-			var list []string
-			if json.Unmarshal([]byte(f.Text), &list) == nil {
+		case f.Typed && listFields[logical]:
+			if list, ok := jsonList(f.Text); ok {
 				text = strings.Join(list, ",")
 			}
 		case f.Typed && f.Text == "null":
 			text = ""
 		case f.Typed:
 			m.typed[f.Key] = true
-		case logical == "labels":
-			m.labelsString = true
+			if isStructuredJSON(f.Text) { // a task only holds text: remember this exact value to write it back as it was
+				m.structured[structuredKey(f.Key, f.Text)] = true
+			}
+		case listFields[logical]:
+			m.listString[logical] = true
 		case logical == "id":
 			m.typed[f.Key] = false
 		}
@@ -127,11 +146,13 @@ func (m *Mapping) Record(t task.Task) Record {
 		}
 		key := m.names[f]
 		switch {
-		case f == "labels" && !m.labelsString:
+		case f == "labels" && !m.listString[f]:
 			list := t.LabelList()
 			b, _ := json.Marshal(list)
 			r = append(r, Field{Key: key, Text: string(b), Typed: true})
-		case m.typed[key] && isScalarJSON(v):
+		case f == "blocked_by" && !m.listString[f]:
+			r = append(r, Field{Key: key, Text: m.idList(t), Typed: true})
+		case m.typed[key] && isScalarJSON(v), m.structured[structuredKey(key, v)]:
 			r = append(r, Field{Key: key, Text: v, Typed: true})
 		default:
 			r = append(r, Field{Key: key, Text: v})
@@ -153,6 +174,48 @@ func (m *Mapping) Record(t task.Task) Record {
 	return r
 }
 
+// listFields are the logical fields a file may hold as a list.
+var listFields = map[string]bool{"labels": true, "blocked_by": true}
+
+// jsonList reads a JSON array of scalars (strings as they are, numbers and
+// booleans as written) as text entries; ok is false for anything else.
+func jsonList(s string) ([]string, bool) {
+	var raw []json.RawMessage
+	if json.Unmarshal([]byte(s), &raw) != nil {
+		return nil, false
+	}
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		var str string
+		switch {
+		case json.Unmarshal(r, &str) == nil:
+			out = append(out, str)
+		case isScalarJSON(string(r)) && string(r) != "null":
+			out = append(out, string(r))
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// idList renders blocked_by as a JSON list: entries that are numbers are
+// written as numbers when the file's ids are (as for the id field itself).
+func (m *Mapping) idList(t task.Task) string {
+	ids := t.BlockedByList()
+	vals := make([]any, len(ids))
+	numeric := m.typed[m.names["id"]]
+	for i, id := range ids {
+		if numeric && isScalarJSON(id) && id != "true" && id != "false" && id != "null" {
+			vals[i] = json.RawMessage(id)
+		} else {
+			vals[i] = id
+		}
+	}
+	b, _ := json.Marshal(vals)
+	return string(b)
+}
+
 // isScalarJSON reports whether s is a JSON number, true, false or null.
 func isScalarJSON(s string) bool {
 	if s == "" || !json.Valid([]byte(s)) {
@@ -164,6 +227,16 @@ func isScalarJSON(s string) bool {
 	}
 	return true
 }
+
+// isStructuredJSON reports whether s is a JSON array or object.
+func isStructuredJSON(s string) bool {
+	return s != "" && (s[0] == '[' || s[0] == '{') && json.Valid([]byte(s))
+}
+
+// structuredKey identifies one list/object value of a record key. Only a value
+// that is still exactly what the file held is written back as a list/object;
+// text the user typed over it is a plain string.
+func structuredKey(key, text string) string { return key + "\x00" + text }
 
 // IsScalarJSON reports whether s is a JSON number, true, false or null.
 func IsScalarJSON(s string) bool { return isScalarJSON(s) }

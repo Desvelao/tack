@@ -128,3 +128,57 @@ func TestPollWatchIsTheDefault(t *testing.T) {
 		t.Fatalf("watch mode must re-read on List: %d", len(ts))
 	}
 }
+
+// sameSizeEdit rewrites p with data of identical size and the previous
+// modification time, either by rename-replace (new inode) or in place (new ctime).
+func sameSizeEdit(t *testing.T, p, data string, rename bool) {
+	t.Helper()
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rename {
+		tmp := p + ".new"
+		if err := os.WriteFile(tmp, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChangedSeesSameSizeEditWithRestoredMtime(t *testing.T) {
+	for _, rename := range []bool{true, false} {
+		for _, age := range []time.Duration{0, -time.Hour} { // fresh (hashed) and old file
+			p := write(t, "id,title,status\n1,A,todo\n")
+			b, err := Open(csvOpts(t, p, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if age != 0 {
+				old := time.Now().Add(age)
+				if err := os.Chtimes(p, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := b.(backend.Watcher)
+			if _, err := b.List(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			sameSizeEdit(t, p, "id,title,status\n1,A,done\n", rename)
+			if ch, err := w.Changed(); !ch || err != nil {
+				t.Fatalf("rename=%v age=%v: Changed = %v, %v; want true", rename, age, ch, err)
+			}
+			got, err := b.List(context.Background())
+			if err != nil || len(got) != 1 || got[0].Status != "done" {
+				t.Fatalf("rename=%v age=%v: List = %+v, %v; want status done", rename, age, got, err)
+			}
+		}
+	}
+}

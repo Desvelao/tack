@@ -3,6 +3,7 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -136,5 +137,59 @@ func TestFilters(t *testing.T) {
 	}
 	if _, err := Parse("nope=1"); err == nil {
 		t.Fatal("unknown field accepted")
+	}
+}
+
+func TestHookOpFilters(t *testing.T) {
+	l, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Record(Entry{Op: OpRun, ID: "1"})
+	l.Record(Entry{Op: HookOp("task.moved"), ID: "1"})
+	l.Record(Entry{Op: HookOp("reload.fail")})
+	es, _ := l.Entries()
+	sess := l.SessionsOf(es)
+	for q, want := range map[string]int{"op=run": 1, "op:hook": 2, "op=hook:task.moved": 1, "op:task.moved": 1} {
+		parsed, err := Parse(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got := len(sess.Filter(es, parsed)); got != want {
+			t.Errorf("%s: %d entries, want %d", q, got, want)
+		}
+	}
+}
+
+func TestFileMode0600AndRotation(t *testing.T) {
+	for _, name := range []string{"r.jsonl", "r.csv"} {
+		p := filepath.Join(t.TempDir(), name)
+		l, _ := New(p)
+		l.SetMaxSize(1)
+		for i := 0; i < 40; i++ {
+			l.Record(Entry{Op: OpUpdate, Details: strings.Repeat("d", 100)})
+		}
+		if err := l.Err(); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
+			t.Errorf("%s: mode %v, want 0600", name, st.Mode().Perm())
+		}
+		if st.Size() > 2<<10 {
+			t.Errorf("%s: %d bytes, rotation did not cap it", name, st.Size())
+		}
+		if _, err := os.Stat(p + ".1"); err != nil {
+			t.Errorf("%s: no rotated file: %v", name, err)
+		}
+		if name == "r.csv" {
+			b, _ := os.ReadFile(p)
+			if !strings.HasPrefix(string(b), "time,session") {
+				t.Errorf("rotated csv lacks its header: %q", b[:20])
+			}
+		}
 	}
 }

@@ -4,6 +4,8 @@
 package filestore
 
 import (
+	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -12,25 +14,57 @@ import (
 // LockTimeout is how long a write waits for another tkan holding the file lock.
 const LockTimeout = 5 * time.Second
 
-// Stamp identifies a version of a file (modification time and size).
+// hashWindow and hashMax bound the content hash: only files that are small and
+// were modified very recently get one, so it stays cheap. It covers filesystems
+// with a coarse mtime (1-2 s on FAT/exFAT, some NFS/SMB) where a same-size edit
+// can keep the same modification time.
+const (
+	hashWindow = 2 * time.Second
+	hashMax    = 256 << 10
+)
+
+// Stamp identifies a version of a file: modification time, size, inode and
+// change time (an editor that replaces the file by rename changes the inode; an
+// in-place write changes the ctime even when the mtime was restored) and, for a
+// small file modified within the last couple of seconds, a hash of its content.
+// Inode and ctime are zero where the platform does not expose them.
 type Stamp struct {
-	Mod  time.Time
-	Size int64
+	Mod   time.Time
+	Size  int64
+	Ino   uint64
+	Ctime int64
+	Hash  uint64
 }
 
-// StatFile returns the current Stamp of path.
+// StatFile returns the current Stamp of path (following symlinks).
 func StatFile(path string) (Stamp, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return Stamp{}, err
 	}
-	return Stamp{st.ModTime(), st.Size()}, nil
+	return StampOf(path, st), nil
+}
+
+// StampOf builds the Stamp of path from an os.Stat result for it.
+func StampOf(path string, st os.FileInfo) Stamp {
+	s := Stamp{Mod: st.ModTime(), Size: st.Size()}
+	s.Ino, s.Ctime = sysIDs(st)
+	if st.Size() <= hashMax && time.Since(st.ModTime()) < hashWindow {
+		if f, err := os.Open(path); err == nil {
+			h := fnv.New64a()
+			if _, err := io.Copy(h, f); err == nil {
+				s.Hash = h.Sum64()
+			}
+			f.Close()
+		}
+	}
+	return s
 }
 
 // WriteAtomic replaces path with data through a temp file + rename in the same
 // directory (writing through a symlink instead of replacing it). It returns the
-// Stamp of the new file, taken before the rename so that an external write
-// landing afterwards differs from it and is noticed.
+// Stamp of the new file (content taken before the rename so that an external
+// write landing afterwards differs from it and is noticed).
 func WriteAtomic(path string, data []byte) (Stamp, error) {
 	target := path
 	if real, err := filepath.EvalSymlinks(path); err == nil {
@@ -68,6 +102,12 @@ func WriteAtomic(path string, data []byte) (Stamp, error) {
 	if err := os.Rename(tmpName, target); err != nil {
 		os.Remove(tmpName)
 		return Stamp{}, err
+	}
+	// The rename changes the ctime, so take the inode and ctime from the renamed
+	// file; if something else already replaced it, keep the stamp as it is so the
+	// difference is noticed.
+	if after, err := StatFile(target); err == nil && after.Mod.Equal(cur.Mod) && after.Size == cur.Size {
+		cur.Ino, cur.Ctime = after.Ino, after.Ctime
 	}
 	SyncDir(dir)
 	return cur, nil

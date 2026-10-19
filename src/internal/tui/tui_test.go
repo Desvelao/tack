@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"gopkg.in/yaml.v3"
 
 	"tkan/internal/backend"
@@ -232,19 +233,35 @@ func TestConfiguredSearchFields(t *testing.T) {
 func TestHelpPagesShowFilterSyntax(t *testing.T) {
 	m, _ := newModel(t)
 	m = press(m, "?")
-	if v := m.View(); !strings.Contains(v, "1/2") || !strings.Contains(v, "move card") {
+	if v := m.View(); !strings.Contains(v, "1/3") || !strings.Contains(v, "move card") {
 		t.Fatalf("keys page:\n%s", v)
 	}
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = nm.(Model)
 	v := m.View()
-	for _, want := range []string{"2/2", "field:value", "field!:value", "field=value", "field!=value", "field^value", "field~regex", "Searched by plain text"} {
+	for _, want := range []string{"2/3", "field:value", "field!:value", "field=value", "field!=value", "field^value", "field~regex", "Searched by plain text"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("filter page missing %q:\n%s", want, v)
 		}
 	}
 	if lines := strings.Count(v, "\n"); lines > 24 {
 		t.Errorf("help page is %d lines, must fit 24 rows", lines)
+	}
+	// The third page says what every field means.
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = nm.(Model)
+	v = m.View()
+	for _, want := range []string{"3/3", "Filter fields", "status", "raw stored value", "column (col)", "backend", "A plain word"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("fields page missing %q:\n%s", want, v)
+		}
+	}
+	if lines := strings.Count(v, "\n"); lines > 24 {
+		t.Errorf("fields page is %d lines, must fit 24 rows", lines)
+	}
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // wraps to the keys
+	if v := nm.(Model).View(); !strings.Contains(v, "1/3") {
+		t.Errorf("tab on the last page should wrap:\n%s", v)
 	}
 	m = press(m, "esc")
 	if m.mode != modeBoard {
@@ -782,11 +799,11 @@ func TestHeaderCountsFollowTheFilter(t *testing.T) {
 
 func TestCardColoursAndLabels(t *testing.T) {
 	for _, p := range []string{"critical", "URGENT", "p0", "P1", "Normal", "p3", "minor"} {
-		if priorityColorOf(p) == "245" {
+		if priorityColorOf(p) == priorityGrey {
 			t.Errorf("priority %q has no colour", p)
 		}
 	}
-	if priorityColorOf("urgent") == priorityColorOf("low") || priorityColorOf("HIGH") != priorityColorOf("p1") || priorityColorOf("zzz") != "245" {
+	if priorityColorOf("urgent") == priorityColorOf("low") || priorityColorOf("HIGH") != priorityColorOf("p1") || priorityColorOf("zzz") != priorityGrey {
 		t.Error("priority colours are not consistent across spellings")
 	}
 	if typeColor("Bug") != typeColor(" bug ") {
@@ -794,7 +811,7 @@ func TestCardColoursAndLabels(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for _, ty := range []string{"bug", "feature", "chore", "fix", "docs", "enhancement"} {
-		seen[string(typeColor(ty))] = true
+		seen[typeColor(ty).Dark.ANSI256] = true
 	}
 	if len(seen) < 3 {
 		t.Errorf("types share too few colours: %v", seen)
@@ -804,7 +821,7 @@ func TestCardColoursAndLabels(t *testing.T) {
 			t.Errorf("labelChip(%q) = %q, want %q", labels, got, want)
 		}
 	}
-	meta := cardMeta(task.Task{Priority: "p1", Type: "bug", Labels: "ui,api,x"}, 60, metaSty)
+	meta := cardMeta(task.Task{Priority: "p1", Type: "bug", Labels: "ui,api,x"}, 60, metaSty, false)
 	if !strings.Contains(meta, "p1") || !strings.Contains(meta, "bug") || !strings.Contains(meta, "[ui,api+1]") {
 		t.Errorf("meta %q", meta)
 	}
@@ -1077,17 +1094,17 @@ func TestPageSizeUsesRealCardHeights(t *testing.T) {
 func TestCardMetaNeverWrapsAndDropsLeastImportantFirst(t *testing.T) {
 	long := task.Task{Backend: "backend-with-a-long-name", Priority: "critical", Type: "documentation", Assignee: "christopher-longname", Due: "2026-12-31", Labels: "frontend,backend,infra"}
 	for _, w := range []int{60, 40, 24, 12, 6} {
-		got := cardMeta(long, w, metaSty)
+		got := cardMeta(long, w, metaSty, false)
 		if strings.Contains(got, "\n") || lipgloss.Width(got) > w {
 			t.Errorf("width %d: %q is %d wide", w, got, lipgloss.Width(got))
 		}
 	}
 	// plenty of room: everything shows
-	if got := cardMeta(task.Task{Priority: "high", Type: "bug", Assignee: "ann", Due: "2026-01-02", Labels: "ui"}, 60, metaSty); !strings.Contains(got, "due 2026-01-02") || !strings.Contains(got, "[ui]") {
+	if got := cardMeta(task.Task{Priority: "high", Type: "bug", Assignee: "ann", Due: "2026-01-02", Labels: "ui"}, 60, metaSty, false); !strings.Contains(got, "due 2026-01-02") || !strings.Contains(got, "[ui]") {
 		t.Errorf("wide meta lost parts: %q", got)
 	}
 	// tight: labels and due go before priority
-	got := cardMeta(task.Task{Priority: "high", Type: "bug", Assignee: "ann", Due: "2026-01-02", Labels: "ui"}, 16, metaSty)
+	got := cardMeta(task.Task{Priority: "high", Type: "bug", Assignee: "ann", Due: "2026-01-02", Labels: "ui"}, 16, metaSty, false)
 	if strings.Contains(got, "[ui]") || strings.Contains(got, "due") || !strings.Contains(got, "high") {
 		t.Errorf("tight meta kept the wrong parts: %q", got)
 	}
@@ -1109,7 +1126,7 @@ func TestLongMetaDoesNotPushFooterOffAt80x24(t *testing.T) {
 	if n := strings.Count(v, "\n") + 1; n > 24 {
 		t.Fatalf("%d lines:\n%s", n, v)
 	}
-	if !strings.Contains(v, "reload") {
+	if !strings.Contains(v, "? help") {
 		t.Fatalf("footer missing:\n%s", v)
 	}
 }
@@ -1223,5 +1240,136 @@ func TestNewTaskIsSelectedUnderActiveSort(t *testing.T) {
 	}
 	if got := m.column(0); got[0].Title != "Alpha" || got[2].Title != "Charlie" || m.row != 2 {
 		t.Fatalf("sorted column %v, row %d", got, m.row)
+	}
+}
+
+func TestTitleLineStaysOneLineAt80Cols(t *testing.T) {
+	m, _ := newModel(t)
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = nm.(Model)
+	m.filter = "type:bug label:frontend assignee:somebody-with-a-long-name"
+	m.groupBy = "type"
+	m.marks = map[cardKey]bool{{}: true, {id: "x"}: true}
+	first := strings.SplitN(m.View(), "\n", 2)[0]
+	if w := lipgloss.Width(first); w > 79 {
+		t.Fatalf("title line is %d cols, want <= 79: %q", w, first)
+	}
+}
+
+func TestFocusedColumnHeaderHasTextMarker(t *testing.T) {
+	m, _ := newModel(t)
+	v := m.View()
+	if strings.Count(v, "▸ ") != 1 {
+		t.Fatalf("want exactly one focus marker, got %d in:\n%s", strings.Count(v, "▸ "), v)
+	}
+}
+
+// TestRolesStayDistinctOnSixteenColours renders the colour roles under the ANSI
+// profile (a Linux console, a Raspberry Pi over serial): none may collapse.
+func TestRolesStayDistinctOnSixteenColours(t *testing.T) {
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI)
+	defer lipgloss.SetColorProfile(old)
+	groups := map[string]map[string]lipgloss.Style{
+		"ids":         {"id": idSty},
+		"header tags": {"loading": loadSty, "filter": filterSty, "mark": markSty, "sort": sortSty, "group": groupSty, "fail": failSty, "ok": okSty},
+		"priorities": {
+			"p0": lipgloss.NewStyle().Foreground(priorityColorOf("p0")),
+			"p1": lipgloss.NewStyle().Foreground(priorityColorOf("p1")),
+			"p2": lipgloss.NewStyle().Foreground(priorityColorOf("p2")),
+			"p3": lipgloss.NewStyle().Foreground(priorityColorOf("p3")),
+		},
+	}
+	for gname, roles := range groups {
+		seen := map[string]string{}
+		for name, sty := range roles {
+			out := sty.Render("x")
+			if !strings.Contains(out, "\x1b[") {
+				t.Errorf("%s: %s renders without colour under ANSI: %q", gname, name, out)
+			}
+			if other, dup := seen[out]; dup {
+				t.Errorf("%s: %s and %s render the same on 16 colours: %q", gname, name, other, out)
+			}
+			seen[out] = name
+		}
+	}
+}
+
+// TestTextCuesSurviveNoColor: with colours off, the board still shows the focus
+// marker.
+func TestTextCuesSurviveNoColor(t *testing.T) {
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	defer lipgloss.SetColorProfile(old)
+	m, _ := newModel(t)
+	v := m.View()
+	if strings.Contains(v, "\x1b[") {
+		t.Fatalf("ascii profile still emits escapes: %q", v)
+	}
+	if !strings.Contains(v, "▸ ") {
+		t.Error("no focus marker without colour")
+	}
+}
+
+func TestDeleteMarkedCards(t *testing.T) {
+	m, be := newModel(t)
+	m = press(m, " ", "down", " ") // mark two cards of the first column
+	if len(m.marks) != 2 {
+		t.Fatalf("marks %d, want 2", len(m.marks))
+	}
+	m = press(m, "d")
+	if m.mode != modeConfirmDelete || len(m.deleteTargets) != 2 {
+		t.Fatalf("d: mode %v, %d targets", m.mode, len(m.deleteTargets))
+	}
+	m = press(m, "x") // cancel keeps everything, marks included
+	tasks, _ := be.List(context.Background())
+	if len(tasks) != 3 || len(m.marks) != 2 {
+		t.Fatalf("cancel: %d tasks, %d marks", len(tasks), len(m.marks))
+	}
+	m = press(m, "d", "y")
+	tasks, _ = be.List(context.Background())
+	if len(tasks) != 1 || len(m.marks) != 0 || !strings.Contains(m.notice, "deleted 2 cards") {
+		t.Fatalf("delete: %d tasks, %d marks, notice %q", len(tasks), len(m.marks), m.notice)
+	}
+	m = press(m, "u")
+	tasks, _ = be.List(context.Background())
+	if len(tasks) != 3 {
+		t.Fatalf("undo: %d tasks, want 3 (notice %q)", len(tasks), m.notice)
+	}
+}
+
+func TestMoveToColumn(t *testing.T) {
+	m, be := newModel(t)
+	m = press(m, "m", "3") // #1 Alpha: pending -> done
+	tasks, _ := be.List(context.Background())
+	if got := tasks[0].Status; got != "done" {
+		t.Fatalf("status %q, want done (notice %q)", got, m.notice)
+	}
+	m = press(m, "u")
+	tasks, _ = be.List(context.Background())
+	if got := tasks[0].Status; got != "pending" {
+		t.Fatalf("undo: status %q", got)
+	}
+	m = press(m, "m", "1")
+	if !strings.Contains(m.notice, "already in") {
+		t.Fatalf("notice %q", m.notice)
+	}
+	m = press(m, "m", "esc", "m", "9")
+	if m.mode != modeBoard {
+		t.Fatalf("mode %v", m.mode)
+	}
+}
+
+func TestMoveMarkedCardsToColumn(t *testing.T) {
+	m, be := newModel(t)
+	m = press(m, " ", "down", " ", "m", "3")
+	tasks, _ := be.List(context.Background())
+	if tasks[0].Status != "done" || tasks[1].Status != "done" || len(m.marks) != 0 || !strings.Contains(m.notice, "moved 2 cards") {
+		t.Fatalf("statuses %q %q, marks %d, notice %q", tasks[0].Status, tasks[1].Status, len(m.marks), m.notice)
+	}
+	m = press(m, "u")
+	tasks, _ = be.List(context.Background())
+	if tasks[0].Status != "pending" || tasks[1].Status != "pending" {
+		t.Fatalf("undo: %q %q (notice %q)", tasks[0].Status, tasks[1].Status, m.notice)
 	}
 }

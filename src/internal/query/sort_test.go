@@ -12,7 +12,7 @@ import (
 func order(tasks []task.Task, keys ...board.SortKey) string {
 	ts := append([]task.Task(nil), tasks...)
 	sort.SliceStable(ts, func(i, j int) bool {
-		return CompareBy(TaskLookup(ts[i], ""), TaskLookup(ts[j], ""), keys) < 0
+		return CompareBy(TaskLookup(ts[i], "", board.Deps{}), TaskLookup(ts[j], "", board.Deps{}), keys) < 0
 	})
 	var ids []string
 	for _, t := range ts {

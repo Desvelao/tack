@@ -20,7 +20,7 @@ func cmdList(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(errw)
 	status := fs.String("status", "", "only tasks in this column (or with this raw status value)")
-	q := fs.String("q", "", "filter query, e.g. 'priority=high col:doing' (see: tkan help filter)")
+	q := fs.String("q", "", "filter query, e.g. 'priority=high col:doing' (syntax and fields: tkan help filter)")
 	view := fs.String("v", "", "saved view (board.views) to apply; combined with -q")
 	asJSON := fs.Bool("json", false, "JSON output")
 	ids := fs.Bool("ids", false, "print only BACKEND:ID, one per line (for piping into set-status / delete)")
@@ -82,7 +82,7 @@ func cmdList(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 			return exitUsage
 		}
 		sort.SliceStable(filtered, func(i, j int) bool {
-			return query.CompareBy(query.TaskLookup(filtered[i].Task, filtered[i].Column), query.TaskLookup(filtered[j].Task, filtered[j].Column), keys) < 0
+			return query.CompareBy(filtered[i].lookup(), filtered[j].lookup(), keys) < 0
 		})
 	}
 	if *limit > 0 && len(filtered) > *limit {
@@ -104,7 +104,7 @@ func cmdList(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 		return finish(exitOK)
 	}
 	cell := func(t taskOut, f string) string {
-		v, _ := query.TaskLookup(t.Task, t.Column)(f)
+		v, _ := t.lookup()(f)
 		return v
 	}
 	if *tsv {
@@ -192,6 +192,7 @@ func selectTasks(ctx context.Context, a *app, status, view, q string, errw io.Wr
 			return nil, false, exitUsage, false
 		}
 	}
+	deps := b.Deps(tasks)
 	filtered = make([]taskOut, 0, len(tasks))
 	for _, t := range tasks {
 		if status != "" {
@@ -203,7 +204,8 @@ func selectTasks(ctx context.Context, a *app, status, view, q string, errw io.Wr
 			}
 		}
 		o := withColumn(b, t)
-		if !qry.Empty() && !qry.Match(query.TaskLookup(t, o.Column), a.spec.Search) {
+		o.deps, o.Blockers = deps, deps.Blockers(t)
+		if !qry.Empty() && !qry.Match(o.lookup(), a.spec.Search) {
 			continue
 		}
 		filtered = append(filtered, o)
@@ -349,8 +351,8 @@ func cmdShow(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 	if *asJSON {
 		return writeJSON(out, o)
 	}
-	fmt.Fprintf(out, "backend:     %s\nid:          %s\ntitle:       %s\nstatus:      %s\ncolumn:      %s\npriority:    %s\ntype:        %s\nassignee:    %s\ndue:         %s\nstart:       %s\nlabels:      %s\ndescription: %s\nnotes:       %s\n",
-		t.Backend, t.ID, t.Title, t.Status, o.Column, t.Priority, t.Type, t.Assignee, t.Due, t.Start, t.Labels, t.Description, t.Notes)
+	fmt.Fprintf(out, "backend:     %s\nid:          %s\ntitle:       %s\nstatus:      %s\ncolumn:      %s\npriority:    %s\ntype:        %s\nassignee:    %s\ndue:         %s\nstart:       %s\nlabels:      %s\nblocked_by:  %s\ndescription: %s\nnotes:       %s\n",
+		t.Backend, t.ID, t.Title, t.Status, o.Column, t.Priority, t.Type, t.Assignee, t.Due, t.Start, t.Labels, t.BlockedBy, t.Description, t.Notes)
 	return exitOK
 }
 

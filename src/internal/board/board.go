@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"tkan/internal/task"
 )
 
 // Modes for Spec.Unmapped.
@@ -46,6 +48,12 @@ type Spec struct {
 	// Views are named, saved filters (board.views). The query text is parsed
 	// by the config loader; this package only checks the names.
 	Views []ViewSpec `yaml:"views,omitempty"`
+	// Agents are assignee names of AI agents (case-insensitive): the board
+	// highlights the cards assigned to one of them. Display only.
+	Agents []string `yaml:"agents,omitempty"`
+	// Avatars give an agent (a name as in Agents) the frames of its picture in
+	// the fleet view: emoji or short text, cycled while it is busy.
+	Avatars map[string][]string `yaml:"avatars,omitempty"`
 }
 
 // ViewSpec is one saved filter.
@@ -115,6 +123,24 @@ func (s Spec) Validate() error {
 	for i, f := range s.Search {
 		if strings.TrimSpace(f) == "" {
 			return fmt.Errorf("board.search[%d]: field name is empty", i)
+		}
+	}
+	for i, a := range s.Agents {
+		if strings.TrimSpace(a) == "" {
+			return fmt.Errorf("board.agents[%d]: name is empty", i)
+		}
+	}
+	for name, frames := range s.Avatars {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("board.avatars: agent name is empty")
+		}
+		if len(frames) == 0 {
+			return fmt.Errorf("board.avatars.%s: needs at least one frame", name)
+		}
+		for i, f := range frames {
+			if strings.TrimSpace(f) == "" {
+				return fmt.Errorf("board.avatars.%s[%d]: frame is empty", name, i)
+			}
 		}
 	}
 	if err := s.validateSort(); err != nil {
@@ -327,3 +353,41 @@ func Finished(name string) bool {
 	n := strings.NewReplacer(" ", "", "-", "", "_", "", "'", "").Replace(strings.ToLower(name))
 	return finishedNames[n]
 }
+
+// Deps knows which tasks still block others (see Board.Deps). The zero value
+// knows nothing: Known is false and no task is blocked.
+type Deps struct {
+	open map[depKey]bool // every listed task -> true while it is not in a Finished column
+}
+
+type depKey struct{ backend, id string }
+
+// Deps records, for the listed tasks, which are finished: in a column whose
+// name Finished accepts (cards of hidden values count as not finished).
+func (b Board) Deps(tasks []task.Task) Deps {
+	d := Deps{open: make(map[depKey]bool, len(tasks))}
+	for _, t := range tasks {
+		c := b.ColumnOf(t.Status)
+		d.open[depKey{t.Backend, t.ID}] = c < 0 || !Finished(b.Columns[c].Name)
+	}
+	return d
+}
+
+// Known reports whether d was built from a task list.
+func (d Deps) Known() bool { return d.open != nil }
+
+// Blockers lists the ids of t's blocked_by that still block it: tasks of the
+// same backend that exist and are not finished. An id naming no listed task
+// (deleted, a typo, a backend that failed to load) and t's own id do not block.
+func (d Deps) Blockers(t task.Task) []string {
+	var out []string
+	for _, id := range t.BlockedByList() {
+		if id != t.ID && d.open[depKey{t.Backend, id}] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// Blocked reports whether t has any blocker left.
+func (d Deps) Blocked(t task.Task) bool { return len(d.Blockers(t)) > 0 }

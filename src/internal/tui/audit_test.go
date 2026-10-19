@@ -173,3 +173,57 @@ func TestPollNoneBoardReloadsOnlyOnR(t *testing.T) {
 		t.Fatalf("%+v", es)
 	}
 }
+
+func TestAuditFileFailureIsShownOnTick(t *testing.T) {
+	m, l, _ := auditModel(t, filepath.Join(t.TempDir(), "missing", "audit.jsonl"))
+	m = press(m, "L") // a write: its audit entry cannot be stored
+	if m.noticeKind == noticeFail {
+		t.Fatalf("the write itself succeeded: %q", m.notice)
+	}
+	next, _ := m.Update(tickMsg(time.Now()))
+	m = next.(Model)
+	if m.noticeKind != noticeFail || !strings.Contains(m.notice, "audit log") {
+		t.Fatalf("notice %q (kind %v)", m.notice, m.noticeKind)
+	}
+	if es := entriesOf(t, l); len(es) == 0 { // still kept in memory
+		t.Fatal("entries lost")
+	}
+	next, _ = m.Update(tickMsg(time.Now())) // reported once
+	if m = next.(Model); strings.Contains(m.notice, "audit log") && m.noticeKind != noticeFail {
+		t.Fatal(m.notice)
+	}
+}
+
+// In the audit view's filter prompt, ? explains the syntax and what every field is.
+func TestAuditPromptHelpListsFieldsWithMeanings(t *testing.T) {
+	m, _, _ := auditModel(t, "")
+	m = press(m, "A", "/")
+	if v := m.View(); !strings.Contains(v, "? fields and syntax") {
+		t.Fatalf("prompt hint missing:\n%s", v)
+	}
+	m = press(m, "?")
+	if m.mode != modeHelp {
+		t.Fatalf("mode %v", m.mode)
+	}
+	if v := m.View(); !strings.Contains(v, "field:value") || !strings.Contains(v, "1/2") {
+		t.Fatalf("syntax page:\n%s", v)
+	}
+	m = press(m, "tab")
+	v := m.View()
+	for _, f := range audit.FieldDocs {
+		if !strings.Contains(v, f.Name) || !strings.Contains(v, f.Desc) {
+			t.Errorf("field %q or its meaning missing:\n%s", f.Name, v)
+		}
+	}
+	if !strings.Contains(v, "Audit fields") || strings.Count(v, "\n") > 24 {
+		t.Errorf("fields page:\n%s", v)
+	}
+	m = press(m, "tab") // only syntax and fields turn here, never the board's keys
+	if v := m.View(); !strings.Contains(v, "field:value") {
+		t.Fatalf("page 2 of 2 should wrap to the syntax:\n%s", v)
+	}
+	m = press(m, "esc")
+	if m.mode != modeAudit || !m.auditEditing {
+		t.Fatalf("back in the prompt expected: mode %v editing %v", m.mode, m.auditEditing)
+	}
+}

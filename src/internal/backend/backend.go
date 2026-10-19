@@ -19,7 +19,47 @@ import (
 var (
 	ErrNotFound    = errors.New("task not found")
 	ErrUnsupported = errors.New("operation not supported by this backend")
+	// ErrPrecondition: the guard given with WithExpect did not hold when the
+	// write was about to be applied (somebody else changed the field first).
+	ErrPrecondition = errors.New("precondition failed")
 )
+
+type expectKey struct{}
+
+type expectation struct{ field, value string }
+
+// WithExpect makes an Update (or Patch) conditional: it is applied only if the
+// stored task still has value in the logical field (status, assignee, ...),
+// else it fails with ErrPrecondition and changes nothing. Backends check it
+// inside their own lock or transaction, so of several writers racing on the
+// same expectation exactly one wins (a custom command only if it reports
+// "guard":true).
+func WithExpect(ctx context.Context, field, value string) context.Context {
+	return context.WithValue(ctx, expectKey{}, expectation{field, value})
+}
+
+// Expected returns the guard set by WithExpect.
+func Expected(ctx context.Context) (field, value string, ok bool) {
+	e, ok := ctx.Value(expectKey{}).(expectation)
+	return e.field, e.value, ok
+}
+
+// CheckExpect is nil without a guard or when cur satisfies it, else an error
+// wrapping ErrPrecondition. cur is the task as the store holds it right now.
+func CheckExpect(ctx context.Context, cur task.Task) error {
+	field, want, ok := Expected(ctx)
+	if !ok {
+		return nil
+	}
+	p := cur.FieldPtr(field)
+	if p == nil {
+		return fmt.Errorf("%w: unknown field %q", ErrPrecondition, field)
+	}
+	if *p != want {
+		return fmt.Errorf("%w: %s is %q, expected %q", ErrPrecondition, field, *p, want)
+	}
+	return nil
+}
 
 // Backend is the only thing the TUI and CLI depend on.
 type Backend interface {
@@ -44,6 +84,47 @@ type Watcher interface {
 	Changed() (bool, error)
 }
 
+// LoadError is returned by List together with the tasks that did load, when
+// part of the store could not be read (one malformed file of many). Callers
+// that can use a partial list keep the tasks and show the error; the writes of
+// the healthy part keep working.
+type LoadError struct{ Errs []error }
+
+func (e *LoadError) Error() string {
+	parts := make([]string, len(e.Errs))
+	for i, err := range e.Errs {
+		parts[i] = err.Error()
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Unwrap exposes the individual errors to errors.Is / errors.As.
+func (e *LoadError) Unwrap() []error { return e.Errs }
+
+// Patcher is optionally implemented by backends that can write only what an
+// edit changed. Patch stores t over the task as the store holds it now, but
+// only the fields (and extra keys) that differ between base, the task as the
+// caller read it, and t. A change someone else made to another field in the
+// meantime survives, where Update would write the caller's old copy over it.
+// Patch and Update honour a guard set with WithExpect inside the store's lock.
+type Patcher interface {
+	Patch(ctx context.Context, base, t task.Task) error
+}
+
+// Guarder is optionally implemented by backends that may or may not check a
+// WithExpect guard atomically (a custom command: only if it said so). Set.Update
+// asks it instead of assuming, and skips its best-effort read-and-check when true.
+type Guarder interface {
+	Guards() bool
+}
+
+// FieldStorer is optionally implemented by backends whose store has a fixed
+// set of columns (csv): Stores reports whether a value written to the
+// logical field is kept. Backends without it store every field.
+type FieldStorer interface {
+	Stores(field string) bool
+}
+
 // Reloader is optionally implemented by backends that may serve a cached copy
 // (see the csv `poll` option); Reload re-reads the store now.
 type Reloader interface {
@@ -55,7 +136,9 @@ type Spec struct {
 	Type    string    // backend type, lower case ("csv", "custom")
 	Name    string    // unique name of this entry (given or generated)
 	Options yaml.Node // the entry's `options:` block; Kind == 0 when absent
+	Command []string  // the entry's `command:` (custom backends); nil when absent
 	BaseDir string    // directory of the config file; relative paths resolve against it
+	Lazy    bool      // the caller loads in the background: do not list while opening
 }
 
 // Resolve returns p made absolute against the config directory.
@@ -125,6 +208,10 @@ func Supported() []string {
 
 // Example is what a backend contributes to a generated sample configuration.
 type Example struct {
+	// Entry is YAML text for keys of the backend entry itself, written before
+	// `options:` (the custom backend's `command:`); empty for most backends. When
+	// set, the entry starts with it instead of `type:`.
+	Entry string
 	// Section is the YAML text of the entry's `options:` body (for example
 	// "source: {{source}}\nheader: true\nfields: ..."), unindented and without a
 	// trailing blank line. The token {{source}} is replaced by the (quoted)

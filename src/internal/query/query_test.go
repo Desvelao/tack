@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"tkan/internal/board"
 	"tkan/internal/task"
 )
 
@@ -22,7 +23,7 @@ func ids(t *testing.T, q string, search []string) string {
 	}
 	var out []string
 	for _, tk := range sample {
-		if p.Match(TaskLookup(tk, "Col-"+tk.Status), search) {
+		if p.Match(TaskLookup(tk, "Col-"+tk.Status, board.Deps{}), search) {
 			out = append(out, tk.ID)
 		}
 	}
@@ -135,7 +136,7 @@ func TestCheckUnknownField(t *testing.T) {
 
 func TestKnownFieldsAndSearchCheck(t *testing.T) {
 	k := KnownFields(sample)
-	want := "id,title,description,status,priority,notes,type,assignee,due,start,labels,column,backend,story_points"
+	want := "id,title,description,status,priority,notes,type,assignee,due,start,labels,blocked_by,lease,claimed_at,column,backend,blocked,ready,running,story_points"
 	if got := strings.Join(k, ","); got != want {
 		t.Fatalf("got %s", got)
 	}
@@ -148,9 +149,9 @@ func TestKnownFieldsAndSearchCheck(t *testing.T) {
 }
 
 func TestHelpMentionsEveryOperatorAndFields(t *testing.T) {
-	h := Help([]string{"id", "title", "assignee"}, []string{"title", "Assignee"})
+	h := Help([]string{"title", "Assignee"})
 	for _, want := range []string{"field:value", "field!:value", "field=value", "field!=value", "field^value", "field~regex",
-		"field=", "a,b", "-text", `"two words"`, "title, assignee", "id, title, assignee"} {
+		"field=", "a,b", "-text", `"two words"`, "title, assignee", "what they mean"} {
 		if !strings.Contains(h, want) {
 			t.Errorf("help missing %q:\n%s", want, h)
 		}
@@ -188,7 +189,7 @@ func TestOrderingComparesNumbersNumerically(t *testing.T) {
 		}
 		var got []string
 		for _, tk := range tasks {
-			if p.Match(TaskLookup(tk, ""), nil) {
+			if p.Match(TaskLookup(tk, "", board.Deps{}), nil) {
 				got = append(got, tk.ID)
 			}
 		}
@@ -234,6 +235,10 @@ func TestRelativeDates(t *testing.T) {
 		"due<=today+16d": "1,2",
 		"due<today+3w":   "1,2",
 		"due>=today-1w":  "1,2",
+		"due<today+1m":   "1,2", // 2026-11-20
+		"due<today+1w":   "1",
+		"due>today-1y":   "1,2",
+		"due<today+1y":   "1,2",
 	}
 	for q, want := range cases {
 		if got := ids(t, q, nil); got != want {
@@ -255,5 +260,106 @@ func TestSuggestAndUnknownFieldHints(t *testing.T) {
 	}
 	if err := CheckSearch([]string{"titel"}, known); err == nil || !strings.Contains(err.Error(), `did you mean "title"`) {
 		t.Fatalf("search hint: %v", err)
+	}
+}
+
+func TestMalformedRelativeDatesAreErrors(t *testing.T) {
+	for _, q := range []string{"due<today+7", "due<today+1x", "due=tomorrow-", "due<tomorow", "start>=yesterdy", "due<todya+1d"} {
+		if _, err := Parse(q); err == nil {
+			t.Errorf("%q accepted", q)
+		}
+	}
+	// Plain text that merely looks similar stays text.
+	for _, q := range []string{"status=todo", "title=today's", "title:tomorow", "status<todo", "due<2026-12-01", "due=today", "due!=today+2d"} {
+		if _, err := Parse(q); err != nil {
+			t.Errorf("%q: %v", q, err)
+		}
+	}
+	_, err := Parse("due<tomorow")
+	if err == nil || !strings.Contains(err.Error(), `did you mean "tomorrow"`) {
+		t.Errorf("no suggestion: %v", err)
+	}
+}
+
+func TestLabelsMatchSingleLabels(t *testing.T) {
+	tasks := []task.Task{
+		{ID: "1", Labels: "ops,wip"},
+		{ID: "2", Labels: "devops"},
+		{ID: "3", Labels: " Ops , x "},
+		{ID: "4"},
+	}
+	cases := map[string]string{
+		"labels=ops":                  "1,3",
+		"labels=OPS":                  "1,3",
+		"labels!=ops":                 "2,4",
+		"labels:ops":                  "1,2,3",
+		"labels^op":                   "1,3",
+		"labels^dev":                  "2",
+		"labels=wip,x":                "1,3",
+		"labels!=wip,x":               "2,4",
+		"labels=":                     "4",
+		"labels!=":                    "1,2,3",
+		"labels=ops wip":              "",
+		"labels=ops OR labels=devops": "1,2,3",
+	}
+	for q, want := range cases {
+		p, err := Parse(q)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", q, err)
+		}
+		var got []string
+		for _, tk := range tasks {
+			if p.Match(TaskLookup(tk, "", board.Deps{}), nil) {
+				got = append(got, tk.ID)
+			}
+		}
+		if g := strings.Join(got, ","); g != want {
+			t.Errorf("%q = %q, want %q", q, g, want)
+		}
+	}
+}
+
+func TestBlockedAndReady(t *testing.T) {
+	b, err := board.New(board.DefaultSpec(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := []task.Task{
+		{ID: "1", Status: "done"},
+		{ID: "2", Status: "pending", BlockedBy: "1"},
+		{ID: "3", Status: "pending", BlockedBy: "2"},
+		{ID: "4", Status: "pending", BlockedBy: "7"},
+	}
+	deps := b.Deps(tasks)
+	cases := map[string]string{
+		"blocked=yes":  "3",
+		"ready=yes":    "1,2,4",
+		"ready=no":     "3",
+		"blocked_by=":  "1",
+		"blocked_by:2": "3",
+		"-x ready!=no": "1,2,4",
+	}
+	for q, want := range cases {
+		p, err := Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, tk := range tasks {
+			if p.Match(TaskLookup(tk, "", deps), nil) {
+				got = append(got, tk.ID)
+			}
+		}
+		if strings.Join(got, ",") != want {
+			t.Errorf("%q: got %v want %s", q, got, want)
+		}
+	}
+	// without the task list blocked and ready are unknown: empty
+	if v, ok := TaskLookup(tasks[2], "", board.Deps{})("blocked"); ok || v != "" {
+		t.Errorf("blocked without Deps: %q %v", v, ok)
+	}
+	// running is supplied by the board; TaskLookup leaves it unknown
+	if v, ok := TaskLookup(tasks[2], "", board.Deps{})(RunningField); ok || v != "" {
+		t.Errorf("running from TaskLookup: %q %v", v, ok)
 	}
 }

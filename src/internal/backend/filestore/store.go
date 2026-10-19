@@ -86,21 +86,25 @@ func (s *Store) Statuses() []string {
 	return out
 }
 
-func (s *Store) Update(_ context.Context, t task.Task) error {
+func (s *Store) Update(ctx context.Context, t task.Task) error {
+	return s.store(ctx, t, func(cur task.Task) task.Task { return KeepExtras(t, cur) })
+}
+
+// Patch writes only what differs between base and t (see backend.Patcher).
+func (s *Store) Patch(ctx context.Context, base, t task.Task) error {
+	return s.store(ctx, t, func(cur task.Task) task.Task { return task.Merge(cur, base, t) })
+}
+
+// store replaces the task t.ID with what merge makes of the stored one, after
+// the file was read again under the lock.
+func (s *Store) store(ctx context.Context, t task.Task, merge func(cur task.Task) task.Task) error {
 	return s.mutate(func() error {
 		for i := range s.tasks {
 			if s.tasks[i].ID == t.ID {
-				// Keep extra keys the caller's copy doesn't carry.
-				nt := t.Clone()
-				for k, v := range s.tasks[i].Extra {
-					if _, ok := nt.Extra[k]; !ok {
-						if nt.Extra == nil {
-							nt.Extra = map[string]string{}
-						}
-						nt.Extra[k] = v
-					}
+				if err := backend.CheckExpect(ctx, s.tasks[i]); err != nil {
+					return err
 				}
-				s.tasks[i] = nt
+				s.tasks[i] = merge(s.tasks[i])
 				return nil
 			}
 		}
@@ -108,7 +112,22 @@ func (s *Store) Update(_ context.Context, t task.Task) error {
 	})
 }
 
-// Create appends a task with ID max(numeric id)+1. The status is stored as given.
+// KeepExtras is t, plus the extra keys cur has that t does not carry (columns or
+// keys the caller's copy never saw). Shared by the whole-record backends.
+func KeepExtras(t, cur task.Task) task.Task {
+	nt := t.Clone()
+	for k, v := range cur.Extra {
+		if _, ok := nt.Extra[k]; !ok {
+			if nt.Extra == nil {
+				nt.Extra = map[string]string{}
+			}
+			nt.Extra[k] = v
+		}
+	}
+	return nt
+}
+
+// Create appends a task with ID max(numeric id, high-water mark)+1. The status is stored as given.
 func (s *Store) Create(_ context.Context, t task.Task) (task.Task, error) {
 	if err := t.Validate(); err != nil {
 		return task.Task{}, err
@@ -116,7 +135,7 @@ func (s *Store) Create(_ context.Context, t task.Task) (task.Task, error) {
 	var created task.Task
 	err := s.mutate(func() error {
 		t = t.Clone()
-		t.ID = NextID(s.tasks)
+		t.ID = NextIDMark(s.tasks, s.path+MarkSuffix)
 		s.tasks = append(s.tasks, t)
 		created = t.Clone()
 		return nil
@@ -272,6 +291,26 @@ func NextID(tasks []task.Task) string {
 		}
 	}
 	return strconv.Itoa(max + 1)
+}
+
+// MarkSuffix is appended to a store's path to name its high-water mark file.
+const MarkSuffix = ".nextid"
+
+// NextIDMark is NextID, but never an id the store handed out before: the
+// highest id given out lives in the file at markPath, which is updated here.
+// Call it under the store lock. A missing or unreadable mark degrades to
+// NextID, and a mark that cannot be written is ignored (the id is still valid).
+func NextIDMark(tasks []task.Task, markPath string) string {
+	id := NextID(tasks)
+	n, _ := strconv.Atoi(id)
+	if data, err := os.ReadFile(markPath); err == nil {
+		if m, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && m >= n {
+			n = m + 1
+			id = strconv.Itoa(n)
+		}
+	}
+	_, _ = WriteAtomic(markPath, []byte(id+"\n"))
+	return id
 }
 
 var (

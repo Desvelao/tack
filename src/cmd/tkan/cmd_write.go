@@ -7,7 +7,9 @@ import (
 	"io"
 	"strings"
 
+	"tkan/internal/backend"
 	"tkan/internal/board"
+	"tkan/internal/outcome"
 	"tkan/internal/task"
 )
 
@@ -57,17 +59,48 @@ func warnOverLimit(ctx context.Context, a *app, b board.Board, col int, errw io.
 	}
 }
 
+// guardFor builds the context of a guarded write ("only if FIELD is VALUE").
+// A status is given as a column name or a raw value, like everywhere else.
+func guardFor(ctx context.Context, a *app, field, value string) (context.Context, string, error) {
+	if (&task.Task{}).FieldPtr(field) == nil {
+		return ctx, "", fmt.Errorf("unknown field %q (fields: %s)", field, strings.Join(task.FieldNames, ", "))
+	}
+	if field == "status" {
+		b, err := a.board()
+		if err != nil {
+			return ctx, "", err
+		}
+		m, ok := b.Lookup(value)
+		if !ok {
+			return ctx, "", fmt.Errorf("unknown status %q", value)
+		}
+		value = m.Raw
+	}
+	return backend.WithExpect(ctx, field, value), value, nil
+}
+
 func cmdSetStatus(ctx context.Context, a *app, args []string, out, errw io.Writer) int {
 	fs := flag.NewFlagSet("set-status", flag.ContinueOnError)
 	fs.SetOutput(errw)
 	backendName := fs.String("b", "", "backend name (needed when the ID exists in several)")
 	asJSON := fs.Bool("json", false, "print the resulting tasks as JSON (with a changed flag)")
+	from := fs.String("from", "", "only move tasks that are still in this column/status (exit 4 otherwise); checked inside the backend's lock")
 	pos, err := parseArgs(fs, args)
 	if err != nil || len(pos) < 2 {
-		fmt.Fprintln(errw, "usage: tkan set-status ID... STATUS [-b NAME]")
+		fmt.Fprintln(errw, "usage: tkan set-status ID... STATUS [-b NAME] [-from STATUS] [-json]")
 		return exitUsage
 	}
 	ids, status := pos[:len(pos)-1], pos[len(pos)-1]
+	wctx := ctx
+	guarded := false
+	fs.Visit(func(f *flag.Flag) { guarded = guarded || f.Name == "from" })
+	if guarded {
+		var err error
+		if wctx, _, err = guardFor(ctx, a, "status", *from); err != nil {
+			fmt.Fprintf(errw, "set-status: -from: %v\n", err)
+			return exitUsage
+		}
+	}
 	b, err := a.board()
 	if err != nil {
 		return fail(errw, err)
@@ -88,17 +121,32 @@ func cmdSetStatus(ctx context.Context, a *app, args []string, out, errw io.Write
 		Changed bool `json:"changed"`
 	}
 	var results []result
-	moved := false
+	moved, nMoved := false, 0
 	for _, t := range tasks {
-		if t.Status == m.Raw {
+		if t.Status == m.Raw && !guarded {
 			results = append(results, result{withColumn(b, t), false})
 			if !*asJSON {
 				fmt.Fprintf(out, "%s:%s already %s\n", t.Backend, t.ID, b.Columns[m.Col].Name)
 			}
 			continue
 		}
+		old := t
 		t.Status = m.Raw
-		if err := a.be.Update(ctx, t); err != nil {
+		// With -from the snapshot is checked first (no write for a stale view); the
+		// backend checks again under its lock, which is what decides a race.
+		err := backend.CheckExpect(wctx, old)
+		if err == nil {
+			err = a.be.Update(backend.WithOld(wctx, old), t)
+		}
+		if err != nil {
+			// Not atomic: report what was already done before failing.
+			if *asJSON && len(results) > 0 {
+				writeJSON(out, results)
+			}
+			if moved {
+				fmt.Fprintf(errw, "set-status: stopped after moving %d of %d tasks\n", nMoved, len(tasks))
+				warnOverLimit(ctx, a, b, m.Col, errw)
+			}
 			return fail(errw, err)
 		}
 		results = append(results, result{withColumn(b, t), true})
@@ -106,6 +154,7 @@ func cmdSetStatus(ctx context.Context, a *app, args []string, out, errw io.Write
 			fmt.Fprintf(out, "%s:%s -> %s (%s)\n", t.Backend, t.ID, b.Columns[m.Col].Name, m.Raw)
 		}
 		moved = true
+		nMoved++
 	}
 	if *asJSON {
 		if code := writeJSON(out, results); code != exitOK {
@@ -222,11 +271,14 @@ func cmdEdit(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 	asJSON := fs.Bool("json", false, "print the updated task as JSON (like show -json)")
 	descFile := fs.String("description-file", "", "read the new description from this file")
 	notesFile := fs.String("notes-file", "", "read the new notes from this file")
+	appendNotes := fs.String("append-notes", "", "append this text to the notes (a blank line apart; - reads stdin), without rewriting them")
+	appendFile := fs.String("append-notes-file", "", "append the text of this file to the notes")
 	var addLabels, rmLabels listFlag
 	fs.Var(&addLabels, "add-label", "add label(s), comma-separated; repeatable (applied after -labels)")
 	fs.Var(&rmLabels, "rm-label", "remove label(s), comma-separated; repeatable")
+	ifGuard := fs.String("if", "", "only edit if the task still has FIELD=VALUE (exit 4 otherwise); checked inside the backend's lock")
 	pos, err := parseArgs(fs, args)
-	usageMsg := "usage: tkan edit ID [-b NAME] [-status S] [-add-label L] [-rm-label L] [-json] " + fieldUsage()
+	usageMsg := "usage: tkan edit ID [-b NAME] [-if FIELD=VALUE] [-status S] [-add-label L] [-rm-label L] [-append-notes TEXT] [-json] " + fieldUsage()
 	if err != nil || len(pos) != 1 {
 		fmt.Fprintln(errw, usageMsg)
 		return exitUsage
@@ -235,6 +287,8 @@ func cmdEdit(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
 	delete(given, "b")
 	delete(given, "json")
+	guarded := given["if"]
+	delete(given, "if")
 	// Long text can come from stdin (-description -) or a file (-description-file F).
 	usedStdin := false
 	for _, src := range []struct {
@@ -261,7 +315,35 @@ func cmdEdit(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 			*src.field, given[src.name] = text, true
 		}
 	}
-	if len(given) == 0 {
+	// -append-notes adds to the notes the store holds right now, so it cannot be
+	// combined with a rewrite of them.
+	addText, appending := "", given["append-notes"] || given["append-notes-file"]
+	if appending {
+		switch {
+		case given["append-notes"] && given["append-notes-file"]:
+			fmt.Fprintln(errw, "edit: use either -append-notes or -append-notes-file, not both")
+			return exitUsage
+		case given["notes"]:
+			fmt.Fprintln(errw, "edit: -append-notes cannot be combined with -notes or -notes-file")
+			return exitUsage
+		}
+		path := *appendFile
+		if given["append-notes"] {
+			path, addText = "-", *appendNotes
+		}
+		if given["append-notes-file"] || addText == "-" {
+			text, err := readText(path, &usedStdin)
+			if err != nil {
+				fmt.Fprintf(errw, "edit: -append-notes: %v\n", err)
+				return exitUsage
+			}
+			addText = text
+		}
+		addText = strings.TrimSpace(addText)
+		delete(given, "append-notes")
+		delete(given, "append-notes-file")
+	}
+	if len(given) == 0 && !appending {
 		fmt.Fprintln(errw, usageMsg)
 		return exitUsage
 	}
@@ -277,10 +359,24 @@ func cmdEdit(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 			}
 		}
 	}
+	wctx := ctx
+	if guarded {
+		field, value, ok := strings.Cut(*ifGuard, "=")
+		if !ok {
+			fmt.Fprintln(errw, "edit: -if wants FIELD=VALUE (for example -if status=todo)")
+			return exitUsage
+		}
+		var err error
+		if wctx, _, err = guardFor(ctx, a, strings.TrimSpace(field), value); err != nil {
+			fmt.Fprintf(errw, "edit: -if: %v\n", err)
+			return exitUsage
+		}
+	}
 	t, err := a.find(ctx, *backendName, pos[0])
 	if err != nil {
 		return fail(errw, err)
 	}
+	old := t.Clone()
 	limitCol := -1
 	var limitBoard board.Board
 	if given["status"] {
@@ -305,10 +401,21 @@ func cmdEdit(ctx context.Context, a *app, args []string, out, errw io.Writer) in
 	for name := range given {
 		*dst[name] = strings.TrimSpace(*targets[name])
 	}
+	if addText != "" {
+		t.Notes = outcome.AppendBlock(t.Notes, addText)
+	}
 	if len(addLabels) > 0 || len(rmLabels) > 0 {
 		t.Labels = editLabels(t.Labels, addLabels, rmLabels)
 	}
-	if err := a.be.Update(ctx, t); err != nil {
+	if err := t.Validate(); err != nil { // the rules of add (e.g. start after due), as a usage error
+		fmt.Fprintf(errw, "edit: %v\n", err)
+		return exitUsage
+	}
+	err = backend.CheckExpect(wctx, old) // a stale view needs no write; the backend decides a race
+	if err == nil {
+		err = a.be.Update(backend.WithOld(wctx, old), t)
+	}
+	if err != nil {
 		return fail(errw, err)
 	}
 	if limitCol >= 0 {
@@ -330,9 +437,10 @@ func cmdDelete(ctx context.Context, a *app, args []string, out, errw io.Writer) 
 	fs.SetOutput(errw)
 	backendName := fs.String("b", "", "backend name (needed when the ID exists in several)")
 	dryRun := fs.Bool("n", false, "dry run: print what would be deleted, change nothing")
+	asJSON := fs.Bool("json", false, "print the tasks as JSON (with a deleted flag)")
 	pos, err := parseArgs(fs, args)
 	if err != nil || len(pos) < 1 {
-		fmt.Fprintln(errw, "usage: tkan delete ID... [-b NAME] [-n]")
+		fmt.Fprintln(errw, "usage: tkan delete ID... [-b NAME] [-n] [-json]")
 		return exitUsage
 	}
 	// Resolve every ID first so a bad one deletes nothing.
@@ -342,15 +450,39 @@ func cmdDelete(ctx context.Context, a *app, args []string, out, errw io.Writer) 
 			return fail(errw, err)
 		}
 	}
+	type deletedOut struct {
+		Backend string `json:"backend"`
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Deleted bool   `json:"deleted"`
+	}
+	results := []deletedOut{}
+	deleted := 0
 	for _, t := range tasks {
 		if *dryRun {
-			fmt.Fprintf(out, "would delete %s:%s %q\n", t.Backend, t.ID, t.Title)
+			results = append(results, deletedOut{t.Backend, t.ID, t.Title, false})
+			if !*asJSON {
+				fmt.Fprintf(out, "would delete %s:%s %q\n", t.Backend, t.ID, t.Title)
+			}
 			continue
 		}
 		if err := a.be.Delete(ctx, t.Backend, t.ID); err != nil {
+			if *asJSON && deleted > 0 {
+				writeJSON(out, results)
+			}
+			if deleted > 0 { // not atomic: say how far it got
+				fmt.Fprintf(errw, "delete: stopped after deleting %d of %d tasks\n", deleted, len(tasks))
+			}
 			return fail(errw, err)
 		}
-		fmt.Fprintf(out, "deleted %s:%s %q\n", t.Backend, t.ID, t.Title)
+		deleted++
+		results = append(results, deletedOut{t.Backend, t.ID, t.Title, true})
+		if !*asJSON {
+			fmt.Fprintf(out, "deleted %s:%s %q\n", t.Backend, t.ID, t.Title)
+		}
+	}
+	if *asJSON {
+		return writeJSON(out, results)
 	}
 	return exitOK
 }

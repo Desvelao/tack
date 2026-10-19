@@ -6,10 +6,10 @@ read or update a task file, read `docs/AGENTS.md` instead.
 ## The project
 
 **tkan**: a small Go TUI that shows a task backlog as a kanban board, plus
-non-interactive subcommands (`list`, `show`, `add`, `edit`, `set-status`, `delete`, `count`, `labels`, `statuses`, `config`, `init`, `completion`) for scripts and agents.
+non-interactive subcommands (`list`, `show`, `add`, `edit`, `set-status`, `delete`, `claim`, `release`, `next`, `mcp`, `count`, `labels`, `statuses`, `config`, `init`, `completion`) for scripts and agents.
 The task stores sit behind a `Backend` interface; the config lists any number of them
-(`backend:` entries with a `type`, optional `name` and `options`). CSV, JSON/JSONL/YAML files, a Markdown directory, a SQLite one (drives the `sqlite3` CLI, no
-library, to keep the binary static) and a command-based `custom` backend exist; GitHub Projects etc. are expected later.
+(`backend:` entries with a `type`, optional `name` and `options`). CSV, JSON/JSONL/YAML files and a command-based `custom` backend exist (`command:` on an entry implies it); SQLite is a script for it
+(`contrib/backends/sqlite`, bash + jq + `sqlite3`, run its tests with `make test-contrib`); GitHub Projects etc. are expected later.
 
 Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 
@@ -21,8 +21,10 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 - `src/internal/backend/csv`: the CSV backend (the reference implementation)
 - `src/internal/backend/custom`: runs an external command, JSON over stdin/stdout
 - `src/internal/backend/filestore`: lock, atomic write and the whole-file `Store`/`Codec`/`Mapping` shared by json, jsonl and yaml
-- `src/internal/backend/json`, `yaml`, `markdown`: JSON / JSON Lines, YAML list, one-Markdown-file-per-task (frontmatter) backends
-- `src/internal/backend/sqlite`: SQLite table through the sqlite3 CLI (JSON out, SQL on stdin; values as hex literals)
+- `src/internal/backend/json`, `yaml`: JSON / JSON Lines, YAML list backends
+- `contrib/backends/sqlite`: the SQLite backend as a `custom` script (`tkan-sqlite.sh`) and its tests
+- `src/internal/fleet`: claims -> one row per agent and task (state, since, left, avatar frame); pure, drawn by the `F` view and `tkan fleet`
+- `src/internal/claim`: claim/lease rules (who holds a task, the guarded claim/release write) shared by `claim`, `next`, `run` and the TUI
 - `src/internal/board`: raw status value -> kanban column mapping (pure, no backend/UI imports)
 - `src/internal/config`: `tkan.yaml` loading (`backend:` list), config lookup, sample generation (`init.go`)
 - `src/internal/query`: filter language (parser, matcher, `Help()` text used by the TUI and `tkan help filter`)
@@ -33,7 +35,7 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 ## Development rules
 
 1. **Everything runs in Docker.** No Go toolchain is required on the host:
-   `make test`, `make build`, `make build-arm`, `make tidy`, `make fmt`, `make vet`, `make shell`
+   `make test`, `make race` (race detector, own image with a C compiler), `make build`, `make build-arm`, `make tidy`, `make fmt`, `make vet`, `make shell`
    (thin wrappers over `docker compose run --rm <service>`). Containers run as the host
    UID/GID (`HOST_UID`/`HOST_GID`, set by the Makefile) so no root-owned files appear.
 2. **The TUI and CLI depend only on `backend.Set`/`backend.Backend` and `board.Board`.** Nothing CSV-specific may
@@ -49,11 +51,20 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
 4. **Low-spec friendly**: static binary (`CGO_ENABLED=0`), small dependency set, works at 80x24 and
    on ARM (Raspberry Pi). No mouse-only or hover-only interactions; every action has a key.
 5. **Never test against a real backlog.** Use a copy of the file (e.g. in a temp dir).
+6. **Keep the binary light.** Binary size is a feature. **Strongly discouraged:** adding a Go
+   dependency (direct or transitive), embedding assets/data (`embed`, generated tables), or pulling in
+   a heavy stdlib package (`net/http`, `crypto/tls`, `text/template`, reflection-heavy encoders) for
+   something small. **Warn the user before doing it**, with the measured size delta (`make build`,
+   compare `ls -l` before/after), and proceed only with their explicit approval.
+   **Workaround that costs no size:** drive an external CLI the way `contrib/backends/sqlite` does with `sqlite3`,
+   or use the `custom` backend (user-supplied command, JSON over stdin/stdout). Otherwise hand-write the
+   few lines needed with the stdlib already linked, or ship the feature as an optional external
+   script/doc instead of compiled-in code.
 
 ## Workflow
 
-- Releasing: bump `VERSION` **and** the `VERSION=` line in `install.sh` (checked by `make check` and CI), and the tag in the README install URL; move the `CHANGELOG.md` entries under the new version.
-- `make test` must pass (also run `make vet`).
+- Releasing: bump `VERSION` **and** the `VERSION=` line in `install.sh`, the tag in the README install URLs, and move the `CHANGELOG.md` entries under a `## [VERSION]` heading (`make check-version`, part of `make check` and CI, fails when any of them disagrees).
+- `make test` must pass (also run `make vet`; run `make race` when you touch goroutines, locks or process handling).
 - **Before every commit, check the staged changes for security problems.** Review `git diff --staged`
   (and any new untracked files being added) for exposed secrets (API keys, tokens, passwords, private
   keys, `.env` contents, credentials in `tkan.yaml` backend `options`, real backlog data or personal
@@ -68,4 +79,4 @@ Stack: Go, Bubble Tea + Lip Gloss + Bubbles, Docker for everything.
   `docs/config.md`, `docs/AGENTS.md` and `tkan.example.yaml`.
 - Filter operators live in `internal/query` only; `query.Help()` is the single source of the help text
   (TUI page, `tkan help filter`) and `docs/filter.md` must mirror it. Keep the help page within 20 lines.
-- Subcommand exit codes are part of the contract for agents (`0` ok, `1` error, `2` usage, `3` not found).
+- Subcommand exit codes are part of the contract for agents (`0` ok, `1` error, `2` usage, `3` not found, `4` precondition failed (`set-status -from` / `edit -if`, a task claimed by another agent), `130` interrupted).

@@ -3,9 +3,10 @@ package query
 import "strings"
 
 // Help returns the filter syntax reference shown by the TUI (`?`, then tab),
-// by `tkan help filter`, and mirrored in docs/filter.md. fields are the
-// usable field names; search are the fields plain text is matched against.
-func Help(fields, search []string) string {
+// by `tkan help filter`, and mirrored in docs/filter.md. search are the fields
+// plain text is matched against. What each field means is FieldsHelp, on its
+// own page: this one must fit 20 lines.
+func Help(search []string) string {
 	if len(search) == 0 {
 		search = DefaultSearch
 	}
@@ -18,22 +19,20 @@ func Help(fields, search []string) string {
 		{`"two words"`, "quote values that contain spaces"},
 		{"field:value", "field contains value"},
 		{"field!:value", "field does not contain value"},
-		{"field=value", "field equals value exactly"},
+		{"field=value", "field equals value exactly  (labels: one whole label)"},
 		{"field!=value", "field is not equal to value"},
 		{"field^value", "field starts with value"},
 		{"field~regex", "field matches the regular expression"},
 		{"field<value", "also > <= >= (numbers, dates: due<2026-12-01)"},
 		{"field=", "field is empty  (field!= : has a value)"},
 		{"a,b", "any of the values: priority=high,medium  (!: and != : none)"},
-		{"a OR b", "either side (also |); dates: today, tomorrow, today+7d, today-2w"},
+		{"a OR b", "either side (also |); dates: today, tomorrow, today+7d (d w m y)"},
 	}
 	for _, r := range rows {
 		b.WriteString("  " + pad(r[0], 14) + r[1] + "\n")
 	}
 	b.WriteString("\nSearched by plain text: " + strings.Join(sortedUniqueKeepOrder(search), ", ") + "\n")
-	if len(fields) > 0 {
-		b.WriteString("Fields: " + strings.Join(fields, ", ") + "  (col = column)\n")
-	}
+	b.WriteString("Fields and what they mean: next page (tab)  ·  tkan help filter fields  (col = column)\n")
 	b.WriteString("Examples: priority=high col:doing   title:\"fix bug\" -wip   notes=   id~^A-\\d+   due<2026-12-01\n")
 	return b.String()
 }

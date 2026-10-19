@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"tkan/internal/board"
 	"tkan/internal/query"
@@ -22,43 +23,26 @@ var (
 	headSty   = lipgloss.NewStyle().Bold(true).Foreground(dim)
 	headSelSt = lipgloss.NewStyle().Bold(true).Foreground(accent)
 	cardSty   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(dim).Padding(0, 1)
-	cardSel   = cardSty.BorderForeground(accent)
+	cardSel   = cardSty.Border(lipgloss.ThickBorder()).BorderForeground(accent) // thick: still visible without colour
 	metaSty   = lipgloss.NewStyle().Foreground(dim)
-	okSty     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "114"})
-	failSty   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "160", Dark: "203"})
+	okSty     = lipgloss.NewStyle().Foreground(pair("28", "114", "2", "10"))
+	failSty   = lipgloss.NewStyle().Bold(true).Foreground(pair("160", "203", "1", "9"))
 	noteSty   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "130", Dark: "215"})
 	helpSty   = lipgloss.NewStyle().Foreground(dim)
+	// One style per header tag, so "loading", "filter" and "marked" never look alike.
+	loadSty    = lipgloss.NewStyle().Foreground(pair("30", "80", "6", "14"))
+	filterSty  = lipgloss.NewStyle().Foreground(pair("136", "221", "3", "11"))
+	sortSty    = lipgloss.NewStyle().Foreground(pair("25", "111", "4", "12"))
+	groupSty   = lipgloss.NewStyle().Foreground(pair("97", "140", "7", "7"))
+	labelSty   = lipgloss.NewStyle().Foreground(pair("30", "73", "6", "6"))
+	backendSty = lipgloss.NewStyle().Italic(true).Foreground(dim)
+	blockedSty = lipgloss.NewStyle().Foreground(pair("166", "209", "1", "9"))
+	keySty     = lipgloss.NewStyle().Foreground(accent)
+	markSty    = lipgloss.NewStyle().Foreground(pair("127", "176", "5", "13"))
+	idSty      = lipgloss.NewStyle().Bold(true).Foreground(pair("172", "214", "3", "11")) // the #ID before a title
+	// agentColor marks the cards assigned to one of board.agents: their border and the bold @name.
+	agentColor = lipgloss.AdaptiveColor{Light: "91", Dark: "177"}
 )
-
-// priorityColorOf colours the priority word on a card from its rank (see
-// task.PriorityRank), so every spelling of a level looks alike; unknown values
-// stay grey.
-func priorityColorOf(p string) lipgloss.Color {
-	switch r := task.PriorityRank(p); {
-	case r == 0:
-		return "196"
-	case r == 1:
-		return "203"
-	case r == 2:
-		return "221"
-	case r <= 4:
-		return "114"
-	}
-	return "245"
-}
-
-// typeColors is the palette task types are coloured from.
-var typeColors = []lipgloss.Color{"141", "80", "180", "174", "110", "150"}
-
-// typeColor gives every type a stable colour (hash of its lower-case name), so
-// "bug" looks the same on every card and in every run.
-func typeColor(typ string) lipgloss.Color {
-	h := 0
-	for _, r := range strings.ToLower(strings.TrimSpace(typ)) {
-		h = (h*31 + int(r)) % 9973
-	}
-	return typeColors[h%len(typeColors)]
-}
 
 // labelChip shows the first two labels, e.g. "[ui,api+1]"; "" when there are none.
 func labelChip(t task.Task) string {
@@ -72,7 +56,40 @@ func labelChip(t task.Task) string {
 	return fmt.Sprintf("[%s,%s+%d]", l[0], l[1], len(l)-2)
 }
 
+// View is the screen of the current mode. While background runs ended since R
+// was last opened, every screen says so: the board in its title line, the other
+// views at the start of their last line.
 func (m Model) View() string {
+	out := m.screen()
+	if m.unseen == 0 || m.boardScreen() {
+		return out
+	}
+	i := strings.LastIndex(out, "\n") + 1
+	last := m.finishedTag() + out[i:]
+	if m.width > 0 {
+		last = ansi.Truncate(last, m.width, "…")
+	}
+	return out[:i] + last
+}
+
+// finishedTag is "N finished (R) · " while background runs ended unseen, else "".
+func (m Model) finishedTag() string {
+	if m.unseen == 0 {
+		return ""
+	}
+	return okSty.Render(fmt.Sprintf("%d finished (R)", m.unseen)) + metaSty.Render(" · ")
+}
+
+// boardScreen reports whether the board is drawn (alone or under a prompt).
+func (m Model) boardScreen() bool {
+	switch m.mode {
+	case modeBoard, modeNew, modeFilter, modeQuick, modeConfirmDelete, modeMoveTo:
+		return true
+	}
+	return false
+}
+
+func (m Model) screen() string {
 	switch m.mode {
 	case modeDetail:
 		return m.detailView()
@@ -82,9 +99,20 @@ func (m Model) View() string {
 		return m.editView()
 	case modeAudit:
 		return m.auditView()
+	case modeActions:
+		return m.actionsView()
+	case modeRuns:
+		return m.runsView()
+	case modeRunOutput:
+		return m.runOutputView()
+	case modeFleet:
+		return m.fleetView()
 	}
 	var b strings.Builder
 	count := fmt.Sprintf("%d tasks", len(m.tasks))
+	if m.busy() && !m.loaded && len(m.tasks) == 0 {
+		count = "… tasks"
+	}
 	if m.filter != "" { // show how many the filter lets through
 		shown := 0
 		for c := range m.board.Columns {
@@ -92,7 +120,20 @@ func (m Model) View() string {
 		}
 		count = fmt.Sprintf("%d/%d tasks", shown, len(m.tasks))
 	}
-	b.WriteString(titleSty.Render("tkan") + metaSty.Render(fmt.Sprintf("  %s · %s", m.name, count)))
+	var h strings.Builder
+	h.WriteString(titleSty.Render("tkan") + metaSty.Render(fmt.Sprintf("  %s · %s", m.name, count)))
+	if tag := m.loadingTag(); tag != "" {
+		h.WriteString(loadSty.Render("  " + tag))
+	}
+	if tag := m.failedTag(); tag != "" && !m.busy() {
+		h.WriteString(failSty.Render("  " + tag))
+	}
+	if n := len(m.marks); n > 0 {
+		h.WriteString(markSty.Render(fmt.Sprintf("  %d marked", n)))
+	}
+	if m.unseen > 0 {
+		h.WriteString(okSty.Render(fmt.Sprintf("  %d finished (R)", m.unseen)))
+	}
 	if keys := m.activeSort(); len(keys) > 0 {
 		parts := make([]string, len(keys))
 		for i, k := range keys {
@@ -103,21 +144,26 @@ func (m Model) View() string {
 				parts[i] += "↑"
 			}
 		}
-		b.WriteString(metaSty.Render("  sort: " + strings.Join(parts, " ")))
+		h.WriteString(sortSty.Render("  sort: " + strings.Join(parts, " ")))
 	}
 	if m.groupBy != "" {
-		b.WriteString(metaSty.Render("  group: " + m.groupBy))
+		h.WriteString(groupSty.Render("  group: " + m.groupBy))
 	}
 	if m.filter != "" {
 		if m.view != "" {
-			b.WriteString(noteSty.Render("  view " + m.view + ": " + m.filter))
+			h.WriteString(filterSty.Render("  view " + m.view + ": " + m.filter))
 		} else {
-			b.WriteString(noteSty.Render("  filter: " + m.filter))
+			h.WriteString(filterSty.Render("  filter: " + m.filter))
 		}
 	}
 	if n := len(m.board.Columns); n > m.visibleCols() {
-		b.WriteString(metaSty.Render(fmt.Sprintf("  column %d/%d", m.col+1, n)))
+		h.WriteString(metaSty.Render(fmt.Sprintf("  column %d/%d", m.col+1, n)))
 	}
+	title := h.String()
+	if m.width > 0 {
+		title = ansi.Truncate(title, m.width-1, "…") // many tags must not wrap the header
+	}
+	b.WriteString(title)
 	b.WriteString("\n")
 	if len(m.board.Columns) > m.visibleCols() {
 		b.WriteString(m.columnStrip()) // replaces the blank line: columns are off-screen
@@ -125,31 +171,39 @@ func (m Model) View() string {
 	b.WriteString("\n")
 	b.WriteString(m.boardView())
 	b.WriteString("\n")
+	if strip := m.runsStrip(); len(strip) > 0 {
+		b.WriteString(strings.Join(strip, "\n") + "\n")
+	}
 	switch m.mode {
 	case modeNew:
 		where := m.board.Columns[m.col].Name
 		if names := m.be.Names(); len(names) > 1 {
 			where += " @" + names[m.target]
 		}
-		b.WriteString("new task in " + where + "> " + m.input.View())
+		b.WriteString(headSelSt.Render("new task in "+where+"> ") + m.input.View())
 	case modeFilter:
-		b.WriteString("filter> " + m.input.View() + "\n")
+		b.WriteString(filterSty.Render("filter> ") + m.input.View() + "\n")
 		if m.notice != "" {
 			b.WriteString(m.renderNotice())
 		} else {
 			b.WriteString(helpSty.Render("enter apply · empty clears · esc cancel · ? on an empty prompt: syntax help"))
 		}
 	case modeQuick:
-		b.WriteString(noteSty.Render("filter by this card's: (t)ype  (a)ssignee  (p)riority  (l)abel   esc cancel"))
+		b.WriteString(filterSty.Render("filter by this card's: (t)ype  (a)ssignee  (p)riority  (l)abel   esc cancel"))
+	case modeMoveTo:
+		b.WriteString(filterSty.Render(m.moveToPrompt()))
 	case modeConfirmDelete:
-		if t, ok := m.selected(); ok {
-			b.WriteString(noteSty.Render(fmt.Sprintf("delete %s:%s %q? (y/N)", t.Backend, t.ID, t.Title)))
+		if n := len(m.deleteTargets); n > 1 {
+			b.WriteString(failSty.Render(fmt.Sprintf("delete the %d marked cards? (y/N)", n)))
+			break
 		}
+		t := m.deleteTargets[0]
+		b.WriteString(failSty.Render(fmt.Sprintf("delete %s:%s %q? (y/N)", t.Backend, t.ID, t.Title)))
 	default:
 		if m.notice != "" {
 			b.WriteString(m.renderNotice())
 		} else {
-			b.WriteString(helpSty.Render("←→ column  ↑↓ card  H/L move  enter open  e edit  n new  d delete  / filter  r reload  ? help  q quit"))
+			b.WriteString(boardHelp(m.width - 1))
 		}
 	}
 	return b.String()
@@ -190,11 +244,6 @@ func (m Model) columnStrip() string {
 	}
 	return line
 }
-
-var (
-	overdueSty = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
-	soonSty    = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
-)
 
 // soonDays is how close a due date must be to be flagged amber.
 const soonDays = 3
@@ -250,12 +299,11 @@ func (m Model) renderNotice() string {
 	case noticeFail:
 		tag, text = "FAIL  ", strings.TrimPrefix(text, "error: ")
 	}
-	if r := []rune(tag + text); m.width > 0 && len(r) > m.width {
-		r = append(r[:m.width-1], '…')
-		if n := len([]rune(tag)); len(r) <= n {
-			tag, text = string(r), ""
+	if m.width > 0 && ansi.StringWidth(tag+text) > m.width { // cells, not runes: wide characters take two
+		if n := ansi.StringWidth(tag); m.width <= n {
+			tag, text = ansi.Truncate(tag, m.width, "…"), ""
 		} else {
-			text = string(r[n:])
+			text = ansi.Truncate(text, m.width-n, "…")
 		}
 	}
 	switch m.noticeKind {
@@ -299,7 +347,7 @@ func (m Model) cardsHeight() int {
 	if m.mode == modeFilter {
 		footer = 2
 	}
-	h := m.height - 5 - footer
+	h := m.height - 5 - footer - len(m.runsStrip())
 	if h < 4 {
 		h = 4
 	}
@@ -341,15 +389,27 @@ func (m Model) columnView(c, cw, cardsH int) string {
 		n := m.columnTotal(c)
 		title = fmt.Sprintf("%s (%d/%d)", strings.ToUpper(m.board.Columns[c].Name), n, lim)
 		if _, over := m.board.Over(c, n); over {
-			headStyle = noteSty.Bold(true)
+			headStyle = failSty
 			title += " !"
 		}
 	}
+	if sel { // a text cue too: colour and underline are lost under NO_COLOR
+		title = "▸ " + title
+	}
 	head := headStyle.Render(title)
 
-	cards := make([]string, len(tasks))
-	for i, t := range tasks {
-		cards[i] = renderCard(t, cw, sel && i == m.row, m.board.Columns[c].Color, m.dueStyle(t, c))
+	// Cards are drawn on demand: a column can hold hundreds and only the ones in
+	// the window are needed (drawing them all made every redraw take ~100 ms).
+	drawn := map[int]string{}
+	card := func(i int) string {
+		if s, ok := drawn[i]; ok {
+			return s
+		}
+		t := tasks[i]
+		s := renderCard(t, cw, sel && i == m.row, m.marked(t), m.deps.Blockers(t), m.board.Columns[c].Color, m.dueStyle(t, c),
+			m.isAgent(t.Assignee), m.runMarker(t, cw-6))
+		drawn[i] = s
+		return s
 	}
 
 	// Group sub-headers ("-- bug (3) --") sit above the first card of each group
@@ -371,60 +431,96 @@ func (m Model) columnView(c, cw, cardsH int) string {
 
 	// Scroll so the selected card is visible in the focused column.
 	top := 0
-	if sel {
-		for top < m.row {
-			h := 0
-			for i := top; i <= m.row; i++ {
-				h += lipgloss.Height(cards[i]) + hdr(i, top)
+	if sel && m.row < len(tasks) {
+		// The first card from which everything down to the selection fits, found
+		// walking up from the selection so the cards above the window are not drawn.
+		// The first card always has a sub-header (hdr), the others only at a group change.
+		h := lipgloss.Height(card(m.row))
+		for top = m.row; top > 0; top-- {
+			next := h + lipgloss.Height(card(top-1))
+			if m.groupBy != "" && groups[top] != groups[top-1] {
+				next++ // the sub-header above card top
 			}
-			if h <= cardsH {
+			if next+hdr(top-1, top-1) > cardsH {
 				break
 			}
-			top++
+			h = next
 		}
 	}
 	var out []string
 	out = append(out, head)
+	if len(tasks) == 0 && c == m.col && m.busy() && !m.loaded {
+		out = append(out, metaSty.Render("loading…"))
+	}
 	used := 0
 	if top > 0 {
 		out = append(out, metaSty.Render(fmt.Sprintf("↑ %d more", top)))
 	}
-	for i := top; i < len(cards); i++ {
+	for i := top; i < len(tasks); i++ {
 		hh := hdr(i, top)
-		h := lipgloss.Height(cards[i]) + hh
+		h := lipgloss.Height(card(i)) + hh
 		// Always draw the first card, even if taller than the budget, so the
 		// selection never disappears on very small terminals.
 		if used+h > cardsH && i > top {
-			out = append(out, metaSty.Render(fmt.Sprintf("↓ %d more", len(cards)-i)))
+			out = append(out, metaSty.Render(fmt.Sprintf("↓ %d more", len(tasks)-i)))
 			break
 		}
 		if hh > 0 {
-			out = append(out, metaSty.Render(fmt.Sprintf("-- %s (%d) --", groups[i], counts[groups[i]])))
+			out = append(out, groupHeadStyle(m.groupBy, groups[i]).Render(fmt.Sprintf("-- %s (%d) --", groups[i], counts[groups[i]])))
 		}
-		out = append(out, cards[i])
+		out = append(out, card(i))
 		used += h
 	}
 	return lipgloss.NewStyle().Width(cw).Render(strings.Join(out, "\n"))
 }
 
-func renderCard(t task.Task, cw int, selected bool, color string, due lipgloss.Style) string {
+// groupHeadStyle colours a group sub-header: by the type colour when grouping by
+// type, else bold dim, so it reads differently from the "↑ N more" markers.
+func groupHeadStyle(groupBy, label string) lipgloss.Style {
+	if groupBy == "type" {
+		return lipgloss.NewStyle().Bold(true).Foreground(typeColor(label))
+	}
+	return headSty
+}
+
+// markSign is drawn before the title of a card marked with space.
+const markSign = "✓ "
+
+// blockers are the open ids of t's blocked_by (board.Deps); agent says the
+// assignee is one of board.agents; runLine is runMarker's line ("" = none).
+func renderCard(t task.Task, cw int, selected, marked bool, blockers []string, color string, due lipgloss.Style, agent bool, runLine string) string {
 	style := cardSty
+	if agent {
+		style = style.BorderForeground(agentColor)
+	}
 	if selected {
 		style = cardSel
 		if color != "" {
 			style = style.BorderForeground(lipgloss.Color(color))
 		}
 	}
-	title := fmt.Sprintf("#%s %s", t.ID, t.Title)
+	title := idSty.Render("#"+t.ID) + " " + t.Title
+	if marked {
+		title = markSty.Bold(true).Render(markSign) + title
+	}
 	body := lipgloss.NewStyle().MaxHeight(3).Render(title)
-	body += "\n" + cardMeta(t, cw-6, due)
+	body += "\n" + cardMeta(t, cw-6, due, agent)
+	// On its own line: in the meta line it would be the first part dropped
+	// when backend and priority fill it.
+	if len(blockers) > 0 {
+		body += "\n" + blockedSty.MaxWidth(cw-6).Render("blocked by #"+strings.Join(blockers, ",#"))
+	}
+	if runLine != "" {
+		body += "\n" + runLine
+	}
 	// Width counts padding but not the border.
 	return style.Width(cw - 2).Render(body)
 }
 
-// cardMeta is the card's second line: the owning backend, then priority and type.
-// width is the room available inside the card.
-func cardMeta(t task.Task, width int, dueStyle lipgloss.Style) string {
+// cardMeta is the card's second line: the owning backend, then priority, the
+// type and so on. width is the room available inside the card; agent shows the
+// assignee in bold agentColor.
+func cardMeta(t task.Task, width int, dueStyle lipgloss.Style, agent bool) string {
 	type part struct {
 		kind, text string
 		style      lipgloss.Style
@@ -435,7 +531,7 @@ func cardMeta(t task.Task, width int, dueStyle lipgloss.Style) string {
 		if max := width / 2; max > 1 && len(name) > max {
 			name = append(name[:max-1], '…')
 		}
-		parts = append(parts, part{"backend", string(name), lipgloss.NewStyle().Foreground(accent)})
+		parts = append(parts, part{"backend", string(name), backendSty})
 	}
 	if t.Priority != "" {
 		col := priorityColorOf(t.Priority)
@@ -445,13 +541,17 @@ func cardMeta(t task.Task, width int, dueStyle lipgloss.Style) string {
 		parts = append(parts, part{"type", t.Type, lipgloss.NewStyle().Foreground(typeColor(t.Type))})
 	}
 	if t.Assignee != "" {
-		parts = append(parts, part{"assignee", "@" + t.Assignee, metaSty})
+		sty := metaSty
+		if agent {
+			sty = lipgloss.NewStyle().Bold(true).Foreground(agentColor)
+		}
+		parts = append(parts, part{"assignee", "@" + t.Assignee, sty})
 	}
 	if t.Due != "" {
 		parts = append(parts, part{"due", "due " + t.Due, dueStyle})
 	}
 	if chip := labelChip(t); chip != "" {
-		parts = append(parts, part{"labels", chip, metaSty})
+		parts = append(parts, part{"labels", chip, labelSty})
 	}
 	render := func() string {
 		out := make([]string, len(parts))
@@ -477,6 +577,36 @@ func cardMeta(t task.Task, width int, dueStyle lipgloss.Style) string {
 	return lipgloss.NewStyle().MaxWidth(width).Render(render())
 }
 
+// detailMeta is the line under the title, coloured like the card: backend,
+// status, priority, type, assignee, dates and labels.
+func (m Model) detailMeta(t task.Task) string {
+	type part struct {
+		text string
+		sty  lipgloss.Style
+	}
+	assignee := metaSty
+	if m.isAgent(t.Assignee) {
+		assignee = lipgloss.NewStyle().Bold(true).Foreground(agentColor)
+	}
+	due := metaSty
+	if c := m.board.Columns; m.col < len(c) {
+		due = m.dueStyle(t, m.col)
+	}
+	var parts []string
+	for _, p := range []part{
+		{t.Backend, backendSty}, {t.Status, metaSty},
+		{t.Priority, lipgloss.NewStyle().Foreground(priorityColorOf(t.Priority))},
+		{t.Type, lipgloss.NewStyle().Foreground(typeColor(t.Type))},
+		{atName(t.Assignee), assignee}, {dateLabel("due", t.Due), due}, {dateLabel("start", t.Start), metaSty},
+		{t.Labels, labelSty},
+	} {
+		if p.text != "" {
+			parts = append(parts, p.sty.Render(p.text))
+		}
+	}
+	return strings.Join(parts, metaSty.Render(" · "))
+}
+
 func (m Model) detailView() string {
 	t, ok := m.selected()
 	if !ok {
@@ -488,8 +618,29 @@ func (m Model) detailView() string {
 	}
 	wrap := lipgloss.NewStyle().Width(w)
 	var b strings.Builder
-	b.WriteString(titleSty.Render(fmt.Sprintf("#%s  %s", t.ID, t.Title)) + "\n")
-	b.WriteString(metaSty.Render(strings.Join(nonEmpty(t.Backend, t.Status, t.Priority, t.Type, atName(t.Assignee), dateLabel("due", t.Due), dateLabel("start", t.Start), t.Labels), " · ")) + "\n\n")
+	b.WriteString(idSty.Render("#"+t.ID) + "  " + titleSty.Render(t.Title) + "\n")
+	b.WriteString(m.detailMeta(t))
+	if m.isAgent(t.Assignee) {
+		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(agentColor).Render("  agent"))
+	}
+	b.WriteString("\n\n")
+	if going, ended := m.cardRuns(t); len(going)+len(ended) > 0 {
+		for _, r := range going {
+			b.WriteString(loadSty.Render("⟳ running "+r.job.Spec.Name) + metaSty.Render(" "+formatDur(m.clock().Sub(r.started))) + "\n")
+		}
+		for _, r := range ended {
+			b.WriteString(runResult(r) + "\n")
+		}
+		b.WriteString("\n")
+	}
+	if ids := t.BlockedByList(); len(ids) > 0 {
+		line := "blocked by #" + strings.Join(ids, ", #")
+		if open := m.deps.Blockers(t); len(open) > 0 {
+			b.WriteString(blockedSty.Render(line+"  (open: #"+strings.Join(open, ", #")+")") + "\n\n")
+		} else {
+			b.WriteString(okSty.Render(line+"  (all finished: ready)") + "\n\n")
+		}
+	}
 	if t.Description != "" {
 		b.WriteString(wrap.Render(t.Description) + "\n\n")
 	}
@@ -509,7 +660,7 @@ func (m Model) detailView() string {
 	// Scroll long cards: only detailRoom() lines fit between the border and the footer.
 	lines := strings.Split(strings.TrimRight(b.String(), "\n"), "\n")
 	room := m.detailRoom()
-	foot := "e edit · esc/enter back"
+	foot := "e edit · x actions · . repeat · R runs · esc/enter back"
 	if len(lines) > room {
 		y := m.detailY
 		if y > len(lines)-room {
@@ -545,10 +696,19 @@ func nonEmpty(s ...string) []string {
 }
 
 func (m Model) helpView() string {
-	if m.helpPage == 1 {
-		return titleSty.Render("tkan help 2/2") + "\n\n" +
-			query.Help(m.fields, m.spec.Search) + "\n" +
-			helpSty.Render("tab/←→ other page · esc back")
+	docs, title, search := m.helpDocs, m.helpTitle, m.helpSearch
+	pages, page := 3, m.helpPage+1
+	if docs == nil { // the board's own filter
+		docs, title, search = query.TaskFieldDocs(m.fields), "Filter fields", m.spec.Search
+	} else {
+		pages, page = 2, m.helpPage
+	}
+	foot := helpSty.Render("tab/←→ other page · esc back")
+	switch m.helpPage {
+	case 1:
+		return titleSty.Render(fmt.Sprintf("tkan help %d/%d", page, pages)) + "\n\n" + query.Help(search) + "\n" + foot
+	case 2:
+		return titleSty.Render(fmt.Sprintf("tkan help %d/%d", page, pages)) + "\n\n" + query.FieldsHelp(title, docs, search) + "\n" + foot
 	}
 	return keysHelp()
 }
@@ -563,25 +723,28 @@ func keysHelp() string {
 		{"H L / shift+← →", "move card to previous / next status"},
 		{"enter", "open card details"},
 		{"e", "edit the card (tab next field, enter save, esc cancel)"},
-		{"n", "new task in the current column"},
-		{"b", "cycle the backend new tasks go to"},
-		{"d", "delete card (asks to confirm)"},
+		{"n / b", "new task in the current column / cycle the backend new tasks go to"},
+		{"x / .", "run an action on the card (or marked cards) / repeat it"},
+		{"space", "mark / unmark the card (esc with no filter unmarks all)"},
+		{"m", "move the card, or the marked cards, to column 1-9"},
+		{"d", "delete card, or the marked cards (asks to confirm)"},
 		{"u", "undo the last move, edit or delete (a deleted card gets a new ID)"},
 		{"/", "filter: text or field:value (esc clears; up/down recall earlier filters)"},
 		{"f", "filter by the selected card: then t type, a assignee, p priority, l label"},
 		{"v", "cycle the saved views (board.views), then none"},
 		{"z", "group cards by priority / type / assignee / labels (cycle)"},
 		{"s / S", "sort cards: next field / reverse (display only)"},
-		{"r / A", "reload from the backend / audit trail of reloads and writes"},
-		{"?", "this help (tab: filter syntax)"},
+		{"r / A / R", "reload from the backend / audit trail / background action runs"},
+		{"F", "fleet: the agents, the task each holds, since when, lease left"},
+		{"?", "this help (tab: filter syntax, then what each field means)"},
 		{"q / ctrl+c", "quit"},
 	}
 	var b strings.Builder
-	b.WriteString(titleSty.Render("tkan help 1/2: keys") + "\n\n")
+	b.WriteString(titleSty.Render("tkan help 1/3: keys") + "\n\n")
 	for _, r := range rows {
-		b.WriteString(fmt.Sprintf("  %-18s %s\n", r[0], r[1]))
+		b.WriteString("  " + keySty.Render(fmt.Sprintf("%-18s", r[0])) + " " + r[1] + "\n")
 	}
-	b.WriteString("\n" + helpSty.Render("tab/←→ filter syntax · esc back"))
+	b.WriteString("\n" + helpSty.Render("tab/←→ filter syntax and fields · esc back"))
 	return b.String()
 }
 
@@ -618,4 +781,47 @@ func (m Model) editView() string {
 		b.WriteString(helpSty.Render("tab/↓ next · shift+tab/↑ prev · enter save · esc cancel · dates: YYYY-MM-DD"))
 	}
 	return b.String()
+}
+
+// boardHelp is the board's key hint, cut to fit one line of width cells: the
+// least important entries go first (the full list is behind ?), the way out
+// and the help key stay.
+func boardHelp(width int) string {
+	items := []string{"←→ column", "↑↓ card", "H/L move", "enter open", "e edit", "n new", "d delete", "m move to", "x actions", ". repeat", "space mark", "R runs", "/ filter", "r reload", "? help", "q quit"}
+	drop := []string{"space mark", ". repeat", "r reload", "R runs", "m move to", "d delete", "H/L move", "n new", "e edit", "x actions", "/ filter", "↑↓ card", "←→ column", "enter open"}
+	for ansi.StringWidth(strings.Join(items, "  ")) > width && len(drop) > 0 {
+		for i, it := range items {
+			if it == drop[0] {
+				items = append(items[:i], items[i+1:]...)
+				break
+			}
+		}
+		drop = drop[1:]
+	}
+	line := ansi.Truncate(strings.Join(items, "  "), max(width, 1), "…")
+	// Style after the cut, so the width maths above stays on plain text.
+	parts := strings.Split(line, "  ")
+	for i, p := range parts {
+		key, rest, _ := strings.Cut(p, " ")
+		parts[i] = keySty.Render(key) + helpSty.Render(" "+rest)
+		if rest == "" {
+			parts[i] = keySty.Render(key)
+		}
+	}
+	return strings.Join(parts, helpSty.Render("  "))
+}
+
+// moveToPrompt is the footer while `m` waits for a column number.
+func (m Model) moveToPrompt() string {
+	p := "move to:"
+	if n := len(m.marks); n > 0 {
+		p = fmt.Sprintf("move %d marked cards to:", n)
+	}
+	for i, c := range m.board.Columns {
+		if i == 9 {
+			break
+		}
+		p += fmt.Sprintf("  %d %s", i+1, c.Name)
+	}
+	return ansi.Truncate(p+"   esc cancel", m.width-1, "…")
 }

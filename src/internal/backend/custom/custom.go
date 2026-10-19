@@ -7,9 +7,18 @@
 //	{"op":"update","task":{...}}       -> {}
 //	{"op":"delete","id":"7"}           -> {}
 //
-// A failure is a non-zero exit status or {"error":"message","code":"..."};
-// code "not_found" (or exit status 3) maps to "task not found" and
-// "unsupported" to "operation not supported". Task is the JSON shape printed by
+// Every request carries "version":1. An update made through backend.Patcher
+// (a move or edit from the board or `tkan edit`) also carries "base", the task as
+// the caller read it; a command may write only the fields that differ between
+// base and task, so another writer's change to another field survives. An update made for a claim also carries
+// "expect":{"field":"assignee","value":""}: the command applies it only if the
+// stored task still has that value, checked under its own lock or transaction,
+// else it answers code "precondition". A list answer may add "guard":true (the
+// command honours expect atomically) and "fields" (the logical fields it keeps,
+// e.g. no "lease"). A failure is a non-zero exit status or
+// {"error":"message","code":"..."}; code "not_found" (or exit status 3) maps to
+// "task not found", "unsupported" to "operation not supported" and
+// "precondition" to "precondition failed". Task is the JSON shape printed by
 // `tkan list -json` (id, title, description, status, priority, notes, type,
 // assignee, due, start, labels, extra). IDs must be non-empty and unique within
 // one list. See docs/backends.md.
@@ -29,6 +38,7 @@ import (
 	"time"
 
 	"tkan/internal/backend"
+	"tkan/internal/proc"
 	"tkan/internal/task"
 )
 
@@ -40,37 +50,31 @@ const (
 	maxStderr      = 64 << 10 // only the start of stderr is kept for error messages
 )
 
-// capWriter keeps at most max bytes and silently drops the rest, so a runaway
-// command cannot exhaust memory (writes never fail, the command keeps running
-// until it exits or times out).
-type capWriter struct {
-	buf       bytes.Buffer
-	max       int
-	truncated bool
-}
-
-func (w *capWriter) Write(p []byte) (int, error) {
-	n := len(p) // always report everything as written, or exec fails with a short write
-	if room := w.max - w.buf.Len(); len(p) > room {
-		w.truncated = true
-		p = p[:max(room, 0)]
-	}
-	w.buf.Write(p)
-	return n, nil
-}
-
 type options struct {
 	Command []string          `yaml:"command"`
 	Cwd     string            `yaml:"cwd"`
 	Timeout string            `yaml:"timeout"`
-	Poll    string            `yaml:"poll"`
+	Poll    any               `yaml:"poll"`
 	Env     map[string]string `yaml:"env"`
 }
 
+// protocolVersion is sent with every request so a command can tell protocol
+// revisions apart.
+const protocolVersion = 1
+
 type request struct {
-	Op   string     `json:"op"`
-	Task *task.Task `json:"task,omitempty"`
-	ID   string     `json:"id,omitempty"`
+	Version int        `json:"version"`
+	Op      string     `json:"op"`
+	Task    *task.Task `json:"task,omitempty"`
+	ID      string     `json:"id,omitempty"`
+	Expect  *expect    `json:"expect,omitempty"`
+	Base    *task.Task `json:"base,omitempty"` // update: the task as the caller read it
+}
+
+// expect is the guard of backend.WithExpect, handed to the command.
+type expect struct {
+	Field string `json:"field"`
+	Value string `json:"value"`
 }
 
 type response struct {
@@ -79,6 +83,8 @@ type response struct {
 	Tasks    []task.Task `json:"tasks"`
 	Statuses []string    `json:"statuses"`
 	Task     *task.Task  `json:"task"`
+	Guard    bool        `json:"guard"`  // list: update honours expect atomically
+	Fields   []string    `json:"fields"` // list: logical fields the store keeps (nil: all)
 }
 
 // Backend implements backend.Backend by running the configured command.
@@ -91,6 +97,8 @@ type Backend struct {
 
 	mu       sync.Mutex
 	statuses []string
+	guard    bool        // the command said it checks expect atomically
+	fields   []string    // the fields the command said it keeps; nil: all
 	primed   []task.Task // the list Open fetched; handed to the first List call
 	hasPrime bool
 	primedAt time.Time
@@ -99,6 +107,8 @@ type Backend struct {
 	seen     snapshot // what List last returned
 	hasSeen  bool
 	dirty    bool  // a poll saw something different from seen
+	writes   int   // successful writes by tkan itself
+	adopt    bool  // a write happened: the next poll refreshes seen without flagging
 	pollErr  error // the last poll failure, reported once
 	started  bool
 	cancel   context.CancelFunc
@@ -109,6 +119,8 @@ type Backend struct {
 type snapshot struct {
 	Tasks    []task.Task
 	Statuses []string
+	Guard    bool
+	Fields   []string
 }
 
 // Open validates the options and runs one `list` to verify the command works.
@@ -119,8 +131,14 @@ func Open(spec backend.Spec) (backend.Backend, error) {
 			return nil, fmt.Errorf("custom options: %w", err)
 		}
 	}
+	if len(spec.Command) > 0 {
+		if len(o.Command) > 0 {
+			return nil, errors.New("custom: set command on the backend entry or in options, not both")
+		}
+		o.Command = spec.Command
+	}
 	if len(o.Command) == 0 || strings.TrimSpace(o.Command[0]) == "" {
-		return nil, errors.New("custom options: command is required (a list: program and arguments)")
+		return nil, errors.New("custom: command is required (a list: program and arguments)")
 	}
 	b := &Backend{command: o.Command, dir: spec.BaseDir, timeout: defaultTimeout}
 	if o.Cwd != "" {
@@ -133,15 +151,18 @@ func Open(spec backend.Spec) (backend.Backend, error) {
 		}
 		b.timeout = d
 	}
-	if o.Poll != "" {
-		d, err := time.ParseDuration(o.Poll)
-		if err != nil || d <= 0 {
-			return nil, fmt.Errorf("custom options: invalid poll %q (e.g. 5s)", o.Poll)
-		}
-		b.poll = d
+	pm, err := backend.ParsePoll("custom", o.Poll)
+	if err != nil {
+		return nil, err
+	}
+	if pm.Kind == backend.PollEvery { // watch and none both mean: no background polling
+		b.poll = pm.Interval
 	}
 	for k, v := range o.Env {
 		b.env = append(b.env, k+"="+v)
+	}
+	if spec.Lazy { // the caller lists in the background and reports a broken command then
+		return b, nil
 	}
 	first, err := b.List(context.Background())
 	if err != nil {
@@ -154,6 +175,7 @@ func Open(spec backend.Spec) (backend.Backend, error) {
 }
 
 func (b *Backend) call(ctx context.Context, req request) (response, error) {
+	req.Version = protocolVersion
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return response{}, err
@@ -165,22 +187,22 @@ func (b *Backend) call(ctx context.Context, req request) (response, error) {
 	cmd.Env = append(os.Environ(), b.env...)
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.WaitDelay = time.Second // do not hang on grandchildren that keep the pipes open
-	killGroupOnCancel(cmd)
-	stdout, stderr := &capWriter{max: maxStdout}, &capWriter{max: maxStderr}
+	proc.KillGroupOnCancel(cmd, 0)
+	stdout, stderr := &proc.CapWriter{Max: maxStdout}, &proc.CapWriter{Max: maxStderr}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
-	killLeftovers(cmd) // children a wrapper left behind must not outlive the call
+	proc.KillLeftovers(cmd) // children a wrapper left behind must not outlive the call
 	// A command that exited 0 but left a background child holding the pipes open
 	// is not a failure: what it printed is judged by the JSON below.
 	if errors.Is(runErr, exec.ErrWaitDelay) {
 		runErr = nil
 	}
-	if stdout.truncated {
+	if stdout.Truncated {
 		return response{}, fmt.Errorf("custom %s: output exceeds %d MiB", req.Op, maxStdout>>20)
 	}
 
 	var resp response
-	decErr := json.Unmarshal(bytes.TrimSpace(stdout.buf.Bytes()), &resp)
+	decErr := json.Unmarshal(bytes.TrimSpace(stdout.Buf.Bytes()), &resp)
 	if resp.Error != "" { // a structured error wins over the exit status
 		return resp, protocolError(resp)
 	}
@@ -191,7 +213,7 @@ func (b *Backend) call(ctx context.Context, req request) (response, error) {
 		if errors.Is(ctx.Err(), context.Canceled) { // the caller gave up (for example the TUI quit)
 			return resp, fmt.Errorf("custom %s: %w", req.Op, context.Canceled)
 		}
-		msg := strings.TrimSpace(stderr.buf.String())
+		msg := strings.TrimSpace(stderr.Buf.String())
 		if msg == "" {
 			msg = runErr.Error()
 		}
@@ -213,6 +235,8 @@ func protocolError(r response) error {
 		return fmt.Errorf("%w: %s", backend.ErrNotFound, r.Error)
 	case "unsupported":
 		return fmt.Errorf("%w: %s", backend.ErrUnsupported, r.Error)
+	case "precondition":
+		return fmt.Errorf("%w: %s", backend.ErrPrecondition, r.Error)
 	}
 	return errors.New(r.Error)
 }
@@ -237,7 +261,8 @@ func (b *Backend) List(ctx context.Context) ([]task.Task, error) {
 	}
 	b.mu.Lock()
 	b.statuses = snap.Statuses
-	b.seen, b.hasSeen, b.dirty = snap, true, false
+	b.guard, b.fields = snap.Guard, snap.Fields
+	b.seen, b.hasSeen, b.dirty, b.adopt = snap, true, false, false
 	b.mu.Unlock()
 	return snap.Tasks, nil
 }
@@ -276,7 +301,7 @@ func (b *Backend) fetch(ctx context.Context) (snapshot, error) {
 	for i := range resp.Tasks {
 		resp.Tasks[i].Backend = ""
 	}
-	return snapshot{Tasks: resp.Tasks, Statuses: statuses}, nil
+	return snapshot{Tasks: resp.Tasks, Statuses: statuses, Guard: resp.Guard, Fields: resp.Fields}, nil
 }
 
 // Statuses returns the statuses reported by (or derived from) the last list.
@@ -286,10 +311,60 @@ func (b *Backend) Statuses() []string {
 	return append([]string(nil), b.statuses...)
 }
 
-func (b *Backend) Update(ctx context.Context, t task.Task) error {
+// Guards implements backend.Guarder: true once a list said the command checks
+// expect under its own lock.
+func (b *Backend) Guards() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.guard
+}
+
+// Stores implements backend.FieldStorer from the "fields" a list reported;
+// without it every field is assumed to be kept.
+func (b *Backend) Stores(field string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fields == nil {
+		return true
+	}
+	for _, f := range b.fields {
+		if f == field {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Backend) Update(ctx context.Context, t task.Task) error { return b.update(ctx, nil, t) }
+
+// Patch implements backend.Patcher: the update request also carries base, the
+// task as the caller read it, so a command can write only what changed. A
+// command that ignores base replaces the whole record, as before.
+func (b *Backend) Patch(ctx context.Context, base, t task.Task) error {
+	base.Backend = ""
+	return b.update(ctx, &base, t)
+}
+
+func (b *Backend) update(ctx context.Context, base *task.Task, t task.Task) error {
 	t.Backend = ""
-	_, err := b.call(ctx, request{Op: "update", Task: &t})
+	req := request{Op: "update", Task: &t, Base: base}
+	if field, value, ok := backend.Expected(ctx); ok {
+		req.Expect = &expect{Field: field, Value: value}
+	}
+	_, err := b.call(ctx, req)
+	if err == nil {
+		b.wrote()
+	}
 	return err
+}
+
+// wrote records a successful write by tkan: the next poll adopts the new state
+// as seen instead of reporting it as an outside change.
+func (b *Backend) wrote() {
+	b.mu.Lock()
+	b.writes++
+	b.adopt, b.dirty = true, false
+	b.mu.Unlock()
 }
 
 func (b *Backend) Create(ctx context.Context, t task.Task) (task.Task, error) {
@@ -301,11 +376,15 @@ func (b *Backend) Create(ctx context.Context, t task.Task) (task.Task, error) {
 	if resp.Task == nil || resp.Task.ID == "" {
 		return task.Task{}, errors.New(`custom create: response must contain "task" with an "id"`)
 	}
+	b.wrote()
 	return *resp.Task, nil
 }
 
 func (b *Backend) Delete(ctx context.Context, id string) error {
 	_, err := b.call(ctx, request{Op: "delete", ID: id})
+	if err == nil {
+		b.wrote()
+	}
 	return err
 }
 
@@ -340,6 +419,9 @@ func (b *Backend) pollLoop(ctx context.Context, done chan struct{}) {
 			return
 		case <-tick.C:
 		}
+		b.mu.Lock()
+		gen := b.writes
+		b.mu.Unlock()
 		snap, err := b.fetch(ctx)
 		if ctx.Err() != nil {
 			return
@@ -348,6 +430,10 @@ func (b *Backend) pollLoop(ctx context.Context, done chan struct{}) {
 		switch {
 		case err != nil:
 			b.pollErr = err
+		case gen != b.writes:
+			// a write landed while this poll ran: it may predate it; ignore
+		case b.adopt:
+			b.seen, b.hasSeen, b.adopt = snap, true, false
 		case b.hasSeen && !reflect.DeepEqual(snap, b.seen):
 			b.dirty = true
 		}

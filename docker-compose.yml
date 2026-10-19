@@ -23,6 +23,15 @@ services:
     <<: *dev
     command: go test ./...
 
+  # Race detector over the packages that run goroutines (needs cgo, hence its own image).
+  race:
+    <<: *dev
+    build:
+      context: .
+      target: race
+    image: tkan-race
+    command: go test -race ./internal/action ./internal/actionlog ./internal/audit ./internal/backend/... ./internal/proc ./internal/hook ./internal/tui ./cmd/tkan
+
   # Static binary into ./bin. Cross-compile with GOOS/GOARCH/GOARM and OUT, see Makefile.
   build:
     <<: *dev

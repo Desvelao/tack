@@ -80,7 +80,11 @@ func Generate(o InitOptions) (string, []string, error) {
 	b.WriteString("# Backends: each entry has a `type`, an optional `name` (default: type + position,\n")
 	b.WriteString("# e.g. csv1) and the type's `options`. Cards show the name of their backend.\n")
 	b.WriteString("backend:\n")
-	fmt.Fprintf(&b, "  - type: %s\n    options:\n", o.Backend)
+	if ex.Entry != "" {
+		b.WriteString("  - " + strings.ReplaceAll(ex.Entry, "{{source}}", quote(sourceFor(o))) + "\n    options:\n")
+	} else {
+		fmt.Fprintf(&b, "  - type: %s\n    options:\n", o.Backend)
+	}
 	section := strings.ReplaceAll(ex.Section, "{{source}}", quote(sourceFor(o)))
 	for _, line := range strings.Split(section, "\n") {
 		if line == "" {
@@ -91,7 +95,18 @@ func Generate(o InitOptions) (string, []string, error) {
 	}
 	b.WriteString("\n# Audit trail of reloads and writes (press A in the board, or `tkan audit`).\n")
 	b.WriteString("# Kept in memory unless a file is set; .jsonl or .csv, relative to this file.\n")
-	b.WriteString("# audit:\n#   file: audit.jsonl\n")
+	b.WriteString("# audit:\n#   file: audit.jsonl\n#   max_size: 1024    # KiB; past it the file is moved to audit.jsonl.1 (default: grows forever)\n")
+	b.WriteString("\n# Actions: commands run on the selected task (press x in the board, or `tkan run NAME ID`).\n")
+	b.WriteString("# The command is a list, not a shell line; {id}, {title}, {description}, {status}, ... are\n")
+	b.WriteString("# replaced by the task's values. mode: background (default) | interactive (owns the terminal).\n")
+	b.WriteString("# Details of every run (command, stdin, output, times) can be kept with: action_log: {file: actions.jsonl}\n")
+	b.WriteString("# actions:\n#   - {name: notify, command: [notify-send, \"tkan #{id}\", \"{title}\"]}\n")
+	b.WriteString("#   - {name: claude, key: c, mode: interactive, command: [claude, \"Work on task {id}: {title}\"]}\n")
+	b.WriteString("# Marked cards (space, then x) run in the background, this many at once: action_max_parallel: 2\n")
+	b.WriteString("\n# Hooks: commands started by events (task.create|update|delete[.success|.fail], task.moved,\n")
+	b.WriteString("# task.appeared, task.disappeared, reload.ok|fail, action.started|finished|succeeded|failed).\n")
+	b.WriteString("# `when` filters the event's task; {event} {old_status} {error} {source} are extra placeholders.\n")
+	b.WriteString("# hooks:\n#   - {name: notify-high, on: [task.moved], when: \"priority=high\", command: [notify-send, \"#{id} {title}\", \"{old_status} -> {status}\"]}\n")
 	b.WriteString("\nboard:\n")
 	b.WriteString("  # Columns, left to right. `values` are the raw status values shown in a column;\n")
 	b.WriteString("  # `write` (default: first value) is stored when a card is moved into it.\n")
@@ -131,7 +146,7 @@ func otherFields(extras []string) []string {
 
 // defaultSources is the `source:` written when init gets no location.
 var defaultSources = map[string]string{
-	"json": "tasks.json", "jsonl": "tasks.jsonl", "yaml": "tasks.yaml", "markdown": "tasks", "sqlite": "tasks.db",
+	"json": "tasks.json", "jsonl": "tasks.jsonl", "yaml": "tasks.yaml", "sqlite": "tasks.db",
 }
 
 // sourceFor picks the `source:` value: relative to the output directory when possible.

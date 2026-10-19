@@ -6,10 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"tkan/internal/backend"
+	"tkan/internal/backend/backendtest"
 	"tkan/internal/task"
 )
 
@@ -151,4 +153,80 @@ func TestExampleAndNoExtensionClaim(t *testing.T) {
 	if err != nil || !strings.Contains(ex.Section, "id: key") || len(ex.Statuses) != 1 {
 		t.Fatalf("%+v %v", ex, err)
 	}
+}
+
+func TestStructuredLogicalFieldKeepsItsType(t *testing.T) {
+	b, p := open(t, "- id: 1\n  title: {a: 1}\n  status: todo\n  due: [2026, 1, 2]\n- id: 2\n  title: plain\n  status: todo\n", "")
+	ctx := context.Background()
+	got, err := b.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0].Status = "doing"
+	if err := b.Update(ctx, got[0]); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	var recs []map[string]any
+	if err := yaml.Unmarshal(data, &recs); err != nil {
+		t.Fatalf("%v\n%s", err, data)
+	}
+	if _, ok := recs[0]["title"].(map[string]any); !ok {
+		t.Errorf("title is %#v, want a mapping:\n%s", recs[0]["title"], data)
+	}
+	if _, ok := recs[0]["due"].([]any); !ok {
+		t.Errorf("due is %#v, want a list:\n%s", recs[0]["due"], data)
+	}
+	// A string the user typed that looks like a mapping stays a string.
+	got, _ = b.List(ctx)
+	got[1].Title = `{"b":2}`
+	if err := b.Update(ctx, got[1]); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(p)
+	recs = nil
+	_ = yaml.Unmarshal(data, &recs)
+	if s, ok := recs[1]["title"].(string); !ok || s != `{"b":2}` {
+		t.Errorf("title is %#v, want the string:\n%s", recs[1]["title"], data)
+	}
+}
+
+func TestPatchKeepsAConcurrentChangeToAnotherField(t *testing.T) {
+	reader, p := open(t, sample, "")
+	var n yaml.Node
+	if err := yaml.Unmarshal([]byte("source: \""+p+"\"\n"), &n); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := backend.OpenSpec(backend.Spec{Type: "yaml", Options: *n.Content[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendtest.CheckPatch(t, reader, writer, func() {
+		future := time.Now().Add(time.Duration(time.Now().UnixNano()%1000+2) * time.Second)
+		_ = os.Chtimes(p, future, future)
+	})
+}
+
+func TestConcurrentWriters(t *testing.T) {
+	p := writeTemp(t, "[]\n")
+	open := func() backend.Backend {
+		b, err := backend.OpenSpec(specFor(t, p, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	backendtest.CheckConcurrentWriters(t, open, filepath.Dir(p), 4, 12)
+}
+
+func TestIDsNotReused(t *testing.T) {
+	p := writeTemp(t, "[]\n")
+	open := func() backend.Backend {
+		b, err := backend.OpenSpec(specFor(t, p, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	backendtest.CheckIDsNotReused(t, open, p+".nextid")
 }

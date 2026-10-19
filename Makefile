@@ -7,8 +7,8 @@ export VERSION ?= $(or $(shell git describe --tags --match "v*" --dirty 2>/dev/n
 export BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 PREFIX ?= $(HOME)/.local
 
-.PHONY: build build-arm build-armv7 build-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64 release \
-	install clean test check tidy shell fmt vet
+.PHONY: test-contrib check-version build build-arm build-armv7 build-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64 release \
+	install clean test race check tidy shell fmt vet
 build:
 	$(DC) run --rm build
 build-arm:   # Raspberry Pi Zero W / 1
@@ -34,12 +34,25 @@ clean:
 	rm -rf bin
 test:
 	$(DC) run --rm test
+# The contrib backend scripts (bash + jq + sqlite3), alone and driven through the built tkan.
+test-contrib: build
+	$(DC) run --rm dev sh -c 'cd /app && contrib/backends/sqlite/test.sh /app/bin/tkan'
 # Read-only gate: gofmt must not want changes, then vet and the tests.
-check:
-	@test "$$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' install.sh)" = "$$(tr -d '[:space:]' < VERSION)" || { echo "install.sh VERSION does not match the VERSION file"; exit 1; }
+check: check-version
 	$(DC) run --rm dev sh -c 'out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi'
 	$(DC) run --rm dev go vet ./...
 	$(DC) run --rm test
+	$(MAKE) test-contrib
+# Every place that names the release must agree with the VERSION file.
+check-version:
+	@v="$$(tr -d '[:space:]' < VERSION)"; \
+	test "$$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' install.sh)" = "$$v" || { echo "install.sh VERSION does not match the VERSION file ($$v)"; exit 1; }; \
+	stale="$$(grep -on '/v[0-9]\+\.[0-9]\+\.[0-9]\+/' README.md | grep -v "/v$$v/" || true)"; \
+	test -z "$$stale" || { echo "README.md install URLs are not v$$v:"; echo "$$stale"; exit 1; }; \
+	grep -q "^## \[$$v\]" CHANGELOG.md || { echo "CHANGELOG.md has no '## [$$v]' heading"; exit 1; }
+# The race detector needs cgo: it runs in its own image with a C compiler.
+race:
+	$(DC) run --rm race
 tidy:
 	$(DC) run --rm dev go mod tidy
 fmt:

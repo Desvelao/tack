@@ -7,6 +7,14 @@ store (`csv`, `custom`, ...) and its `options`; every entry becomes one `Backend
 (`Task.Backend`), unions the statuses, and routes `Update`/`Create`/`Delete` by that name.
 Backends themselves never see the name on a task.
 
+## Task ids are not reused
+
+The csv, json, jsonl and yaml backends keep a high-water mark, the highest id they handed out, in a small
+sidecar written atomically under the same lock as the create: `<file>.nextid` next to the data file. A new id is `max(max numeric id present, mark) + 1`, so
+after `tkan delete 12` the next `tkan add` does not return 12 again. A missing or unreadable sidecar degrades to
+`max + 1`. The SQLite script (a `custom` backend) assigns ids itself: tables with `AUTOINCREMENT` never reuse one; for other tables the id is `max + 1`. Every `custom` backend assigns its own ids. Add `*.nextid` to `.gitignore` if the backlog is
+in a repository.
+
 ## Interface
 
 ```go
@@ -23,6 +31,32 @@ type Backend interface {
 // A backend that may serve a cached copy (csv with `poll: none`/N) can also
 // implement `Reload() error` (backend.Reloader); the board's `r` key calls it.
 type Watcher interface{ Changed() (bool, error) }
+
+// A guard from backend.WithExpect(ctx, field, value) travels in the ctx of Update and
+// Patch: a backend checks it against the stored task inside its lock (custom: the
+// command does, when its list reports "guard":true) and returns backend.ErrPrecondition without
+// writing. Backends that cannot (a custom command without "guard") get a best-effort fresh-read
+// check from Set.Update instead.
+//
+// Optional: write only what an edit changed. Patch stores t over the task as the
+// store holds it now (read again under the lock), but only the fields and extra
+// keys that differ between base, the copy the caller read, and t. csv, json,
+// jsonl, yaml and custom (which sends the base to the command) implement it; backend.Set uses it whenever the
+// caller knows the original (backend.WithOld: the board's move and edit, `edit`,
+// `set-status`), so an agent's edit of another field is not written back
+// over. Without Patch (custom) or without the original, Update replaces the whole record.
+//
+// Extras and deletion: Update never removes an extra key or column; one the copy
+// lacks is kept (it may be a column the caller never saw). Patch removes an extra
+// that the caller dropped relative to its base. Setting it to "" is not a removal
+// (json/yaml keep an empty-string key). The shipped CLI and board do not edit
+// extras, so today only a Patcher caller or a direct file edit clears one.
+type Patcher interface{ Patch(ctx, base, t task.Task) error }
+
+// Optional, for stores with a fixed set of columns (csv, sqlite): whether a value
+// written to the logical field is kept. `tkan claim` refuses a claim whose
+// assignee/lease would be dropped. Backends without it are assumed to store every field.
+type FieldStorer interface{ Stores(field string) bool }
 
 // Registered per type name; Spec is one entry of the config's backend list.
 type Factory func(spec backend.Spec) (Backend, error)
@@ -86,7 +120,6 @@ returns `backend.Example{Section, Statuses, Notes}`:
 | `csv` | `internal/backend/csv` | `options.source`/`header`/`fields` map the file by header name or position, headerless files, atomic write (fsync + rename, symlinks followed), CRLF, BOM and a missing final newline preserved, writes serialised across processes with an advisory lock on `<file>.lock` (a harmless empty sidecar file; a writer waits up to 5 s for another tkan, then fails with `locked by another tkan`; implemented with flock on Unix and LockFileEx on Windows, the latter never run there), implements `Watcher` |
 | `json`, `jsonl` | `internal/backend/json` | a JSON file (array, or object with `tasks`) or JSON Lines; built on `internal/backend/filestore` (below); implements `Watcher` and `Reloader` |
 | `yaml` | `internal/backend/yaml` | a YAML list of tasks (or mapping with `tasks`); same engine as `json`; selected with `type: yaml` only (no extension claim) |
-| `markdown` | `internal/backend/markdown` | a directory of `.md` files, one task each (below); implements `Watcher` and `Reloader` |
 | `sqlite` | `internal/backend/sqlite` | a table of a SQLite database, accessed through a SQLite command line tool (no library linked, so the binary stays static); `options.source`/`table`/`fields`/`cli`/`poll` (below); writes in one `BEGIN IMMEDIATE` transaction; implements `Watcher` and `Reloader` |
 | `custom` | `internal/backend/custom` | runs an external command per operation, JSON over stdin/stdout (below); implements `Watcher` only when `options.poll` is set, otherwise press `r` to reload |
 
@@ -103,82 +136,63 @@ and a key mapping (`filestore.Mapping`: record keys <-> task fields, everything 
 The csv backend uses the same lock and atomic-write helpers but keeps its own engine for its header,
 BOM and line-ending handling.
 
-## The `markdown` backend
+## SQLite: the `tkan-sqlite.sh` script
+
+SQLite is provided as a script for the [`custom` backend](#the-custom-backend), shipped as `contrib/backends/sqlite/tkan-sqlite.sh`. Copy it
+next to your `tkan.yaml`, or anywhere and give its path. It needs `bash`, `jq` and the `sqlite3`
+command line tool (3.38 or newer, for the JSON functions); tkan links no SQLite library.
 
 ```yaml
 backend:
-  - type: markdown
+  - name: tasks
+    command: [./tkan-sqlite.sh, tasks.db, tasks]   # database file, table (default: tasks)
     options:
-      source: tasks/        # tasks/12.md, tasks/fix-login.md, ...
+      env: {TKAN_SQLITE_FIELDS: "id=key,title=summary,status=state"}   # only where the column name differs
+      poll: 5s     # outside changes are noticed by re-running `list` (default: never; press r)
 ```
 
-```markdown
----
-title: Fix the login
-status: todo
-labels:
-  - auth
-owner: ann            # not a task field: kept in `extra`
----
+`tkan init -backend sqlite` writes this entry. `TKAN_SQLITE_CLI` names another SQLite tool
+(default `sqlite3`). The script has no file stamp to watch: outside changes are noticed by `poll`
+re-running `list` every N seconds, or by `r`.
 
-Steps to reproduce...
-```
-
-- The id is the file name without `.md`; new tasks are `max(numeric id) + 1`. `list` order is numeric ids
-  ascending, then the other names alphabetically.
-- Each write replaces one file atomically under a `.tkan.lock` in the directory (hidden, ignored by the
-  scan). A write rewrites the frontmatter from the task's fields: comments inside it are not kept, and
-  `\r\n` becomes `\n`. Writing does not touch the other files.
-- `Changed` compares the name, size and modification time of every `.md` file, so adding, removing or
-  editing a file by hand shows up on the board.
-- The body is the description (outer blank lines trimmed); a `description:` key in the frontmatter wins over
-  the body when it is present.
-
-## The `sqlite` backend
-
-```yaml
-backend:
-  - type: sqlite
-    options:
-      source: tasks.db
-      table: tasks
-      # cli: sqlite3                          # default: first installed of sqlite3, sqlite
-      fields: {id: key, title: summary, status: state}   # only where the column name differs
-```
-
-tkan does not link a SQLite library. For every operation it starts a SQLite command line tool,
-writes one SQL script to its stdin and reads the rows as JSON (`-json`) from its stdout, so the CLI
-must be installed (`apt install sqlite3`, `apk add sqlite`, `brew install sqlite`, ...) and be
-SQLite 3.33 or newer.
-
-- **Which CLI.** `options.cli` (a program name or a list, no shell) if set; otherwise the first of
-  `sqlite3`, `sqlite` that is on `PATH` and prints JSON. When none works the error lists what was
-  tried. A list lets you run the tool elsewhere, e.g. `[docker, exec, -i, db, sqlite3]` (then
-  `source` is the path inside the container and outside edits are not noticed by `Changed`).
-- **Safety.** Values never travel as SQL text: they are sent as hex literals
-  (`CAST(X'..' AS TEXT)`), so no quote, `;` or leading `.` in a title can alter the statement or reach
-  the CLI as a dot command. Table and column names come from the config and are quoted.
-- **Concurrency.** Writes run in one `BEGIN IMMEDIATE` transaction with a 5 s busy timeout, so
-  several tkan processes (and other programs using the database) are serialised by SQLite itself;
-  there is no lock file. Updates touch only the mapped columns (and extras the task carries).
-- **Changes by others.** `Changed` compares the modification time and size of the database file and
-  its `-wal`; see `poll` in [config.md](config.md#sqlite-options).
-- **Limits.** One process per operation (a start-up cost per `list`/write, noticeable on a Raspberry
-  Pi with a huge table); `WITHOUT ROWID` tables are not supported; rows come back in the table's
-  natural (rowid) order; a database that needs an encryption key or a special build must be
-  reached through `options.cli`.
+- **Safety.** The whole request is handed to SQLite as one hex blob literal and read back with
+  `json_extract`, so no quote, `;` or leading `.` in a title can alter a statement or reach the CLI as a
+  dot command. Table and column names are quoted; the script refuses control characters in them and NUL
+  characters in values.
+- **Concurrency and claims.** Writes run in one `BEGIN IMMEDIATE` transaction with a 5 s busy timeout,
+  so several tkan processes (and other programs using the database) are serialised by SQLite itself.
+  The script reports `"guard":true`, so `claim`, `release`, `next`, `set-status -from` and `edit -if` are
+  atomic: the `expect` check is part of the `UPDATE`. The table layout read first is checked
+  (`schema_version`) inside the transaction, and the write is retried once if another process altered
+  the table meanwhile.
+- **Partial updates.** tkan sends `base`, the task as it was read, and the script writes only the columns
+  whose value differs, so another writer's change to a different field survives.
+- **Layout.** The columns are mapped to the fields by name (case-insensitive) or by
+  `TKAN_SQLITE_FIELDS`; `id`, `title` and `status` are required. Unmapped columns are kept as extra
+  fields and left alone by updates. New tasks get the next rowid when `id` is an `INTEGER PRIMARY KEY`,
+  otherwise `max(numeric id) + 1`. A missing table (or database) is an empty backlog; the first `add`
+  creates it with one column per field. A `NOT NULL` column without a default that tkan does not map
+  makes `add` fail naming it.
+- **NULLs.** A NULL reads as an empty string; unchanged columns are left alone, but setting a column to
+  an empty value stores `''`.
+- **Limits.** One `sqlite3` process (and a few `jq` ones) per operation, noticeable on a Raspberry Pi with
+  a huge table; no change detection by file stamp (use `poll`); rows come back in rowid order; a column
+  whose name contains a double quote cannot be written; `WITHOUT ROWID` tables are untested. Test it with
+  `make test-contrib`.
 
 ## The `custom` backend
 
 ```yaml
 backend:
-  - type: custom
-    name: tracker
+  - name: tracker
+    command: [./tracker.sh, --project, demo]   # program + args, no shell; implies type: custom
     options:
-      command: [./tracker.sh, --project, demo]   # program + args, no shell
       timeout: 10s
       # poll: 5s     # optional: re-run `list` this often to notice outside changes
 ```
+
+`command:` on the entry means `type: custom`. `type: custom` with
+`options: {command: [...]}` is equivalent; setting the command in both places is an error.
 
 For **every operation** tkan starts the command (working directory: `cwd`, default the config
 directory), writes one JSON object to its stdin and reads one JSON object from its stdout. At
@@ -186,19 +200,31 @@ start-up tkan runs one `list` to check the command works.
 
 | Request (stdin) | Response (stdout) |
 |---|---|
-| `{"op":"list"}` | `{"tasks":[Task, ...], "statuses":["todo","done"]}` (`statuses` optional: default is the statuses of `tasks`, first-seen order; give it to expose columns that have no task yet) |
+| `{"op":"list"}` | `{"tasks":[Task, ...], "statuses":["todo","done"]}` (`statuses` optional: default is the statuses of `tasks`, first-seen order; give it to expose columns that have no task yet). May also carry `"guard":true` and `"fields":[...]`, see below. |
 | `{"op":"create","task":Task}` | `{"task":Task}` with the assigned `id` (required) |
-| `{"op":"update","task":Task}` | `{}` (replaces the task with that `id`) |
+| `{"op":"update","task":Task}` | `{}` (replaces the task with that `id`). May carry `"expect":{"field":"assignee","value":""}`, see below. |
 | `{"op":"delete","id":"7"}` | `{}` |
 
 `Task` is the JSON shown by `tkan list -json`: `id`, `title`, `status` (raw value),
-`description`, `priority`, `notes`, `type`, `assignee`, `due`, `start`, `labels` and `extra` (a string map
+`description`, `priority`, `notes`, `type`, `assignee`, `due`, `start`, `labels`, `blocked_by` (comma-separated ids), `lease` (RFC 3339 time a claim runs out, see `tkan claim`), `claimed_at` (RFC 3339 time it started) and `extra` (a string map
 to round-trip unknown fields); empty fields may be omitted. In a `list` response `tasks` is required (`[]` for an empty board; a missing or misspelled key is an
 error, not an empty list) and every `id` must be non-empty and unique. `column` and `backend` are never sent.
 
+Every request also has `"version":1`.
+
+**Atomic claims.** `tkan claim`, `release`, `next` and `run -claim` write with a guard: an `update`
+carries `"expect":{"field":"assignee","value":""}` and must be applied only if the stored task still
+has that value in that field. A command that checks this under its own lock or transaction (a
+`BEGIN IMMEDIATE`, `flock`, a compare-and-set in an API) answers `{"error":"...","code":"precondition"}`
+when it does not hold (tkan exit code 4) and reports `"guard":true` in its `list` answer. Without
+`"guard":true` tkan still checks against a fresh `list` before the write, which is not atomic: two
+agents racing for one task can both win. A `list` answer may also give `"fields":["title","status",...]`,
+the logical fields the store keeps; tkan then knows a missing one (for example `lease`) is not stored.
+Without it every field is assumed to be kept.
+
 Errors: any response with `{"error":"message"}` (optionally `"code"`), or a non-zero exit status
 (stderr is shown). `"code":"not_found"` or exit status 3 means the ID does not exist (tkan exit code 3);
-`"code":"unsupported"` marks an operation the tool cannot do. Output that is not valid JSON is an
+`"code":"unsupported"` marks an operation the tool cannot do; `"code":"precondition"` means the `expect` guard did not hold. Output that is not valid JSON is an
 error, as is stdout above 32 MiB. A call that exceeds `timeout` is killed together with the
 processes the command started (its process group, on Unix). Processes a command leaves running in
 the background are also killed when the call returns, and a command that exits 0 with a valid answer

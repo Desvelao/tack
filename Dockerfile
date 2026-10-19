@@ -3,7 +3,7 @@ ARG GO_VERSION=1.24.13
 
 # dev: toolchain image used by docker-compose (source is bind-mounted).
 FROM golang:${GO_VERSION}-alpine AS dev
-RUN apk add --no-cache git make sqlite \
+RUN apk add --no-cache git make sqlite bash jq \
     && mkdir -p /go-cache /go/pkg/mod /app && chmod -R 777 /go-cache /go /app
 ENV CGO_ENABLED=0 \
     GOFLAGS=-buildvcs=false \
@@ -11,6 +11,13 @@ ENV CGO_ENABLED=0 \
     HOME=/tmp
 WORKDIR /app/src
 CMD ["sh"]
+
+# race: the dev image plus a C compiler, because the race detector needs cgo
+# (the normal build stays static: CGO_ENABLED=0).
+FROM dev AS race
+USER root
+RUN apk add --no-cache gcc musl-dev
+ENV CGO_ENABLED=1
 
 # build: reproducible static binary from the committed source.
 FROM dev AS build

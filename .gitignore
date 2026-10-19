@@ -1,10 +1,15 @@
 bin/
 *.tmp
 *.lock
+*.nextid
+.tkan.nextid
 # personal backlog and config; tkan.example.yaml is the tracked sample
 /tasks.csv
 /tkan.yaml
 /tkan.yml
+# action run logs (prompts and command output); see action_log in docs/config.md
+/actions.jsonl
+/actions/
 /.tkan.yaml
 /.tkan.yml
 .env

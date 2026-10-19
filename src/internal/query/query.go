@@ -12,13 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"tkan/internal/task"
 )
 
 // DefaultSearch lists the fields a plain text term is matched against.
 var DefaultSearch = []string{"id", "title", "description", "notes"}
 
 // LogicalFields are the task fields every backend provides.
-var LogicalFields = []string{"id", "title", "description", "status", "priority", "notes", "type", "assignee", "due", "start", "labels"}
+var LogicalFields = []string{"id", "title", "description", "status", "priority", "notes", "type", "assignee", "due", "start", "labels", "blocked_by", "lease", "claimed_at"}
 
 type op int
 
@@ -156,6 +158,16 @@ func (t *term) match(get Lookup, search []string) bool {
 		return found != t.neg
 	}
 	v, _ := get(t.field)
+	if t.field == "labels" {
+		switch t.op {
+		case opEquals:
+			return labelsMatch(v, expandDates(t.values), false)
+		case opNotEquals:
+			return !labelsMatch(v, expandDates(t.values), false)
+		case opPrefix:
+			return labelsMatch(v, t.values, true)
+		}
+	}
 	switch t.op {
 	case opContains:
 		return containsAny(strings.ToLower(v), t.values)
@@ -184,10 +196,49 @@ func (t *term) match(get Lookup, search []string) bool {
 // Now is the clock for relative dates; tests replace it.
 var Now = time.Now
 
-var relDate = regexp.MustCompile(`^(today|tomorrow|yesterday)(?:([+-])(\d+)([dw]))?$`)
+var relDate = regexp.MustCompile(`^(today|tomorrow|yesterday)(?:([+-])(\d+)([dwmy]))?$`)
+
+// relWords are the words a relative date starts with.
+var relWords = []string{"today", "tomorrow", "yesterday"}
+
+// dateFields are the fields that hold dates, where an ordering term with a
+// near-miss of a relative word (due<tomorow) is a typo, not text.
+var dateFields = map[string]bool{"due": true, "start": true, "date": true, "time": true}
+
+// checkRelativeDates rejects values that try to be a relative date but are not
+// one (today+7, today+1x, due<tomorow) instead of comparing them as text.
+func checkRelativeDates(t term) error {
+	switch t.op {
+	case opEquals, opNotEquals, opLess, opLessEq, opGreater, opGreaterEq:
+	default:
+		return nil
+	}
+	ordering := t.op != opEquals && t.op != opNotEquals
+	for _, v := range t.values {
+		if relDate.MatchString(v) {
+			continue
+		}
+		for _, w := range relWords {
+			if strings.HasPrefix(v, w+"+") || strings.HasPrefix(v, w+"-") {
+				return fmt.Errorf("invalid relative date %q in %q (use %s+7d or %s-2w; units: d days, w weeks, m months, y years)", v, t.src, w, w)
+			}
+		}
+		if ordering && dateFields[t.field] {
+			base := v
+			if i := strings.IndexAny(v, "+-"); i > 0 {
+				base = v[:i]
+			}
+			if s := Suggest(base, relWords); s != "" {
+				return fmt.Errorf("unknown date %q in %q; did you mean %q? (dates: YYYY-MM-DD, today, tomorrow, yesterday, today+7d)", v, t.src, s)
+			}
+		}
+	}
+	return nil
+}
 
 // expandDates turns today, tomorrow, yesterday and today+7d / today-2w (d =
-// days, w = weeks) into ISO dates; other values pass through unchanged.
+// days, w = weeks, m = months, y = years) into ISO dates; other values pass
+// through unchanged.
 func expandDates(values []string) []string {
 	var out []string
 	for i, v := range values {
@@ -207,13 +258,19 @@ func expandDates(values []string) []string {
 		}
 		if m[3] != "" {
 			n, _ := strconv.Atoi(m[3])
-			if m[4] == "w" {
-				n *= 7
-			}
 			if m[2] == "-" {
 				n = -n
 			}
-			d = d.AddDate(0, 0, n)
+			switch m[4] {
+			case "w":
+				d = d.AddDate(0, 0, 7*n)
+			case "m":
+				d = d.AddDate(0, n, 0)
+			case "y":
+				d = d.AddDate(n, 0, 0)
+			default:
+				d = d.AddDate(0, 0, n)
+			}
 		}
 		out[i] = d.Format("2006-01-02")
 	}
@@ -258,6 +315,24 @@ func containsAny(lv string, values []string) bool {
 	for _, s := range values {
 		if strings.Contains(lv, s) {
 			return true
+		}
+	}
+	return false
+}
+
+// labelsMatch reports whether one of the comma separated labels in v equals
+// (or, with prefix, starts with) one of values. An empty value means "no labels".
+func labelsMatch(v string, values []string, prefix bool) bool {
+	list := task.Task{Labels: v}.LabelList()
+	for _, s := range values {
+		if s == "" && len(list) == 0 {
+			return true
+		}
+		for _, l := range list {
+			l = strings.ToLower(l)
+			if l == s || (prefix && s != "" && strings.HasPrefix(l, s)) {
+				return true
+			}
 		}
 	}
 	return false
@@ -450,6 +525,9 @@ func finishField(t term, rawValue string) (term, error) {
 				return t, fmt.Errorf("missing value in %q (use field= to test for an empty field)", t.src)
 			}
 		}
+	}
+	if err := checkRelativeDates(t); err != nil {
+		return t, err
 	}
 	return t, nil
 }

@@ -9,11 +9,15 @@ import (
 
 // validKeys lists the YAML keys of each decoded Go type, for typo hints.
 var validKeys = map[string]struct{ section, keys string }{
-	"config.Config":    {"top level", "backend, board"},
-	"board.Spec":       {"board", "columns, unmapped, search, sort, views"},
-	"board.ColumnSpec": {"board.columns[]", "name, values, write, limit, color"},
+	"config.Config":    {"top level", "backend, board, default_backend, audit, actions, action_max_parallel, hooks, hook_max_depth, hook_max_parallel, action_log"},
+	"board.Spec":       {"board", "columns, unmapped, search, sort, group, views, agents, avatars"},
+	"board.ColumnSpec": {"board.columns[]", "name, values, write, limit, color, sort"},
 	"board.ViewSpec":   {"board.views[]", "name, query"},
-	"config.Entry":     {"backend[]", "type, name, options"},
+	"config.Entry":     {"backend[]", "type, name, command, disabled, options, actions, hooks"},
+	"config.AuditSpec": {"audit", "file, max_size"},
+	"actionlog.Spec":   {"action_log", "file, dir"},
+	"hook.Spec":        {"hooks[]", "name, on, when, max_depth, max_parallel, min_interval, queue, unique, retries, retry_delay, dedupe, command, cwd, timeout, kill_grace, max_output, exclusive, stdin, env, capture, capture_max, on_success, on_failure, on_fail"},
+	"action.Spec":      {"actions[]", "name, label, key, command, mode, cwd, timeout, interactive_timeout, kill_grace, max_output, exclusive, claim, stdin, show, notify, env, capture, capture_max, on_success, on_failure, on_fail"},
 }
 
 var unknownKey = regexp.MustCompile(`field (\S+) not found in type ([\w.]+)`)

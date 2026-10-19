@@ -131,3 +131,35 @@ func TestCloneIsDeep(t *testing.T) {
 		t.Error("cloning a task without Extra must not invent a map")
 	}
 }
+
+func TestMergeAppliesOnlyWhatTheEditChanged(t *testing.T) {
+	base := Task{ID: "1", Title: "t", Status: "todo", Notes: "n0", Priority: "low", Extra: map[string]string{"a": "1", "b": "2", "c": "3"}}
+	edited := base.Clone()
+	edited.Status = "doing"
+	edited.Extra["a"] = "one" // changed
+	delete(edited.Extra, "b") // removed
+	edited.Extra["d"] = "4"   // added
+	cur := base.Clone()       // what the store holds now: someone else changed other things
+	cur.Notes, cur.Priority, cur.Backend = "n1 by an agent", "high", "csv1"
+	cur.Extra["c"] = "three by an agent"
+	got := Merge(cur, base, edited)
+	if got.Status != "doing" || got.Notes != "n1 by an agent" || got.Priority != "high" || got.ID != "1" || got.Backend != "csv1" {
+		t.Fatalf("%+v", got)
+	}
+	want := map[string]string{"a": "one", "c": "three by an agent", "d": "4"}
+	if len(got.Extra) != len(want) {
+		t.Fatalf("extra %v", got.Extra)
+	}
+	for k, v := range want {
+		if got.Extra[k] != v {
+			t.Errorf("extra[%s] = %q, want %q", k, got.Extra[k], v)
+		}
+	}
+	if cur.Status != "todo" || cur.Extra["a"] != "1" {
+		t.Error("Merge changed its input")
+	}
+	// A field the edit sets to its old value is not a change, and an unchanged edit is a no-op.
+	if same := Merge(cur, base, base); same.Notes != cur.Notes || same.Status != cur.Status {
+		t.Errorf("%+v", same)
+	}
+}

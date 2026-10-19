@@ -9,15 +9,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
 
+	"tkan/internal/action"
+	"tkan/internal/actionlog"
 	"tkan/internal/audit"
 	"tkan/internal/backend"
 	"tkan/internal/board"
+	"tkan/internal/hook"
 	"tkan/internal/query"
 )
 
@@ -34,7 +38,15 @@ var HomeConfigNames = []string{".tkan.yaml", ".tkan.yml"}
 type Entry struct {
 	Type    string    `yaml:"type"`
 	Name    string    `yaml:"name"`    // optional; default "<type><position>", e.g. csv1
+	Command []string  `yaml:"command"` // external command: implies type custom
 	Options yaml.Node `yaml:"options"` // backend-specific settings
+	// Disabled keeps the entry in the file but skips it: it is validated, not
+	// opened, and its actions and hooks are ignored.
+	Disabled bool `yaml:"disabled,omitempty"`
+	// Actions and Hooks apply to this backend's tasks only, besides the
+	// top-level ones; one with the name of a top-level one replaces it here.
+	Actions []action.Spec `yaml:"actions,omitempty"`
+	Hooks   []hook.Spec   `yaml:"hooks,omitempty"`
 }
 
 // Config is the parsed tkan.yaml.
@@ -47,14 +59,43 @@ type Config struct {
 	DefaultBackend string `yaml:"default_backend,omitempty"`
 	// Audit configures the audit trail of reloads and writes.
 	Audit AuditSpec `yaml:"audit"`
+	// Actions are commands the TUI picker and `tkan run` start on a task
+	// (every backend; see also Entry.Actions and AllActions).
+	Actions []action.Spec `yaml:"actions"`
+	// ActionMaxParallel is how many runs go at once when the board starts an
+	// action on its marked cards (0 = action.DefaultMaxParallel).
+	ActionMaxParallel int `yaml:"action_max_parallel,omitempty"`
+	// Hooks are commands started by events (task written, reload, action
+	// ended); see internal/hook. Entry.Hooks and AllHooks as for Actions.
+	Hooks []hook.Spec `yaml:"hooks"`
+	// HookMaxDepth is how deep hooks may chain: 1 (default) means a tkan
+	// started by a hook fires nothing; at most hook.HardMaxDepth.
+	HookMaxDepth int `yaml:"hook_max_depth,omitempty"`
+	// HookMaxParallel caps the hook runs at once over all hooks (0 = unlimited,
+	// at most hook.MaxGlobalParallel); a hook's own max_parallel still applies.
+	HookMaxParallel int `yaml:"hook_max_parallel,omitempty"`
+	// ActionLog stores the details of every action run (command, stdin,
+	// output, times). Disabled unless set; the audit trail keeps a summary only.
+	ActionLog actionlog.Spec `yaml:"action_log"`
 
 	Path string `yaml:"-"` // absolute path of the file it was loaded from
+
+	allActions []action.Spec
+	allHooks   []hook.Spec
 }
+
+// AllActions are the top-level actions followed by those of each backend
+// (Backend set); action.For picks the ones of a task.
+func (c *Config) AllActions() []action.Spec { return c.allActions }
+
+// AllHooks are the top-level hooks followed by those of each backend (Backend set).
+func (c *Config) AllHooks() []hook.Spec { return c.allHooks }
 
 // AuditSpec is the `audit:` section. Without a file the trail lives in memory
 // and ends with the run.
 type AuditSpec struct {
-	File string `yaml:"file,omitempty"` // .jsonl or .csv, relative to the config file
+	File    string `yaml:"file,omitempty"`     // .jsonl or .csv, relative to the config file
+	MaxSize int    `yaml:"max_size,omitempty"` // KiB; past it the file is moved to FILE.1 (0 = grow forever)
 }
 
 // AuditPath is the absolute audit file ("" = in memory only).
@@ -77,9 +118,6 @@ func Load(path string) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
-		if isLegacyFormat(err) {
-			return nil, fmt.Errorf("%s: %w (expected a `backend:` list of {type, name, options}; see docs/config.md)", path, err)
-		}
 		return nil, fmt.Errorf("%s: %s", path, explainUnknownKeys(err.Error()))
 	}
 	if err := c.Board.Validate(); err != nil {
@@ -98,6 +136,28 @@ func Load(path string) (*Config, error) {
 	if err := c.nameEntries(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	if err := action.ValidateAll(c.Actions); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := c.scopeEntries(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := action.CheckMaxParallel(c.ActionMaxParallel); err != nil {
+		return nil, fmt.Errorf("%s: action_max_parallel: %w", path, err)
+	}
+	if err := hook.CheckMaxDepth(c.HookMaxDepth); err != nil {
+		return nil, fmt.Errorf("%s: hook_max_depth: %w", path, err)
+	}
+	if err := hook.CheckMaxParallel(c.HookMaxParallel); err != nil {
+		return nil, fmt.Errorf("%s: hook_max_parallel: %w", path, err)
+	}
+	if err := hook.ValidateAll(c.Hooks); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	c.allHooks = append(slices.Clone(c.Hooks), c.allHooks...)
+	if _, err := actionlog.New(c.ActionLog, c.Dir(), ""); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	if _, err := audit.New(c.AuditPath()); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -105,6 +165,12 @@ func Load(path string) (*Config, error) {
 		found := false
 		var names []string
 		for _, e := range c.Backends {
+			if e.Disabled {
+				if strings.EqualFold(e.Name, strings.TrimSpace(c.DefaultBackend)) {
+					return nil, fmt.Errorf("%s: default_backend %q is disabled", path, c.DefaultBackend)
+				}
+				continue
+			}
 			names = append(names, e.Name)
 			found = found || strings.EqualFold(e.Name, strings.TrimSpace(c.DefaultBackend))
 		}
@@ -115,23 +181,22 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// isLegacyFormat reports whether a decode error comes from the old
-// single-backend keys (source:, csv:, or `backend:` as a plain string).
-func isLegacyFormat(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "field source not found") ||
-		strings.Contains(msg, "field csv not found") ||
-		strings.Contains(msg, "into []config.Entry")
-}
-
 // nameEntries validates the entries and fills in generated names.
 func (c *Config) nameEntries() error {
 	seen := map[string]bool{}
 	for i := range c.Backends {
 		e := &c.Backends[i]
 		e.Type = strings.ToLower(strings.TrimSpace(e.Type))
+		if len(e.Command) > 0 {
+			if e.Type == "" {
+				e.Type = "custom"
+			}
+			if e.Type != "custom" {
+				return fmt.Errorf("backend[%d]: command is only for the custom backend, not type %q", i+1, e.Type)
+			}
+		}
 		if e.Type == "" {
-			return fmt.Errorf("backend[%d]: type is required (supported: %s)", i+1, strings.Join(backend.Supported(), ", "))
+			return fmt.Errorf("backend[%d]: type or command is required (supported types: %s)", i+1, strings.Join(backend.Supported(), ", "))
 		}
 		e.Name = strings.TrimSpace(e.Name)
 		if e.Name == "" {
@@ -149,6 +214,44 @@ func (c *Config) nameEntries() error {
 		seen[key] = true
 	}
 	return nil
+}
+
+// scopeEntries validates the actions and hooks of each backend entry and
+// collects them with the top-level actions (the hooks are joined once the
+// top-level ones are valid).
+func (c *Config) scopeEntries() error {
+	c.allActions = slices.Clone(c.Actions)
+	c.allHooks = nil
+	for i, e := range c.Backends {
+		if err := action.ValidateFor(e.Actions, e.Name); err != nil {
+			return fmt.Errorf("backend[%d] %s: %w", i+1, e.Name, err)
+		}
+		if err := hook.ValidateFor(e.Hooks, e.Name); err != nil {
+			return fmt.Errorf("backend[%d] %s: %w", i+1, e.Name, err)
+		}
+		if e.Disabled {
+			continue
+		}
+		c.allActions = append(c.allActions, e.Actions...)
+		c.allHooks = append(c.allHooks, e.Hooks...)
+	}
+	for i, e := range c.Backends {
+		if e.Disabled {
+			continue
+		}
+		if err := action.CheckKeys(c.allActions, e.Name); err != nil {
+			return fmt.Errorf("backend[%d] %s: %w", i+1, e.Name, err)
+		}
+	}
+	return nil
+}
+
+// ActionParallel is the effective action_max_parallel.
+func (c *Config) ActionParallel() int {
+	if c.ActionMaxParallel == 0 {
+		return action.DefaultMaxParallel
+	}
+	return c.ActionMaxParallel
 }
 
 // Dir is the directory relative paths in the config resolve against.
@@ -185,13 +288,22 @@ func findIn(dir string, names []string) (string, bool) {
 }
 
 // Open opens every configured backend as one Set.
-func (c *Config) Open() (*backend.Set, error) {
+func (c *Config) Open() (*backend.Set, error) { return c.open(false) }
+
+// OpenLazy is Open for a caller that lists in the background (the board): a
+// slow backend does not delay opening, so its first list happens later.
+func (c *Config) OpenLazy() (*backend.Set, error) { return c.open(true) }
+
+func (c *Config) open(lazy bool) (*backend.Set, error) {
 	if len(c.Backends) == 0 {
 		return nil, fmt.Errorf("%s: no backends configured (add a `backend:` list; see docs/config.md)", c.Path)
 	}
 	var items []backend.Named
 	for _, e := range c.Backends {
-		be, err := backend.OpenSpec(backend.Spec{Type: e.Type, Name: e.Name, Options: e.Options, BaseDir: c.Dir()})
+		if e.Disabled {
+			continue
+		}
+		be, err := backend.OpenSpec(backend.Spec{Type: e.Type, Name: e.Name, Options: e.Options, Command: e.Command, BaseDir: c.Dir(), Lazy: lazy})
 		if err != nil {
 			for _, it := range items {
 				it.Backend.Close()
@@ -199,6 +311,9 @@ func (c *Config) Open() (*backend.Set, error) {
 			return nil, fmt.Errorf("backend %s: %w", e.Name, err)
 		}
 		items = append(items, backend.Named{Name: e.Name, Type: e.Type, Backend: be})
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("%s: no backends enabled (every backend entry is disabled)", c.Path)
 	}
 	return backend.NewSet(items), nil
 }

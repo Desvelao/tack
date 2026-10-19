@@ -195,21 +195,37 @@ func (b *Backend) Statuses() []string {
 	return out
 }
 
-func (b *Backend) Update(_ context.Context, t task.Task) error {
+// Stores reports whether the file has a column for the logical field.
+func (b *Backend) Stores(field string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, f := range b.colField {
+		if f == field {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Backend) Update(ctx context.Context, t task.Task) error {
+	return b.store(ctx, t, func(cur task.Task) task.Task { return filestore.KeepExtras(t, cur) }) // unmapped columns the copy doesn't carry stay
+}
+
+// Patch writes only what differs between base and t (see backend.Patcher).
+func (b *Backend) Patch(ctx context.Context, base, t task.Task) error {
+	return b.store(ctx, t, func(cur task.Task) task.Task { return task.Merge(cur, base, t) })
+}
+
+// store replaces the task t.ID with what merge makes of the stored one, after
+// the file was read again under the lock.
+func (b *Backend) store(ctx context.Context, t task.Task, merge func(cur task.Task) task.Task) error {
 	return b.mutate(func() error {
 		for i := range b.tasks {
 			if b.tasks[i].ID == t.ID {
-				// Keep unmapped columns the caller's copy doesn't carry.
-				nt := t.Clone()
-				for k, v := range b.tasks[i].Extra {
-					if _, ok := nt.Extra[k]; !ok {
-						if nt.Extra == nil {
-							nt.Extra = map[string]string{}
-						}
-						nt.Extra[k] = v
-					}
+				if err := backend.CheckExpect(ctx, b.tasks[i]); err != nil {
+					return err
 				}
-				b.tasks[i] = nt
+				b.tasks[i] = merge(b.tasks[i])
 				return nil
 			}
 		}
@@ -217,21 +233,15 @@ func (b *Backend) Update(_ context.Context, t task.Task) error {
 	})
 }
 
-// Create appends a task with ID max(numeric id)+1. The status is stored as given.
+// Create appends a task with ID max(numeric id, high-water mark)+1. The status is stored as given.
 func (b *Backend) Create(_ context.Context, t task.Task) (task.Task, error) {
 	if err := t.Validate(); err != nil {
 		return task.Task{}, err
 	}
 	var created task.Task
 	err := b.mutate(func() error {
-		max := 0
-		for _, x := range b.tasks {
-			if n, err := strconv.Atoi(x.ID); err == nil && n > max {
-				max = n
-			}
-		}
 		t = t.Clone()
-		t.ID = strconv.Itoa(max + 1)
+		t.ID = filestore.NextIDMark(b.tasks, b.path+filestore.MarkSuffix)
 		b.tasks = append(b.tasks, t)
 		created = t.Clone()
 		return nil
@@ -516,7 +526,7 @@ func (b *Backend) reload() (err error) {
 		tasks = append(tasks, t)
 	}
 	b.tasks = tasks
-	b.stamp = filestore.Stamp{Mod: st.ModTime(), Size: st.Size()}
+	b.stamp = filestore.StampOf(b.path, st)
 	return nil
 }
 
