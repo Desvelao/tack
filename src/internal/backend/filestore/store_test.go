@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -75,8 +76,8 @@ func TestLockTimeoutAndWait(t *testing.T) {
 }
 
 func TestFailedWriteRollsBack(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("root ignores directory permissions")
+	if os.Getuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("root and Windows ignore directory permissions")
 	}
 	s, p := newStore(t, "1|a|s\n", backend.PollMode{})
 	_ = os.WriteFile(p+".lock", nil, 0o644) // lock file exists, so only the temp file fails
@@ -150,7 +151,7 @@ func TestEmptyIDRejectedAndSymlinkKept(t *testing.T) {
 	if data, _ := os.ReadFile(real); !strings.Contains(string(data), "2|b|s") {
 		t.Fatalf("target not updated: %q", data)
 	}
-	if st, _ := os.Stat(real); st.Mode().Perm() != 0o640 {
+	if st, _ := os.Stat(real); runtime.GOOS != "windows" && st.Mode().Perm() != 0o640 { // Windows has no mode bits
 		t.Fatalf("mode %v", st.Mode())
 	}
 	touch(t, real, "|a|s\n")
@@ -251,6 +252,9 @@ func TestConcurrentWritersLoseNothing(t *testing.T) {
 }
 
 func TestWriteAtomicPreservesMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no Unix mode bits")
+	}
 	dir := t.TempDir()
 	p := filepath.Join(dir, "f.txt")
 	if err := os.WriteFile(p, []byte("old\n"), 0o640); err != nil {
