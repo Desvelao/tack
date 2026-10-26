@@ -25,6 +25,7 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
       - name: vet everything, test the file locking and the portable packages
         working-directory: src
         run: |
