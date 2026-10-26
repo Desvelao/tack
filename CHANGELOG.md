@@ -5,7 +5,7 @@ before 1.0 the config format, CSV schema and CLI may still change.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-19
+## [0.2.0] - 2026-10-26
 
 - BREAKING: the project is renamed from `tkan` to `tack`: the binary, the Go module, `tack.yaml` / `.tack.yaml`, the `.tack.nextid` sidecar and the release assets (`tack-*`). Rename your config and sidecar files; the repository moves to `Desvelao/tack`.
 - Fix: `tack add` reports an invalid `-due` before an invalid `-start` every time; it used to pick one at random when both were wrong.
