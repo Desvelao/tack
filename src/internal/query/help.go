@@ -3,7 +3,7 @@ package query
 import "strings"
 
 // Help returns the filter syntax reference shown by the TUI (`?`, then tab),
-// by `tkan help filter`, and mirrored in docs/filter.md. search are the fields
+// by `tack help filter`, and mirrored in docs/filter.md. search are the fields
 // plain text is matched against. What each field means is FieldsHelp, on its
 // own page: this one must fit 20 lines.
 func Help(search []string) string {
@@ -23,7 +23,7 @@ func Help(search []string) string {
 		{"field!=value", "field is not equal to value"},
 		{"field^value", "field starts with value"},
 		{"field~regex", "field matches the regular expression"},
-		{"field<value", "also > <= >= (numbers, dates: due<2026-12-01)"},
+		{"field<value", "also > <= >= (numbers, dates; priority: >=high is more urgent)"},
 		{"field=", "field is empty  (field!= : has a value)"},
 		{"a,b", "any of the values: priority=high,medium  (!: and != : none)"},
 		{"a OR b", "either side (also |); dates: today, tomorrow, today+7d (d w m y)"},
@@ -32,7 +32,7 @@ func Help(search []string) string {
 		b.WriteString("  " + pad(r[0], 14) + r[1] + "\n")
 	}
 	b.WriteString("\nSearched by plain text: " + strings.Join(sortedUniqueKeepOrder(search), ", ") + "\n")
-	b.WriteString("Fields and what they mean: next page (tab)  ·  tkan help filter fields  (col = column)\n")
+	b.WriteString("Fields and what they mean: next page (tab)  ·  tack help filter fields  (col = column)\n")
 	b.WriteString("Examples: priority=high col:doing   title:\"fix bug\" -wip   notes=   id~^A-\\d+   due<2026-12-01\n")
 	return b.String()
 }

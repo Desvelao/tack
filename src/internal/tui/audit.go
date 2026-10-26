@@ -7,7 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"tkan/internal/audit"
+	"tack/internal/audit"
 )
 
 // openAudit switches to the audit trail (newest entries first).
@@ -87,49 +87,39 @@ func (m Model) auditRoom() int {
 	return 3
 }
 
+// auditCache keeps the lines of the audit view until the trail, the filter or
+// the width changes: sorting and rendering a trail that grows without bound on
+// every keypress would be too much for a small machine. A pointer, because the
+// model is copied on every update.
+type auditCache struct {
+	ok     bool
+	gen    uint64
+	filter string
+	width  int
+	lines  []string
+	shown  int
+	total  int
+}
+
 func (m Model) auditView() string {
-	entries, err := m.audit.Entries()
-	sess := m.audit.SessionsOf(entries)
-	total := len(entries)
-	entries = sess.Filter(entries, m.auditQ)
+	entries, gen, err := m.audit.EntriesVersion()
+	c := m.auditC
+	if c == nil {
+		c = &auditCache{}
+	}
+	if !c.ok || c.gen != gen || c.filter != m.auditFilter || c.width != m.width {
+		c.lines, c.shown, c.total = m.auditLines(entries)
+		c.ok, c.gen, c.filter, c.width = true, gen, m.auditFilter, m.width
+	}
+	lines := c.lines
 
 	where := "memory only (set audit.file to keep it)"
 	if p := m.audit.Path(); p != "" {
 		where = p
 	}
-	head := titleSty.Render("tkan audit") + metaSty.Render(fmt.Sprintf("  %d/%d entries · %s", len(entries), total, where))
+	head := titleSty.Render("tack audit") + metaSty.Render(fmt.Sprintf("  %d/%d entries · %s", c.shown, c.total, where))
 	if m.auditFilter != "" {
 		head += filterSty.Render("  filter: " + m.auditFilter)
-	}
-
-	opW := 6 // wide enough for the longest op shown (hook:EVENT ops are long)
-	for _, e := range entries {
-		opW = max(opW, min(len(e.Op), 28))
-	}
-	var lines []string
-	last := ""
-	for i := len(entries) - 1; i >= 0; i-- { // newest first
-		e := entries[i]
-		if e.Session != last {
-			if last != "" {
-				lines = append(lines, "")
-			}
-			lines = append(lines, headSty.Render(sess.Label(e.Session)))
-			last = e.Session
-		}
-		target := e.Backend
-		if e.ID != "" {
-			target += " #" + e.ID
-		}
-		line := fmt.Sprintf("%s  %-*s %-6s %-14s %s", e.Time.Local().Format("01-02 15:04:05"), opW, e.Op, e.Result, trim(target, 14), e.Details)
-		line = trim(line, m.width-1)
-		if e.Result == audit.ResultError {
-			line = failSty.Render(line)
-		}
-		lines = append(lines, line)
-	}
-	if len(lines) == 0 {
-		lines = []string{metaSty.Render("no entries")}
 	}
 
 	room := m.auditRoom()
@@ -158,6 +148,43 @@ func (m Model) auditView() string {
 		bottom = failSty.Render("error: " + err.Error())
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, head, "", strings.Join(lines, "\n"), bottom)
+}
+
+// auditLines renders the entries that pass the filter, newest first, grouped by
+// session; shown and total count the entries with and without the filter.
+func (m Model) auditLines(entries []audit.Entry) (lines []string, shown, total int) {
+	sess := m.audit.SessionsOf(entries)
+	total = len(entries)
+	entries = sess.Filter(entries, m.auditQ)
+	opW := 6 // wide enough for the longest op shown (hook:EVENT ops are long)
+	for _, e := range entries {
+		opW = max(opW, min(len(e.Op), 28))
+	}
+	last := ""
+	for i := len(entries) - 1; i >= 0; i-- { // newest first
+		e := entries[i]
+		if e.Session != last {
+			if last != "" {
+				lines = append(lines, "")
+			}
+			lines = append(lines, headSty.Render(sess.Label(e.Session)))
+			last = e.Session
+		}
+		target := e.Backend
+		if e.ID != "" {
+			target += " #" + e.ID
+		}
+		line := fmt.Sprintf("%s  %-*s %-6s %-14s %s", e.Time.Local().Format("01-02 15:04:05"), opW, e.Op, e.Result, trim(target, 14), e.Details)
+		line = trim(line, m.width-1)
+		if e.Result == audit.ResultError {
+			line = failSty.Render(line)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		lines = []string{metaSty.Render("no entries")}
+	}
+	return lines, len(entries), total
 }
 
 // trim cuts s to w terminal cells (at least one).

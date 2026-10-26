@@ -11,9 +11,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/board"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/board"
 )
 
 // clocked gives the model a clock the test moves by hand.
@@ -292,7 +292,7 @@ func TestRunsViewScrollsAt80x24(t *testing.T) {
 		if n := strings.Count(v, "\n") + 1; n > 24 {
 			t.Fatalf("%s: %d lines on a 24 line screen:\n%s", step, n, v)
 		}
-		if !strings.Contains(v, "tkan runs") {
+		if !strings.Contains(v, "tack runs") {
 			t.Fatalf("%s: header scrolled off:\n%s", step, v)
 		}
 		if !selectedLineHas(v, wantRow) {
@@ -449,7 +449,7 @@ func TestBoardFitsAt80x24WithStripNoticeAndFooter(t *testing.T) {
 				t.Errorf("%s: line %d is %d cells: %q", step.name, i, w, l)
 			}
 		}
-		if !strings.Contains(v, "tkan") {
+		if !strings.Contains(v, "tack") {
 			t.Fatalf("%s: the title scrolled off:\n%s", step.name, v)
 		}
 	}

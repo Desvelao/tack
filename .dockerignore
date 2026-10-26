@@ -1,10 +1,10 @@
 bin/
 .git/
 docs/
-tkan.yaml
-tkan.yml
-.tkan.yaml
-.tkan.yml
+tack.yaml
+tack.yml
+.tack.yaml
+.tack.yml
 tasks.csv
 .env
 .env.*

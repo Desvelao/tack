@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 type fake struct{ tasks []task.Task }
@@ -577,6 +577,16 @@ type stubBackend struct {
 
 func (s *stubBackend) List(context.Context) ([]task.Task, error) { return s.tasks, nil }
 func (s *stubBackend) Update(context.Context, task.Task) error   { s.updated++; return nil }
+
+func TestWithoutExpectDropsTheGuard(t *testing.T) {
+	ctx := WithExpect(context.Background(), "status", "todo")
+	if _, _, ok := Expected(WithoutExpect(ctx)); ok {
+		t.Fatal("guard still set")
+	}
+	if err := CheckExpect(WithoutExpect(ctx), task.Task{Status: "doing"}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSetUpdateChecksTheGuardForABackendWithoutPatch(t *testing.T) {
 	st := &stubBackend{tasks: []task.Task{{ID: "1", Title: "A", Status: "doing"}}}

@@ -12,12 +12,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/board"
-	"tkan/internal/outcome"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/board"
+	"tack/internal/outcome"
+	"tack/internal/task"
 )
 
 func withActions(t *testing.T, m Model, dir string, specs ...action.Spec) Model {
@@ -55,7 +55,7 @@ func TestActionRunsInBackgroundAndConfirms(t *testing.T) {
 	l, _ := audit.New("")
 	m = m.WithAudit(l)
 	dir := t.TempDir()
-	m = withActions(t, m, dir, action.Spec{Name: "note", Key: "n", Command: []string{"sh", "-c", `echo "$1:$TKAN_TASK_ID" > out.txt; echo done-line`, "sh", "{title}"}})
+	m = withActions(t, m, dir, action.Spec{Name: "note", Key: "n", Command: []string{"sh", "-c", `echo "$1:$TACK_TASK_ID" > out.txt; echo done-line`, "sh", "{title}"}})
 
 	m = press(m, "x")
 	if m.mode != modeActions || !strings.Contains(m.View(), "run an action on #1  Alpha") {
@@ -535,7 +535,7 @@ func TestBatchSkipsACardThatDisappearedBeforeItsTurn(t *testing.T) {
 func TestBatchCountsFailuresAndRefusesTerminalActions(t *testing.T) {
 	m, _ := newModel(t)
 	m = withActions(t, m, t.TempDir(),
-		action.Spec{Name: "bad", Key: "b", Command: []string{"sh", "-c", `[ "$TKAN_TASK_ID" != 2 ]`}},
+		action.Spec{Name: "bad", Key: "b", Command: []string{"sh", "-c", `[ "$TACK_TASK_ID" != 2 ]`}},
 		action.Spec{Name: "agent", Key: "a", Mode: action.ModeInteractive, Command: []string{"true"}})
 	m = press(m, " ", "j", " ", "x")
 	m, cmd := pressCmd(m, "a")
@@ -660,7 +660,7 @@ func TestClaimActionClaimsTheCardForTheRun(t *testing.T) {
 	nm, _ := New(be, "t.csv", board.DefaultSpec()).Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m := nm.(Model)
 	m.now = func() time.Time { return time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC) }
-	t.Setenv("TKAN_AGENT", "")
+	t.Setenv("TACK_AGENT", "")
 	dir := t.TempDir()
 	m = withActions(t, m, dir, action.Spec{Name: "look", Key: "l", Claim: true, Command: []string{"sh", "-c", "cat " + p + " > seen.csv"}})
 
@@ -687,7 +687,7 @@ func TestClaimActionClaimsTheCardForTheRun(t *testing.T) {
 func TestActionCapturesOutputAndMovesTheCard(t *testing.T) {
 	m, be := newModel(t)
 	m = withActions(t, m, t.TempDir(),
-		action.Spec{Name: "ship", Capture: action.CaptureNotes, OnSuccess: action.Outcome{Status: "Done"}, Command: []string{"sh", "-c", `echo "id=$TKAN_RUN_ID"`}},
+		action.Spec{Name: "ship", Capture: action.CaptureNotes, OnSuccess: action.Outcome{Status: "Done"}, Command: []string{"sh", "-c", `echo "id=$TACK_RUN_ID"`}},
 		action.Spec{Name: "bad", OnFailure: action.Outcome{Status: "pending"}, Command: []string{"sh", "-c", "exit 3"}})
 	m = press(m, "x")
 	m, cmd := pressCmd(m, "enter") // first action: ship
@@ -705,10 +705,36 @@ func TestOutcomeLeavesCanceledRunsAlone(t *testing.T) {
 	m, be := newModel(t)
 	tk, _ := be.Find(context.Background(), "", "1")
 	s := action.Spec{Name: "x", OnSuccess: action.Outcome{Status: "Done"}, Capture: action.CaptureNotes}
-	if after, err := outcome.Apply(context.Background(), be, m.board, s, tk, actionlog.Record{Result: actionlog.ResultOK, Stdout: "hi"}, true); after != "" || err != nil {
+	if after, err := outcome.Apply(context.Background(), be, m.board, s, tk, actionlog.Record{Result: actionlog.ResultOK, Stdout: "hi"}, true, ""); after != "" || err != nil {
 		t.Fatalf("%q %v", after, err)
 	}
 	if now, _ := be.Find(context.Background(), "", "1"); now.Status != tk.Status || now.Notes != tk.Notes {
 		t.Fatalf("canceled run changed the task: %+v", now)
+	}
+}
+
+func TestPickerWorkdirPrompt(t *testing.T) {
+	m, _ := newModel(t)
+	m = m.WithActions([]action.Spec{{Name: "a", Key: "a", Mode: action.ModeBackground, Stdin: action.StdinNone, Command: []string{"true"}}}, t.TempDir())
+	m = press(m, "x", "w")
+	m = typeText(m, "/srv/x")
+	if m.actionWDIn == nil || !strings.Contains(m.View(), "workdir: /srv/x") {
+		t.Fatalf("prompt not shown:\n%s", m.View())
+	}
+	m = press(m, "enter")
+	if m.actionWD != "/srv/x" || m.actionWDIn != nil || !strings.Contains(m.View(), "workdir: /srv/x (w changes)") {
+		t.Fatalf("workdir = %q\n%s", m.actionWD, m.View())
+	}
+	m = press(m, "w", "esc") // cancel keeps it
+	if m.actionWD != "/srv/x" || m.mode != modeActions {
+		t.Fatalf("esc: %q mode %v", m.actionWD, m.mode)
+	}
+	m = press(m, "enter")
+	if m.lastWD != "/srv/x" {
+		t.Errorf("lastWD = %q", m.lastWD)
+	}
+	m = press(m, "x")
+	if m.actionWD != "" {
+		t.Errorf("override survived reopening: %q", m.actionWD)
 	}
 }

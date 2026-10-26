@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 // Named is a configured backend instance.

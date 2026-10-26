@@ -193,3 +193,98 @@ func TestFileMode0600AndRotation(t *testing.T) {
 		}
 	}
 }
+
+func TestEntriesAreMergedOnceUntilTheyChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.jsonl")
+	l, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Record(Entry{Op: "update", ID: "1"})
+	a, v1, err := l.EntriesVersion()
+	if err != nil || len(a) != 1 {
+		t.Fatalf("%v %v", a, err)
+	}
+	b, v2, _ := l.EntriesVersion()
+	if v1 != v2 || &a[0] != &b[0] {
+		t.Error("an unchanged trail was merged and sorted again")
+	}
+	l.Record(Entry{Op: "update", ID: "2"})
+	c, v3, _ := l.EntriesVersion()
+	if v3 == v2 || len(c) != 2 {
+		t.Errorf("own write not seen: version %d -> %d, %d entries", v2, v3, len(c))
+	}
+	// Another session appending to the file shows up too.
+	other, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Record(Entry{Op: "create", ID: "3"})
+	d, v4, _ := l.EntriesVersion()
+	if v4 == v3 || len(d) != 3 {
+		t.Errorf("other session not seen: version %d -> %d, %d entries", v3, v4, len(d))
+	}
+}
+
+// A reader must pick up a rotation: the file it knew is now FILE.1 and the
+// current one holds only what was written since.
+func TestReaderFollowsARotation(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "r.jsonl")
+	w, _ := New(p)
+	r, _ := New(p)
+	w.Record(Entry{Op: OpUpdate, ID: "before", Details: strings.Repeat("d", 1200)}) // past the 1 KiB cap
+	es, err := r.Entries()
+	if err != nil || len(es) != 1 || es[0].ID != "before" {
+		t.Fatalf("%v %+v", err, es)
+	}
+	w.SetMaxSize(1) // the next write rotates first
+	w.Record(Entry{Op: OpUpdate, ID: "after"})
+	if err := w.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p + ".1"); err != nil {
+		t.Fatalf("no rotated file: %v", err)
+	}
+	es, err = r.Entries()
+	if err != nil || len(es) != 2 || es[0].ID != "before" || es[1].ID != "after" {
+		t.Fatalf("reader lost the rotated half or did not follow the rotation: %v %+v", err, es)
+	}
+	// The rotated half goes on being read; a second rotation drops the oldest.
+	w.Record(Entry{Op: OpUpdate, ID: "third", Details: strings.Repeat("d", 1200)})
+	w.Record(Entry{Op: OpUpdate, ID: "fourth"})
+	es, _ = r.Entries()
+	for _, e := range es {
+		if e.ID == "before" {
+			t.Errorf("an entry two rotations old is still listed: %+v", es)
+		}
+	}
+}
+
+// A file replaced by one of the same size with the same mtime is a new file.
+func TestReaderSeesASameSizeReplacement(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "r.jsonl")
+	line := func(id string) []byte {
+		return []byte(`{"time":"2026-10-20T10:00:00Z","session":"s-other","op":"update","id":"` + id + `","result":"ok"}` + "\n")
+	}
+	if err := os.WriteFile(p, line("aaaa"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mt := time.Now().Add(-time.Hour) // old, so the content hash is not taken
+	_ = os.Chtimes(p, mt, mt)
+	r, _ := New(p)
+	if es, _ := r.Entries(); len(es) != 1 || es[0].ID != "aaaa" {
+		t.Fatalf("%+v", es)
+	}
+	tmp := filepath.Join(dir, "next")
+	if err := os.WriteFile(tmp, line("bbbb"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(tmp, mt, mt)
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatal(err)
+	}
+	if es, _ := r.Entries(); len(es) != 1 || es[0].ID != "bbbb" {
+		t.Fatalf("a same-size, same-mtime replacement was not noticed: %+v", es)
+	}
+}

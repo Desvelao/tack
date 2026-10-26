@@ -11,8 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"tkan/internal/action"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/task"
 )
 
 var tk = task.Task{ID: "7", Title: "Fix it", Backend: "csv1", Status: "pending"}
@@ -69,7 +69,7 @@ func TestRecordKeepsCommandStdinOutputButNeverEnvValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(l.Path())
-	if strings.Contains(string(data), "hunter2") || strings.Contains(string(data), "SECRET_TOKEN") || strings.Contains(string(data), "TKAN_TASK") {
+	if strings.Contains(string(data), "hunter2") || strings.Contains(string(data), "SECRET_TOKEN") || strings.Contains(string(data), "TACK_TASK") {
 		t.Fatalf("environment leaked into the log:\n%s", data)
 	}
 }
@@ -181,8 +181,8 @@ func TestFilter(t *testing.T) {
 	}
 }
 
-// The audit file is world-readable (0644): what a command printed must stay in
-// the private action log, in the output and in the error text alike.
+// The audit file is long-lived and may be shipped elsewhere: what a command
+// printed must stay in the action log, in the output and in the error text alike.
 func TestSummaryNeverContainsOutput(t *testing.T) {
 	for _, script := range []string{
 		"echo sk-secret-token; echo more",
@@ -194,7 +194,7 @@ func TestSummaryNeverContainsOutput(t *testing.T) {
 			t.Errorf("%q: summary %q leaks output", script, s)
 		}
 	}
-	// A message tkan wrote itself (a start failure, a timeout) is kept.
+	// A message tack wrote itself (a start failure, a timeout) is kept.
 	rec := Record{Action: "x", Mode: action.ModeBackground, Result: ResultError, Error: "timed out after 10s"}
 	if s := rec.Summary(); !strings.HasSuffix(s, ": timed out after 10s") {
 		t.Errorf("%q", s)
@@ -314,5 +314,120 @@ func TestEventRoundTripsLooksUpAndFilters(t *testing.T) {
 	other.Event = "task.added"
 	if recs := Filter([]Record{withEv, other, plain}, q); len(recs) != 1 || recs[0].Event != "task.moved" {
 		t.Fatalf("%+v", recs)
+	}
+}
+
+// The big record spans several read chunks and the lines around it still come out in order.
+func TestRecentReadsAcrossChunks(t *testing.T) {
+	l := &Log{file: filepath.Join(t.TempDir(), "a.jsonl"), session: "me"}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for i := 0; i < 6; i++ {
+		r := Record{Time: base.Add(time.Duration(i) * time.Minute), Action: "a", ID: fmt.Sprint(i)}
+		if i == 2 {
+			r.Stdout = strings.Repeat("x", 3*chunk+17)
+		}
+		if err := l.Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, older, err := l.Recent(true, 0)
+	if err != nil || len(recs) != 6 || older != 0 {
+		t.Fatalf("all: %d older=%d %v", len(recs), older, err)
+	}
+	for i, r := range recs {
+		if r.ID != fmt.Sprint(i) {
+			t.Fatalf("order: %d is %s", i, r.ID)
+		}
+	}
+	recs, older, err = l.Recent(true, 2)
+	if err != nil || len(recs) != 2 || older != 4 || recs[0].ID != "4" {
+		t.Fatalf("last two: %+v older=%d %v", recs, older, err)
+	}
+	recs, older, _ = l.Recent(true, 4) // stops inside the big record's file region
+	if len(recs) != 4 || older != 2 || recs[0].ID != "2" {
+		t.Fatalf("last four: %d older=%d first %s", len(recs), older, recs[0].ID)
+	}
+}
+
+func TestFileLogRotatesAndRecentReadsBothHalves(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(Spec{File: "a.jsonl", MaxSize: 1}, dir, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for i := 0; i < 12; i++ {
+		r := Record{Time: base.Add(time.Duration(i) * time.Minute), Action: "a", ID: fmt.Sprint(i), Stdout: strings.Repeat("o", 300)}
+		if err := l.Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.jsonl.1")); err != nil {
+		t.Fatalf("no rotated file: %v", err)
+	}
+	st, _ := os.Stat(filepath.Join(dir, "a.jsonl"))
+	if st.Size() > 3<<10 {
+		t.Errorf("current file is %d bytes: not capped", st.Size())
+	}
+	recs, _, err := l.Recent(true, 0)
+	if err != nil || len(recs) < 6 || recs[len(recs)-1].ID != "11" {
+		t.Fatalf("%d records, last %v, %v", len(recs), recs[len(recs)-1:], err)
+	}
+	for i := 1; i < len(recs); i++ {
+		if recs[i].Time.Before(recs[i-1].Time) {
+			t.Fatalf("not oldest first at %d", i)
+		}
+	}
+	// The cap on what Recent returns spans the two files, and the older count too.
+	recs, older, _ := l.Recent(true, len(recs)-1)
+	if len(recs) == 0 || older < 1 {
+		t.Errorf("limit across files: %d records, older %d", len(recs), older)
+	}
+}
+
+func TestDirLogKeepsTheNewestRuns(t *testing.T) {
+	dir := t.TempDir()
+	l, err := New(Spec{Dir: "runs", Keep: 3}, dir, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for i := 0; i < 8; i++ {
+		if err := l.Append(Record{Time: base.Add(time.Duration(i) * time.Minute), Action: "a", ID: fmt.Sprint(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.mu.Lock()
+	l.prune() // appends prune now and then; force the last one
+	l.mu.Unlock()
+	recs, _, _ := l.Recent(true, 0)
+	if len(recs) != 3 || recs[0].ID != "5" || recs[2].ID != "7" {
+		t.Fatalf("kept %+v", recs)
+	}
+}
+
+func TestSizeOptionsAreChecked(t *testing.T) {
+	for name, s := range map[string]Spec{
+		"negative size":  {File: "a.jsonl", MaxSize: -1},
+		"negative keep":  {Dir: "d", Keep: -1},
+		"size with dir":  {Dir: "d", MaxSize: 5},
+		"keep with file": {File: "a.jsonl", Keep: 5},
+	} {
+		if _, err := New(s, t.TempDir(), "me"); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestRunAndReportStatusAreFilterFields(t *testing.T) {
+	r := Record{Time: time.Now(), Action: "report", RunID: "r-1", ReportStatus: "done", Result: ResultOK}
+	for q, want := range map[string]bool{"run=r-1": true, "run=r-2": false, "report_status=done": true, "report_status=wip": false} {
+		p, err := Parse(q)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if got := p.Match(Lookup(r), SearchFields); got != want {
+			t.Errorf("%q: %v want %v", q, got, want)
+		}
 	}
 }

@@ -10,9 +10,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/backendtest"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/backend/backendtest"
+	"tack/internal/task"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -90,7 +90,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 	data, _ := os.ReadFile(p)
 	s := string(data)
-	for _, want := range []string{"# my backlog", "tasks:", "status: doing", "estimate: 3", `due: "2026-03-04"`, `due: "2026-05-06"`, "id: 3"} {
+	for _, want := range []string{"# my backlog", "tasks:", "status: doing", "estimate: 3", "due: 2026-03-04", `due: "2026-05-06"`, "id: 3"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q in:\n%s", want, s)
 		}
@@ -101,6 +101,57 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil || len(again) != 3 || again[0].Due != "2026-03-04" || again[0].Extra["deps"] != `{"x":[1,2]}` || again[1].Title != "Multi\nline\n" {
 		t.Fatalf("%+v %v", again, err)
 	}
+}
+
+// A write keeps the comments, quoting and key order of the tasks it did not
+// touch, and the comments of the ones it edited; a task that is an anchor or
+// uses an alias or a merge key is rewritten flat.
+func TestWriteKeepsTaskCommentsAndSpelling(t *testing.T) {
+	const file = `tasks:
+  # the first one
+  - id: 1
+    title: 'Quoted'   # why
+    status: todo
+    # keep me
+    owner: ann
+  - id: 2
+    title: Second
+    status: todo
+    notes: "n"
+  - &base
+    id: 3
+    title: Third
+    status: todo
+  - <<: *base
+    id: 4
+`
+	b, p := open(t, file, "")
+	ctx := context.Background()
+	got, err := b.List(ctx)
+	if err != nil || len(got) != 4 {
+		t.Fatalf("%v %v", got, err)
+	}
+	got[0].Status = "doing"
+	if err := b.Update(ctx, got[0]); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	s := string(data)
+	for _, want := range []string{"# the first one", "title: 'Quoted' # why", "status: doing", "# keep me", "    notes: \"n\"\n"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %q in:\n%s", want, s)
+		}
+	}
+	again, err := open2(t, s)
+	if err != nil || len(again) != 4 || again[0].Status != "doing" {
+		t.Fatalf("%+v %v", again, err)
+	}
+}
+
+func open2(t *testing.T, content string) ([]task.Task, error) {
+	t.Helper()
+	b, _ := open(t, content, "")
+	return b.List(context.Background())
 }
 
 func TestTopLevelListEmptyAndDelete(t *testing.T) {
@@ -144,7 +195,7 @@ func TestErrors(t *testing.T) {
 }
 
 func TestExampleAndNoExtensionClaim(t *testing.T) {
-	if got := backend.TypeForLocation("tkan.yaml"); got != "" {
+	if got := backend.TypeForLocation("tack.yaml"); got != "" {
 		t.Fatalf(".yaml must not be claimed, got %q", got)
 	}
 	p := filepath.Join(t.TempDir(), "t.yaml")
@@ -229,4 +280,27 @@ func TestIDsNotReused(t *testing.T) {
 		return b
 	}
 	backendtest.CheckIDsNotReused(t, open, p+".nextid")
+}
+
+func TestBOMIsKeptOnWrite(t *testing.T) {
+	const bom = "\xef\xbb\xbf"
+	for _, with := range []bool{true, false} {
+		content := "- id: \"1\"\n  title: a\n  status: todo\n"
+		if with {
+			content = bom + content
+		}
+		p := writeTemp(t, content)
+		b, err := backend.OpenSpec(specFor(t, p, ""))
+		if err != nil {
+			t.Fatalf("bom=%v: %v", with, err)
+		}
+		if _, err := b.Create(context.Background(), task.Task{Title: "b", Status: "todo"}); err != nil {
+			t.Fatalf("bom=%v: %v", with, err)
+		}
+		data, _ := os.ReadFile(p)
+		s := string(data)
+		if strings.HasPrefix(s, bom) != with || strings.Count(s, bom) > 1 || !strings.Contains(s, "title: b") {
+			t.Fatalf("bom=%v: file:\n%q", with, s)
+		}
+	}
 }

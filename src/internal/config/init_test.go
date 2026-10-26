@@ -9,9 +9,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	_ "tkan/internal/backend/csv"
-	_ "tkan/internal/backend/custom"
-	"tkan/internal/board"
+	_ "tack/internal/backend/csv"
+	_ "tack/internal/backend/custom"
+	"tack/internal/board"
 )
 
 func gen(t *testing.T, csv, out string) (string, []string, *Config) {
@@ -47,7 +47,7 @@ func names(spec board.Spec) []string {
 }
 
 func TestGenerateFromDefaultWorkflowFile(t *testing.T) {
-	text, notes, cfg := gen(t, "id,title,description,status,priority,notes,type\n1,a,,pending,,,\n2,b,,done,,,\n3,c,,in_progress,,,\n", "data.csv.tkan.yaml")
+	text, notes, cfg := gen(t, "id,title,description,status,priority,notes,type\n1,a,,pending,,,\n2,b,,done,,,\n3,c,,in_progress,,,\n", "data.csv.tack.yaml")
 	if len(notes) != 0 {
 		t.Fatalf("notes: %v", notes)
 	}
@@ -106,7 +106,7 @@ func mustLoad(t *testing.T, text string) *Config {
 }
 
 func TestGenerateNoDataFileUsesGenericTemplate(t *testing.T) {
-	text, notes, cfg := gen(t, "", "tkan.yaml")
+	text, notes, cfg := gen(t, "", "tack.yaml")
 	if len(notes) != 1 || !strings.Contains(notes[0], "no data file yet") {
 		t.Fatalf("notes: %v", notes)
 	}

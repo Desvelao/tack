@@ -10,7 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
-	"tkan/internal/action"
+	"tack/internal/action"
 )
 
 func quickSpec(notify string) action.Spec {
@@ -74,7 +74,7 @@ func TestNotifyWritesBellOrDesktopNotification(t *testing.T) {
 	for _, tc := range []struct{ notify, want string }{
 		{"", ""},
 		{"bell", "\a"},
-		{"desktop", "\x1b]777;notify;tkan;quick on #1: OK\a\x1b]9;quick on #1: OK\a"},
+		{"desktop", "\x1b]777;notify;tack;quick on #1: OK\a\x1b]9;quick on #1: OK\a"},
 	} {
 		m, _ := newModel(t)
 		m = withActions(t, m, t.TempDir(), quickSpec(tc.notify))
@@ -93,7 +93,7 @@ func TestNotifyTextCannotEndTheEscapeSequence(t *testing.T) {
 	var out bytes.Buffer
 	m.term = &out
 	m.notify(action.Spec{Notify: action.NotifyDesktop}, "evil\x1b]0;title\a; more\n")
-	if got, want := out.String(), "\x1b]777;notify;tkan;evil]0,title, more\a\x1b]9;evil]0,title, more\a"; got != want {
+	if got, want := out.String(), "\x1b]777;notify;tack;evil]0,title, more\a\x1b]9;evil]0,title, more\a"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

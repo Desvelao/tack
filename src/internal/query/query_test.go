@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 var sample = []task.Task{
@@ -102,6 +102,8 @@ func TestParseErrors(t *testing.T) {
 		"title:a,,b":     "missing value",
 		"-priority=high": "cannot be negated",
 		"-title:wip":     "title!=value",
+		"title!~wip":     "unknown operator '!~'",
+		"id!^A-":         "unknown operator '!^'",
 	}
 	for q, want := range cases {
 		if _, err := Parse(q); err == nil || !strings.Contains(err.Error(), want) {
@@ -239,6 +241,10 @@ func TestRelativeDates(t *testing.T) {
 		"due<today+1w":   "1",
 		"due>today-1y":   "1,2",
 		"due<today+1y":   "1,2",
+		"due:today":      "1",
+		"due^today":      "1",
+		"due!:today":     "2,A-3",
+		"due:today+16d":  "2",
 	}
 	for q, want := range cases {
 		if got := ids(t, q, nil); got != want {
@@ -361,5 +367,180 @@ func TestBlockedAndReady(t *testing.T) {
 	// running is supplied by the board; TaskLookup leaves it unknown
 	if v, ok := TaskLookup(tasks[2], "", board.Deps{})(RunningField); ok || v != "" {
 		t.Errorf("running from TaskLookup: %q %v", v, ok)
+	}
+}
+
+// today, tomorrow and yesterday are dates only in a field that holds dates: a
+// label, a type or a title of that name is text.
+func TestRelativeWordsAreTextOutsideDateFields(t *testing.T) {
+	old := Now
+	Now = func() time.Time { return time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC) }
+	defer func() { Now = old }()
+	tk := task.Task{ID: "9", Title: "today", Type: "tomorrow", Labels: "yesterday,x", Due: "2026-10-20"}
+	match := func(q string) bool {
+		p, err := Parse(q)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", q, err)
+		}
+		return p.Match(TaskLookup(tk, "Col", board.Deps{}), nil)
+	}
+	for q, want := range map[string]bool{
+		"title=today":       true,
+		"type=tomorrow":     true,
+		"labels=yesterday":  true,
+		"title!=today":      false,
+		"labels!=yesterday": false,
+		"due=today":         true,
+		"due!=today":        false,
+		"due=2026-10-20":    true,
+		"title=2026-10-20":  false,
+		"labels=2026-10-20": false,
+		"title>today":       false, // text order, not 2026-10-20
+		"title>=today":      true,
+		"type<=tomorrow":    true,
+	} {
+		if got := match(q); got != want {
+			t.Errorf("%q: got %v want %v", q, got, want)
+		}
+	}
+}
+
+func TestRelativeMonthsAndYearsStopAtTheEndOfTheMonth(t *testing.T) {
+	old := Now
+	defer func() { Now = old }()
+	for _, c := range []struct{ now, expr, want string }{
+		{"2026-01-31", "today+1m", "2026-02-28"},
+		{"2026-03-31", "today-1m", "2026-02-28"},
+		{"2024-02-29", "today+1y", "2025-02-28"},
+		{"2026-10-20", "today+1m", "2026-11-20"},
+	} {
+		d, _ := time.Parse("2006-01-02", c.now)
+		Now = func() time.Time { return d }
+		if got := expandDates([]string{c.expr})[0]; got != c.want {
+			t.Errorf("%s %s = %s, want %s", c.now, c.expr, got, c.want)
+		}
+	}
+}
+
+// A greater priority is a more urgent one, whatever the letters of the words.
+func TestPriorityOrdersByUrgency(t *testing.T) {
+	cases := map[string]string{
+		"priority>=high":     "1",
+		"priority>medium":    "1",
+		"priority<=medium":   "2",
+		"priority<high":      "2",
+		"priority<=high":     "1,2",
+		"priority>low":       "1,2",
+		"priority>=critical": "",
+		"priority>=p1":       "1",
+		"priority<=2":        "1,2", // a bare number ranks like its word: 2 is high
+		"priority>=URGENT":   "",
+		"priority<trivial":   "",
+		"priority>trivial":   "1,2",
+		"priority>=high,low": "1,2", // any of the values
+	}
+	for q, want := range cases {
+		if got := ids(t, q, nil); got != want {
+			t.Errorf("%q: got %q want %q", q, got, want)
+		}
+	}
+	for _, q := range []string{"priority>hgh", "priority<=soon"} {
+		if _, err := Parse(q); err == nil || !strings.Contains(err.Error(), "unknown priority") {
+			t.Errorf("%q: %v", q, err)
+		}
+	}
+	// = and ! keep comparing the words.
+	if got := ids(t, "priority=high", nil); got != "1" {
+		t.Errorf("priority=high: %q", got)
+	}
+}
+
+func TestTokenizeQuoting(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []string
+	}{
+		{`a b`, []string{"a", "b"}},
+		{"a\tb", []string{"a", "b"}},
+		{`"a b" c`, []string{`"a b"`, "c"}},
+		{`title:"a b"`, []string{`title:"a b"`}},
+		{`"say \"hi\" now"`, []string{`"say \"hi\" now"`}},
+		{`title~"a b|c d"`, []string{`title~"a b|c d"`}},
+		{`""`, []string{`""`}},
+		{`a "" b`, []string{"a", `""`, "b"}},
+		{`\"a b"`, []string{`\"a b"`}}, // outside quotes \" is no escape: the " opens a quote
+	} {
+		got, err := tokenize(c.in)
+		if err != nil || strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("tokenize(%q) = %q, %v; want %q", c.in, got, err, c.want)
+		}
+	}
+	if _, err := tokenize(`"open`); err == nil {
+		t.Error("an unterminated quote must be an error")
+	}
+	if _, err := tokenize(`"open \"`); err == nil {
+		t.Error("an escaped closing quote does not close the quote")
+	}
+}
+
+func TestUnquote(t *testing.T) {
+	for in, want := range map[string]string{
+		`plain`:        "plain",
+		`"a b"`:        "a b",
+		`a"b c"d`:      "ab cd",
+		`say \"hi\"`:   `say "hi"`,
+		`"say \"hi\""`: `say "hi"`,
+		`""`:           "",
+		`back\slash`:   `back\slash`,
+		`"a,b"`:        "a,b",
+	} {
+		if got := unquote(in); got != want {
+			t.Errorf("unquote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestQuotingInTermsAndRegexes(t *testing.T) {
+	tasks := []task.Task{
+		{ID: "1", Title: `say "hi" now`},
+		{ID: "2", Title: "a b|c d"},
+		{ID: "3", Title: "a,b and c"},
+		{ID: "4", Title: "plain", Priority: "high"},
+	}
+	match := func(q string) (string, error) {
+		p, err := Parse(q)
+		if err != nil {
+			return "", err
+		}
+		var out []string
+		for _, tk := range tasks {
+			if p.Match(TaskLookup(tk, "", board.Deps{}), nil) {
+				out = append(out, tk.ID)
+			}
+		}
+		return strings.Join(out, ","), nil
+	}
+	for q, want := range map[string]string{
+		`title:"say \"hi\""`:    "1", // escaped quote inside quotes is a literal quote
+		`"\"hi\""`:              "1", // plain text, quoted
+		`title~"\"hi\""`:        "1", // regex: \" becomes a literal quote
+		`title~"a b|c d"`:       "2", // a regex with spaces and an alternative needs quotes
+		`title~a|plain`:         "1,2,3,4",
+		`title~"a,b|plain"`:     "3,4",     // commas are not split in a regex: this one is literal
+		`title~plain,high`:      "",        // "plain,high" is one pattern
+		`title:"a,b"`:           "3",       // a quoted comma is part of the value
+		`title:a,plain`:         "1,2,3,4", // unquoted: any of "a", "plain"
+		`title=plain,"a b|c d"`: "2,4",
+		`-"a b"`:                "1,3,4",
+	} {
+		got, err := match(q)
+		if err != nil || got != want {
+			t.Errorf("%s: got %q, %v; want %q", q, got, err, want)
+		}
+	}
+	for _, q := range []string{`""`, `-""`, `title~""`, `a OR ""`} {
+		if _, err := match(q); err == nil {
+			t.Errorf("%s: want an error", q)
+		}
 	}
 }

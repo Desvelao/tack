@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/action"
+	"tack/internal/action"
 )
 
 func write(t *testing.T, dir, name, content string) string {
@@ -21,7 +21,7 @@ func write(t *testing.T, dir, name, content string) string {
 
 func TestLoadBackendListAndGeneratedNames(t *testing.T) {
 	dir := t.TempDir()
-	p := write(t, dir, "tkan.yaml", `
+	p := write(t, dir, "tack.yaml", `
 backend:
   - type: csv
     options:
@@ -105,7 +105,7 @@ func TestLocate(t *testing.T) {
 	}
 	t.Setenv("HOME", t.TempDir()) // never pick up a real user config
 	t.Chdir(t.TempDir())
-	if _, err := Locate(""); err == nil || !strings.Contains(err.Error(), "tkan init") {
+	if _, err := Locate(""); err == nil || !strings.Contains(err.Error(), "tack init") {
 		t.Fatalf("got %v", err)
 	}
 	write(t, ".", DefaultFile, "")
@@ -129,23 +129,23 @@ func TestLocateFallsBackToHomeOnly(t *testing.T) {
 	if _, err := Locate(""); err == nil {
 		t.Fatal("found a config in a parent directory")
 	}
-	// neither are ~/.config/tkan/ or non-dotted names in the home directory
-	if err := os.MkdirAll(filepath.Join(home, ".config", "tkan"), 0o755); err != nil {
+	// neither are ~/.config/tack/ or non-dotted names in the home directory
+	if err := os.MkdirAll(filepath.Join(home, ".config", "tack"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(home, ".config", "tkan"), DefaultFile, "")
+	write(t, filepath.Join(home, ".config", "tack"), DefaultFile, "")
 	write(t, home, DefaultFile, "")
 	if _, err := Locate(""); err == nil {
 		t.Fatal("found a config outside the lookup locations")
 	}
-	// ~/.tkan.yml, then ~/.tkan.yaml wins over it
-	write(t, home, ".tkan.yml", "")
-	if p, err := Locate(""); err != nil || p != filepath.Join(home, ".tkan.yml") {
-		t.Fatalf("home .tkan.yml: %q %v", p, err)
+	// ~/.tack.yml, then ~/.tack.yaml wins over it
+	write(t, home, ".tack.yml", "")
+	if p, err := Locate(""); err != nil || p != filepath.Join(home, ".tack.yml") {
+		t.Fatalf("home .tack.yml: %q %v", p, err)
 	}
-	write(t, home, ".tkan.yaml", "")
-	if p, err := Locate(""); err != nil || p != filepath.Join(home, ".tkan.yaml") {
-		t.Fatalf("home .tkan.yaml: %q %v", p, err)
+	write(t, home, ".tack.yaml", "")
+	if p, err := Locate(""); err != nil || p != filepath.Join(home, ".tack.yaml") {
+		t.Fatalf("home .tack.yaml: %q %v", p, err)
 	}
 	// and the current directory wins over home
 	write(t, ".", DefaultFile, "")
@@ -157,10 +157,10 @@ func TestLocateFallsBackToHomeOnly(t *testing.T) {
 func TestLocatePrefersDottedNames(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Chdir(t.TempDir())
-	write(t, ".", "tkan.yaml", "")
-	write(t, ".", ".tkan.yml", "")
-	if p, err := Locate(""); err != nil || p != ".tkan.yml" {
-		t.Fatalf("got %q %v, want .tkan.yml", p, err)
+	write(t, ".", "tack.yaml", "")
+	write(t, ".", ".tack.yml", "")
+	if p, err := Locate(""); err != nil || p != ".tack.yml" {
+		t.Fatalf("got %q %v, want .tack.yml", p, err)
 	}
 }
 
@@ -182,8 +182,8 @@ func TestLocateIgnoresDirectoriesNamedLikeAConfig(t *testing.T) {
 	if err := os.Mkdir(DefaultFile, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	write(t, ".", "tkan.yml", "")
-	if p, err := Locate(""); err != nil || p != "tkan.yml" {
+	write(t, ".", "tack.yml", "")
+	if p, err := Locate(""); err != nil || p != "tack.yml" {
 		t.Fatalf("got %q %v", p, err)
 	}
 }
@@ -246,7 +246,7 @@ func TestUnknownKeysGetHints(t *testing.T) {
 
 func TestLoadActions(t *testing.T) {
 	dir := t.TempDir()
-	p := write(t, dir, "tkan.yaml", `
+	p := write(t, dir, "tack.yaml", `
 backend:
   - {type: csv, options: {source: a.csv}}
 actions:
@@ -274,7 +274,7 @@ func TestLoadRejectsBadActions(t *testing.T) {
 		"typo key":            {"actions:\n  - {name: a, comand: [x]}\n", `unknown key "comand" in actions[]`},
 	}
 	for name, c := range cases {
-		p := write(t, t.TempDir(), "tkan.yaml", "backend:\n  - {type: csv, options: {source: a.csv}}\n"+c.yaml)
+		p := write(t, t.TempDir(), "tack.yaml", "backend:\n  - {type: csv, options: {source: a.csv}}\n"+c.yaml)
 		_, err := Load(p)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: got %v, want %q", name, err, c.want)
@@ -298,13 +298,13 @@ func TestLoadRejectsBadHooks(t *testing.T) {
 		"unknown placehold": {"hooks:\n  - {name: a, on: [task.moved], command: [x, '{titel}']}\n", "hooks[1]"},
 	}
 	for name, c := range cases {
-		p := write(t, t.TempDir(), "tkan.yaml", base+c.yml)
+		p := write(t, t.TempDir(), "tack.yaml", base+c.yml)
 		_, err := Load(p)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: got %v, want it to mention %q", name, err, c.want)
 		}
 	}
-	ok := write(t, t.TempDir(), "tkan.yaml", base+"hooks:\n  - {name: a, on: [task.moved, reload.fail], command: [x, '{event}', '{old_status}']}\n")
+	ok := write(t, t.TempDir(), "tack.yaml", base+"hooks:\n  - {name: a, on: [task.moved, reload.fail], command: [x, '{event}', '{old_status}']}\n")
 	if c, err := Load(ok); err != nil || len(c.Hooks) != 1 {
 		t.Fatalf("%v %+v", err, c)
 	}
@@ -325,7 +325,7 @@ func TestActionMaxParallel(t *testing.T) {
 		"cap":     {fmt.Sprintf("action_max_parallel: %d\n", action.HardMaxParallel+1), 0, "out of range"},
 	}
 	for name, c := range cases {
-		p := write(t, t.TempDir(), "tkan.yaml", base+c.yml)
+		p := write(t, t.TempDir(), "tack.yaml", base+c.yml)
 		cfg, err := Load(p)
 		if c.err != "" {
 			if err == nil || !strings.Contains(err.Error(), c.err) {
@@ -342,7 +342,7 @@ func TestActionMaxParallel(t *testing.T) {
 }
 
 func TestLoadBackendActionsAndHooks(t *testing.T) {
-	p := write(t, t.TempDir(), "tkan.yaml", `
+	p := write(t, t.TempDir(), "tack.yaml", `
 backend:
   - type: csv
     name: work
@@ -377,7 +377,7 @@ hooks:
 		"typo":        {"    action:\n      - {name: a, command: [x]}\n", `unknown key "action" in backend[]`},
 	}
 	for name, cs := range cases {
-		_, err := Load(write(t, t.TempDir(), "tkan.yaml", two+cs.yml))
+		_, err := Load(write(t, t.TempDir(), "tack.yaml", two+cs.yml))
 		if err == nil || !strings.Contains(err.Error(), cs.want) {
 			t.Errorf("%s: got %v, want %q", name, err, cs.want)
 		}
@@ -386,7 +386,7 @@ hooks:
 
 func TestDisabledBackendIsSkipped(t *testing.T) {
 	dir := t.TempDir()
-	p := write(t, dir, "tkan.yaml", `
+	p := write(t, dir, "tack.yaml", `
 backend:
   - type: csv
     disabled: true

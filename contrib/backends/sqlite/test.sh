@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Tests tkan-sqlite.sh on a throw-away database (never a real backlog):
-#   contrib/backends/sqlite/test.sh [path/to/tkan]
-# Protocol-level checks always run; with a tkan binary the same script is
-# driven through `tkan` itself (claim races included).
+# Tests tack-sqlite.sh on a throw-away database (never a real backlog):
+#   contrib/backends/sqlite/test.sh [path/to/tack]
+# Protocol-level checks always run; with a tack binary the same script is
+# driven through `tack` itself (claim races included).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-S=$here/tkan-sqlite.sh
-TKAN=${1:-}
+S=$here/tack-sqlite.sh
+TACK=${1:-}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work" || exit 1
@@ -68,7 +68,7 @@ eq delete-missing not_found "$(jqv .code <<<"$r")"
 rm -f m.db
 sqlite3 m.db "CREATE TABLE items (key INTEGER PRIMARY KEY, summary TEXT NOT NULL, state TEXT, owner TEXT, customer TEXT NOT NULL);
 INSERT INTO items (summary, state, customer) VALUES ('Seven', 'open', 'acme');"
-export TKAN_SQLITE_FIELDS="id=key,title=summary,status=state,assignee=owner"
+export TACK_SQLITE_FIELDS="id=key,title=summary,status=state,assignee=owner"
 r=$(call '{"op":"list"}' m.db items)
 eq map-title Seven "$(jqv '.tasks[0].title' <<<"$r")"
 eq map-extra acme "$(jqv '.tasks[0].extra.customer' <<<"$r")"
@@ -78,7 +78,7 @@ case $(jqv .error <<<"$r") in *customer*) ok ;; *) bad "NOT NULL column not repo
 r=$(call '{"op":"create","task":{"title":"New","status":"open","extra":{"customer":"zed"}}}' m.db items)
 eq extra-create 2 "$(jqv .task.id <<<"$r")"
 eq extra-stored zed "$(sqlite3 m.db "SELECT customer FROM items WHERE key=2;")"
-unset TKAN_SQLITE_FIELDS
+unset TACK_SQLITE_FIELDS
 r=$(call '{"op":"list"}' m.db items)
 case $(jqv .error <<<"$r") in *'no column "id"'*|*'no column id'*) ok ;; *) bad "missing column not reported: $r" ;; esac
 
@@ -89,20 +89,20 @@ r=$(call '{"op":"list"}' none.db)
 eq no-db-lists-empty 0 "$(jqv '.tasks|length' <<<"$r")"
 [ ! -e none.db ] && ok || bad "list must not create the database"
 
-# 8. through tkan
-if [ -n "$TKAN" ]; then
-	cat >tkan.yaml <<EOF
+# 8. through tack
+if [ -n "$TACK" ]; then
+	cat >tack.yaml <<EOF
 backend:
   - name: db
     command: [$S, w.db]
     options: {poll: 2s}
 EOF
-	"$TKAN" -c tkan.yaml add -title "Via tkan" -status pending >/dev/null 2>&1 || bad "tkan add failed"
-	id=$("$TKAN" -c tkan.yaml list -json 2>/dev/null | jq -r ".[0].id // empty")
-	[ -n "$id" ] && ok || bad "tkan list shows no task"
-	codes=$(for i in 1 2 3 4; do ("$TKAN" -c tkan.yaml claim "$id" -as "agent$i" >/dev/null 2>&1; echo $?) & done; wait)
-	eq tkan-claim-winner 1 "$(grep -c '^0$' <<<"$codes")"
-	eq tkan-claim-losers 3 "$(grep -c '^4$' <<<"$codes")"
+	"$TACK" -c tack.yaml add -title "Via tack" -status pending >/dev/null 2>&1 || bad "tack add failed"
+	id=$("$TACK" -c tack.yaml list -json 2>/dev/null | jq -r ".[0].id // empty")
+	[ -n "$id" ] && ok || bad "tack list shows no task"
+	codes=$(for i in 1 2 3 4; do ("$TACK" -c tack.yaml claim "$id" -as "agent$i" >/dev/null 2>&1; echo $?) & done; wait)
+	eq tack-claim-winner 1 "$(grep -c '^0$' <<<"$codes")"
+	eq tack-claim-losers 3 "$(grep -c '^4$' <<<"$codes")"
 fi
 
 echo "$pass passed, $failed failed"

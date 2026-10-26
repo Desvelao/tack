@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 // Field is one key/value of a stored record. When Typed is false Text is the

@@ -20,8 +20,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/pathenv"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 // What `append_notes:` of on_success / on_failure puts on the task's notes.
@@ -32,15 +33,30 @@ const (
 )
 
 // Outcome is what a run asks for when it ends well (on_success) or badly
-// (on_failure): a column or status to move the task to and/or what to append to
-// its notes. In YAML it is a scalar (just the status) or {status, append_notes}.
+// (on_failure): a column or status to move the task to, what to append to its
+// notes and/or a command to run. In YAML it is a scalar (just the status) or
+// {status, append_notes, command}.
 type Outcome struct {
-	Status      string `yaml:"status,omitempty"`
-	AppendNotes string `yaml:"append_notes,omitempty"`
+	Status      string   `yaml:"status,omitempty"`
+	AppendNotes string   `yaml:"append_notes,omitempty"`
+	Command     []string `yaml:"command,omitempty"` // run after the move; {result} and {exit} join the task placeholders
 }
 
+// OutcomeExtra are the placeholders an outcome command has besides the task's.
+var OutcomeExtra = []string{"result", "exit"}
+
 // IsZero reports whether the outcome asks for nothing.
-func (o Outcome) IsZero() bool { return o.Status == "" && o.AppendNotes == "" }
+func (o Outcome) IsZero() bool {
+	return o.Status == "" && o.AppendNotes == "" && len(o.Command) == 0
+}
+
+// CommandSpec is the command of o as a background action named name, with the
+// settings it shares with s (workdir, env), ready to expand and run.
+func (o Outcome) CommandSpec(name string, s Spec) Spec {
+	c := Spec{Name: name, Command: o.Command, Workdir: s.Workdir, CreateWorkdir: s.CreateWorkdir, Env: s.Env}
+	c.Normalize()
+	return c
+}
 
 // UnmarshalYAML accepts a scalar (the status) or a mapping.
 func (o *Outcome) UnmarshalYAML(n *yaml.Node) error {
@@ -100,22 +116,28 @@ const DefaultKillGrace = 5 * time.Second
 // (KiB), unless the action sets max_output.
 const DefaultMaxOutput = 256
 
-// reservedKeys are taken by the picker itself (navigation, quit and close, force-interactive).
-const reservedKeys = "ijkqx"
+// reservedKeys are taken by the picker itself (navigation, quit and close, force-interactive, workdir).
+const reservedKeys = "ijkqwx"
 
 // ReservedKeys lists the characters the picker keeps for itself.
 func ReservedKeys() string { return reservedKeys }
 
 // Spec is one item of the `actions:` list.
 type Spec struct {
-	Name    string   `yaml:"name"`
-	Label   string   `yaml:"label,omitempty"` // shown in the picker; default: name
-	Key     string   `yaml:"key,omitempty"`   // one-character shortcut in the picker
-	Command []string `yaml:"command"`
-	Mode    string   `yaml:"mode,omitempty"`    // background (default) | interactive
-	Cwd     string   `yaml:"cwd,omitempty"`     // relative to the config file; default: its directory
-	Timeout string   `yaml:"timeout,omitempty"` // background only; default 10s
-	// InteractiveTimeout bounds an interactive run (mode: interactive or `tkan run -i`); default: none.
+	Name   string   `yaml:"id"`               // identifier, used as `tack run ID`
+	Label  string   `yaml:"title,omitempty"`  // shown in the picker; default: id
+	Labels []string `yaml:"labels,omitempty"` // free tags (code, review, research, ...) for consumers that classify actions
+	Key    string   `yaml:"key,omitempty"`    // one-character shortcut in the picker
+	// LegacyName and LegacyLabel are the deprecated keys `name` and `label`; Normalize folds them into Name and Label.
+	LegacyName  string   `yaml:"name,omitempty"`
+	LegacyLabel string   `yaml:"label,omitempty"`
+	Command     []string `yaml:"command"`
+	Mode        string   `yaml:"mode,omitempty"`    // background (default) | interactive
+	Workdir     string   `yaml:"workdir,omitempty"` // relative to the config file; default: its directory
+	// CreateWorkdir makes workdir (with its parents) when it does not exist, so a templated workdir such as wt/{slug} works.
+	CreateWorkdir bool   `yaml:"create_workdir,omitempty"`
+	Timeout       string `yaml:"timeout,omitempty"` // background only; default 10s
+	// InteractiveTimeout bounds an interactive run (mode: interactive or `tack run -i`); default: none.
 	InteractiveTimeout string            `yaml:"interactive_timeout,omitempty"`
 	KillGrace          string            `yaml:"kill_grace,omitempty"` // SIGTERM, then SIGKILL after this; default 5s, 0s = SIGKILL at once
 	MaxOutput          int               `yaml:"max_output,omitempty"` // KiB kept of each of stdout and stderr (background); default 256
@@ -138,7 +160,23 @@ type Spec struct {
 	OnFail    Outcome `yaml:"on_fail,omitempty"`
 	// Backend limits the spec to the tasks of one backend: config sets it for
 	// the `actions:` (and `hooks:`) of a backend entry. "" = every backend.
-	Backend string `yaml:"-"`
+	Backend  string `yaml:"-"`
+	conflict string // set by Normalize when the deprecated and the current key disagree
+}
+
+// cleanLabels trims the labels, drops empty and repeated ones and keeps the order.
+func cleanLabels(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range in {
+		l = strings.TrimSpace(l)
+		if l == "" || seen[l] {
+			continue
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	return out
 }
 
 // placeholders maps each {name} usable in command to the task value it stands for.
@@ -162,9 +200,9 @@ var placeholders = map[string]func(task.Task) string{
 	"slug":        func(t task.Task) string { return slug(t.Title) },
 }
 
-// cwdPlaceholders are the names allowed in `cwd`: short values that become a
+// workdirPlaceholders are the names allowed in `workdir`: short values that become a
 // single, safe path element (see pathElem).
-var cwdPlaceholders = []string{"id", "backend", "slug"}
+var workdirPlaceholders = []string{"id", "backend", "slug"}
 
 // slug turns a title into a short name safe for a directory or branch:
 // lower-case letters and digits joined by single dashes, at most 40 characters.
@@ -192,7 +230,7 @@ func slug(title string) string {
 }
 
 // pathElem makes a task value one harmless path element: separators and a
-// leading dot are replaced, so a task cannot steer cwd out of its directory.
+// leading dot are replaced, so a task cannot steer workdir out of its directory.
 func pathElem(v string) string {
 	v = strings.Map(func(r rune) rune {
 		if r == '/' || r == '\\' || r == 0 || r < 32 {
@@ -225,6 +263,19 @@ var lowerName = regexp.MustCompile(`^[a-z_]+$`)
 func (s *Spec) Normalize() {
 	s.Name = strings.TrimSpace(s.Name)
 	s.Label = strings.TrimSpace(s.Label)
+	if legacy := strings.TrimSpace(s.LegacyName); legacy != "" {
+		if s.Name != "" && s.Name != legacy {
+			s.conflict = "id and name are both set (name is the deprecated alias of id)"
+		}
+		if s.Name == "" {
+			s.Name = legacy
+		}
+	}
+	if legacy := strings.TrimSpace(s.LegacyLabel); legacy != "" && s.Label == "" {
+		s.Label = legacy
+	}
+	s.LegacyName, s.LegacyLabel = "", ""
+	s.Labels = cleanLabels(s.Labels)
 	s.Key = strings.TrimSpace(s.Key)
 	s.Mode = strings.ToLower(strings.TrimSpace(s.Mode))
 	if s.Mode == "" {
@@ -266,13 +317,16 @@ func (s Spec) ValidateExtra(extra []string) error { return s.ValidateWith(extra,
 // ValidateWith is ValidateExtra plus extra stdin choices the caller (hooks)
 // accepts besides none, json and markdown.
 func (s Spec) ValidateWith(extra, extraStdin []string) error {
+	if s.conflict != "" {
+		return errors.New(s.conflict)
+	}
 	if s.Name == "" {
-		return errors.New("name is required")
+		return errors.New("id is required")
 	}
 	if bad := strings.IndexFunc(s.Name, func(r rune) bool {
 		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '.' || r == '-')
 	}); bad >= 0 {
-		return fmt.Errorf("name %q may only contain letters, digits, '_', '.' and '-' (it is used as `tkan run NAME`)", s.Name)
+		return fmt.Errorf("id %q may only contain letters, digits, '_', '.' and '-' (it is used as `tack run ID`)", s.Name)
 	}
 	if len(s.Command) == 0 || strings.TrimSpace(s.Command[0]) == "" {
 		return errors.New("command is required (a list: program and arguments)")
@@ -293,9 +347,9 @@ func (s Spec) ValidateWith(extra, extraStdin []string) error {
 			}
 		}
 	}
-	for _, m := range placeholderRe.FindAllStringSubmatch(s.Cwd, -1) {
-		if name := m[1]; name != "" && slices.Contains(known, name) && !slices.Contains(cwdPlaceholders, name) {
-			return fmt.Errorf("cwd: {%s} is not allowed (only %s: they become one safe path element)", name, strings.Join(cwdPlaceholders, ", "))
+	for _, m := range placeholderRe.FindAllStringSubmatch(s.Workdir, -1) {
+		if name := m[1]; name != "" && slices.Contains(known, name) && !slices.Contains(workdirPlaceholders, name) {
+			return fmt.Errorf("workdir: {%s} is not allowed (only %s: they become one safe path element)", name, strings.Join(workdirPlaceholders, ", "))
 		}
 	}
 	switch s.Mode {
@@ -329,6 +383,9 @@ func (s Spec) ValidateWith(extra, extraStdin []string) error {
 		if d, err := time.ParseDuration(s.Timeout); err != nil || d <= 0 {
 			return fmt.Errorf("invalid timeout %q (e.g. 30s)", s.Timeout)
 		}
+	}
+	if s.CreateWorkdir && s.Workdir == "" {
+		return errors.New("create_workdir needs workdir (the config's directory always exists)")
 	}
 	if s.InteractiveTimeout != "" {
 		if d, err := time.ParseDuration(s.InteractiveTimeout); err != nil || d <= 0 {
@@ -368,6 +425,17 @@ func (s Spec) ValidateWith(extra, extraStdin []string) error {
 		}
 		if s.Mode == ModeInteractive {
 			return fmt.Errorf("%s: append_notes applies to background actions; an interactive one prints to the terminal", c.key)
+		}
+	}
+	for _, c := range []struct {
+		key string
+		o   Outcome
+	}{{"on_success", s.OnSuccess}, {"on_failure", s.OnFailure}} {
+		if len(c.o.Command) == 0 {
+			continue
+		}
+		if err := c.o.CommandSpec(s.Name, s).ValidateExtra(OutcomeExtra); err != nil {
+			return fmt.Errorf("%s: command: %w", c.key, err)
 		}
 	}
 	if s.CaptureMax < 0 {
@@ -622,8 +690,18 @@ func (s Spec) CaptureBytes() int {
 	return DefaultCaptureMax << 10
 }
 
+// WithWorkdir returns s running in dir instead of its configured workdir (a
+// per-run override; "" keeps the configured one). Like the configured value it
+// takes placeholders and is relative to the config directory.
+func (s Spec) WithWorkdir(dir string) Spec {
+	if dir != "" {
+		s.Workdir = dir
+	}
+	return s
+}
+
 // WithRun returns s with the variables that tie a run to its record:
-// TKAN_RUN_ID and, when the action log is on, TKAN_ACTION_LOG (its file or
+// TACK_RUN_ID and, when the action log is on, TACK_ACTION_LOG (its file or
 // directory). They go in the command's environment only; records never hold it.
 func (s Spec) WithRun(runID, logPath string) Spec {
 	env := make(map[string]string, len(s.Env)+2)
@@ -631,9 +709,9 @@ func (s Spec) WithRun(runID, logPath string) Spec {
 		env[k] = v
 	}
 	esc := func(v string) string { return strings.NewReplacer("{", "{{", "}", "}}").Replace(v) } // Expand fills {name}
-	env["TKAN_RUN_ID"] = esc(runID)
+	env["TACK_RUN_ID"] = esc(runID)
 	if logPath != "" {
-		env["TKAN_ACTION_LOG"] = esc(logPath)
+		env["TACK_ACTION_LOG"] = esc(logPath)
 	}
 	s.Env = env
 	return s
@@ -653,7 +731,7 @@ type Plan struct {
 // them above a few MiB.
 const (
 	maxArgLen  = 120 << 10 // one argv element
-	maxEnvLen  = 64 << 10  // one variable made from the task (TKAN_TASK_JSON, ...)
+	maxEnvLen  = 64 << 10  // one variable made from the task (TACK_TASK_JSON, ...)
 	maxArgsLen = 1 << 20   // argv and the plan's variables together
 )
 
@@ -672,7 +750,7 @@ func EnvVar(key, value string) string {
 }
 
 // Expand fills the placeholders for t. baseDir is the config directory that
-// Cwd resolves against. Substitution is a single pass: a task whose title
+// Workdir resolves against. Substitution is a single pass: a task whose title
 // contains "{id}" is not expanded a second time.
 func (s Spec) Expand(t task.Task, baseDir string) Plan { return s.ExpandWith(t, baseDir, nil) }
 
@@ -708,8 +786,12 @@ func (s Spec) ExpandWith(t task.Task, baseDir string, extra map[string]string) P
 		})
 	}
 	p := Plan{Dir: baseDir}
-	if s.Cwd != "" {
-		p.Dir = fill(s.Cwd, cwdPlaceholders)
+	if s.Workdir != "" {
+		tmpl, err := pathenv.Expand(s.Workdir) // before the placeholders, so task text is never expanded
+		if err != nil {
+			p.Err = fmt.Errorf("%s: workdir: %w", s.Name, err)
+		}
+		p.Dir = fill(tmpl, workdirPlaceholders)
 		if !filepath.IsAbs(p.Dir) {
 			p.Dir = filepath.Join(baseDir, p.Dir)
 		}
@@ -717,17 +799,19 @@ func (s Spec) ExpandWith(t task.Task, baseDir string, extra map[string]string) P
 	for _, arg := range s.Command {
 		p.Argv = append(p.Argv, fill(arg, nil))
 	}
-	p.Err = s.checkSize(p.Argv, t, extra)
 	for k, v := range s.Env {
 		p.Env = append(p.Env, k+"="+stripNUL(fill(v, nil)))
 	}
+	if p.Err == nil {
+		p.Err = s.checkSize(p.Argv, p.Env, t, extra)
+	}
 	p.Env = append(p.Env,
-		EnvVar("TKAN_TASK_ID", t.ID),
-		EnvVar("TKAN_TASK_TITLE", t.Title),
-		EnvVar("TKAN_TASK_STATUS", t.Status),
-		EnvVar("TKAN_BACKEND", t.Backend),
-		EnvVar("TKAN_WORKDIR", p.Dir),
-		EnvVar("TKAN_TASK_JSON", string(taskJSON(t))),
+		EnvVar("TACK_TASK_ID", t.ID),
+		EnvVar("TACK_TASK_TITLE", t.Title),
+		EnvVar("TACK_TASK_STATUS", t.Status),
+		EnvVar("TACK_BACKEND", t.Backend),
+		EnvVar("TACK_WORKDIR", p.Dir),
+		EnvVar("TACK_TASK_JSON", string(taskJSON(t))),
 	)
 	switch s.Stdin {
 	case StdinJSON:
@@ -738,10 +822,34 @@ func (s Spec) ExpandWith(t task.Task, baseDir string, extra map[string]string) P
 	return p
 }
 
-// checkSize reports an argument the system would refuse to start, naming the
-// placeholders that made it large.
-func (s Spec) checkSize(argv []string, t task.Task, extra map[string]string) error {
+// checkSize reports an argument or a user `env:` value the system would refuse
+// to start, naming the placeholders that made it large. env holds the KEY=VALUE
+// entries of s.Env once filled in.
+func (s Spec) checkSize(argv, env []string, t task.Task, extra map[string]string) error {
 	total := 0
+	for _, e := range env {
+		total += len(e) + 1
+		if len(e) < maxArgLen {
+			continue
+		}
+		key, _, _ := strings.Cut(e, "=")
+		var big []string
+		for _, m := range placeholderRe.FindAllStringSubmatch(s.Env[key], -1) {
+			name := m[1]
+			v, ok := extra[name]
+			if f, known := placeholders[name]; known {
+				v, ok = f(t), true
+			}
+			if ok && len(v) > 4<<10 {
+				big = append(big, fmt.Sprintf("{%s} is %d KiB", name, len(v)>>10))
+			}
+		}
+		why := "the text of the variable"
+		if len(big) > 0 {
+			why = strings.Join(big, ", ")
+		}
+		return fmt.Errorf("%s: env %s is %d KiB once filled in (the limit is %d KiB): %s; pass large text on stdin (stdin: json or markdown) instead", s.Name, key, len(e)>>10, maxArgLen>>10, why)
+	}
 	for i, a := range argv {
 		total += len(a) + 1
 		if len(a) < maxArgLen {

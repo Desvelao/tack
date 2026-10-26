@@ -1,4 +1,4 @@
-module tkan
+module tack
 
 go 1.24.2
 

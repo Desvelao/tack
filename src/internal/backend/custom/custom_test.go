@@ -12,8 +12,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 // script is a tiny fake tool: it keeps one task in $DIR/state and answers the
@@ -79,6 +79,34 @@ func TestProtocolRoundTrip(t *testing.T) {
 	}
 	if err := be.Delete(ctx, "99"); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// A write made before the first List must not be hidden by the list Open primed.
+func TestWriteDropsThePrimedList(t *testing.T) {
+	const stateful = `#!/bin/sh
+req=$(cat)
+case "$req" in
+  *'"op":"list"'*)
+    if [ -e "$PWD/created" ]; then
+      echo '{"tasks":[{"id":"7","title":"Seven","status":"todo"},{"id":"8","title":"New","status":"todo"}]}'
+    else
+      echo '{"tasks":[{"id":"7","title":"Seven","status":"todo"}]}'
+    fi ;;
+  *'"op":"create"'*) touch "$PWD/created"; echo '{"task":{"id":"8","title":"New","status":"todo"}}' ;;
+esac
+`
+	be, _, err := open(t, stateful, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := be.Create(ctx, task.Task{Title: "New", Status: "todo"}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := be.List(ctx)
+	if err != nil || len(tasks) != 2 {
+		t.Fatalf("want the post-write list, got %v %+v", err, tasks)
 	}
 }
 
@@ -437,5 +465,35 @@ func TestLazyOpenDoesNotRunTheCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "ran")); err == nil {
 		t.Fatal("a lazy open ran the command")
+	}
+}
+
+func TestPollRefreshesGuardAndFields(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "upgraded")
+	s := "#!/bin/sh\ncat >/dev/null\nif [ -e " + flag + " ]; then echo '{\"tasks\":[],\"guard\":true,\"fields\":[\"title\",\"assignee\"]}'; else echo '{\"tasks\":[]}'; fi\n"
+	be, _, err := openIn(t, dir, s, "poll: 50ms\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer be.Close()
+	g := be.(*Backend)
+	if _, err := be.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if g.Guards() {
+		t.Fatal("guard reported before the command says so")
+	}
+	watcher(t, be).Changed() // starts the poller
+	os.WriteFile(flag, nil, 0o644)
+	deadline := time.Now().Add(3 * time.Second)
+	for !g.Guards() {
+		if time.Now().After(deadline) {
+			t.Fatal("the poller did not pick up the new guard before the next List")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !g.Stores("assignee") || g.Stores("lease") {
+		t.Errorf("fields not refreshed: assignee %v, lease %v", g.Stores("assignee"), g.Stores("lease"))
 	}
 }

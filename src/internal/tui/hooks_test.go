@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/board"
-	"tkan/internal/hook"
+	"tack/internal/board"
+	"tack/internal/hook"
 )
 
 // hookLog returns a Runner whose hooks append "event id" to a file, and a reader of that file.
@@ -49,8 +49,8 @@ func TestAppearedDoesNotFloodWhenABackendRecovers(t *testing.T) {
 	r, events := hookLog(t, hook.TaskAppeared, hook.TaskDisappeared)
 	m, _, p2 := twoBackends(t)
 	m = m.WithHooks(r)
-	m.loaded, m.partial = false, nil // the model was built before the runner was attached
-	m.reload()                       // first load: nothing is news
+	m.loaded = false // the model was built before the runner was attached
+	m.reload()       // first load: nothing is news
 	if got := events(); len(got) != 0 {
 		t.Fatalf("first load fired %v", got)
 	}
@@ -101,7 +101,7 @@ func TestFirstLoadThatIsPartialDoesNotFloodOnTheSecond(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := New(be, "x", board.DefaultSpec()).WithHooks(r) // New's own first load saw csv2 failing
-	m.loaded, m.partial = false, nil
+	m.loaded = false
 	m.reload() // partial first load
 	if err := os.Rename(hidden, missing); err != nil {
 		t.Fatal(err)

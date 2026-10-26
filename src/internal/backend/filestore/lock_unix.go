@@ -30,7 +30,7 @@ func LockFile(path string, timeout time.Duration) (func(), error) {
 		}
 		if time.Now().After(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("locked by another tkan for more than %s (%s)", timeout, path)
+			return nil, fmt.Errorf("locked by another tack for more than %s (%s)", timeout, path)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

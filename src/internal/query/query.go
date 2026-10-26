@@ -1,4 +1,4 @@
-// Package query implements tkan's filter language: plain text terms plus
+// Package query implements tack's filter language: plain text terms plus
 // field-targeted terms with a few operators. It knows nothing about the UI.
 //
 // See Help for the user-facing syntax.
@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 // DefaultSearch lists the fields a plain text term is matched against.
@@ -161,25 +161,25 @@ func (t *term) match(get Lookup, search []string) bool {
 	if t.field == "labels" {
 		switch t.op {
 		case opEquals:
-			return labelsMatch(v, expandDates(t.values), false)
+			return labelsMatch(v, t.values, false)
 		case opNotEquals:
-			return !labelsMatch(v, expandDates(t.values), false)
+			return !labelsMatch(v, t.values, false)
 		case opPrefix:
 			return labelsMatch(v, t.values, true)
 		}
 	}
 	switch t.op {
 	case opContains:
-		return containsAny(strings.ToLower(v), t.values)
+		return containsAny(strings.ToLower(v), t.dateValues())
 	case opNotContains:
-		return !containsAny(strings.ToLower(v), t.values)
+		return !containsAny(strings.ToLower(v), t.dateValues())
 	case opEquals:
-		return equalsAny(v, expandDates(t.values))
+		return equalsAny(v, t.dateValues())
 	case opNotEquals:
-		return !equalsAny(v, expandDates(t.values))
+		return !equalsAny(v, t.dateValues())
 	case opPrefix:
 		lv := strings.ToLower(strings.TrimSpace(v))
-		for _, p := range t.values {
+		for _, p := range t.dateValues() {
 			if strings.HasPrefix(lv, p) {
 				return true
 			}
@@ -188,9 +188,22 @@ func (t *term) match(get Lookup, search []string) bool {
 	case opRegex:
 		return t.re.MatchString(v)
 	case opLess, opLessEq, opGreater, opGreaterEq:
-		return compareAny(strings.ToLower(strings.TrimSpace(v)), t.op, expandDates(t.values))
+		if t.field == "priority" {
+			return comparePriority(v, t.op, t.values)
+		}
+		return compareAny(strings.ToLower(strings.TrimSpace(v)), t.op, t.dateValues())
 	}
 	return false
+}
+
+// dateValues are the values of t with relative dates (today, tomorrow+2d) turned
+// into ISO dates, but only for a field that holds dates: a label, a type or a
+// title that is literally "today" is text and stays so.
+func (t *term) dateValues() []string {
+	if !dateFields[t.field] {
+		return t.values
+	}
+	return expandDates(t.values)
 }
 
 // Now is the clock for relative dates; tests replace it.
@@ -203,13 +216,17 @@ var relWords = []string{"today", "tomorrow", "yesterday"}
 
 // dateFields are the fields that hold dates, where an ordering term with a
 // near-miss of a relative word (due<tomorow) is a typo, not text.
-var dateFields = map[string]bool{"due": true, "start": true, "date": true, "time": true}
+var dateFields = map[string]bool{"due": true, "start": true, "date": true, "time": true, "lease": true, "claimed_at": true}
 
 // checkRelativeDates rejects values that try to be a relative date but are not
 // one (today+7, today+1x, due<tomorow) instead of comparing them as text.
 func checkRelativeDates(t term) error {
 	switch t.op {
 	case opEquals, opNotEquals, opLess, opLessEq, opGreater, opGreaterEq:
+	case opContains, opNotContains, opPrefix:
+		if !dateFields[t.field] { // title:today-list is text
+			return nil
+		}
 	default:
 		return nil
 	}
@@ -265,9 +282,9 @@ func expandDates(values []string) []string {
 			case "w":
 				d = d.AddDate(0, 0, 7*n)
 			case "m":
-				d = d.AddDate(0, n, 0)
+				d = addClamped(d, 0, n)
 			case "y":
-				d = d.AddDate(n, 0, 0)
+				d = addClamped(d, n, 0)
 			default:
 				d = d.AddDate(0, 0, n)
 			}
@@ -278,6 +295,16 @@ func expandDates(values []string) []string {
 		return values
 	}
 	return out
+}
+
+// addClamped adds years and months, stopping at the last day of the month when
+// the day does not exist there (Jan 31 + 1m is Feb 28, not Mar 3).
+func addClamped(d time.Time, years, months int) time.Time {
+	r := d.AddDate(years, months, 0)
+	if r.Day() != d.Day() {
+		r = r.AddDate(0, 0, -r.Day())
+	}
+	return r
 }
 
 // compareAny orders numerically when both sides are numbers ("9" < "10") and
@@ -473,6 +500,10 @@ func parseTerm(raw string) (term, error) {
 				return finishField(t, raw[i+len(o.tok):])
 			}
 		}
+		// Only != and !: exist; "title!~x" would otherwise become a text term that matches nothing.
+		if i+1 < len(raw) && raw[i] == '!' && strings.IndexByte("~^<>", raw[i+1]) >= 0 {
+			return t, fmt.Errorf("%q: unknown operator '!%c'; negation exists as %s!=value and %s!:value", raw, raw[i+1], raw[:i], raw[:i])
+		}
 	}
 
 	// "-field<op>value" is not a negated field term; it would silently turn
@@ -529,7 +560,52 @@ func finishField(t term, rawValue string) (term, error) {
 	if err := checkRelativeDates(t); err != nil {
 		return t, err
 	}
+	if err := checkPriorityOrder(t); err != nil {
+		return t, err
+	}
 	return t, nil
+}
+
+// checkPriorityOrder rejects an ordering term on priority whose value is not a
+// priority (priority>hgh), instead of comparing it as text.
+func checkPriorityOrder(t term) error {
+	if t.field != "priority" {
+		return nil
+	}
+	switch t.op {
+	case opLess, opLessEq, opGreater, opGreaterEq:
+	default:
+		return nil
+	}
+	for _, v := range t.values {
+		if task.PriorityRank(v) == task.UnknownPriority {
+			return fmt.Errorf("unknown priority %q in %q (critical, high, medium, low, trivial; also p0-p4 and 1-5)", v, t.src)
+		}
+	}
+	return nil
+}
+
+// comparePriority orders by urgency, not by the letters of the words: a greater
+// priority is a more urgent one, so priority>=high matches high and critical and
+// priority<medium matches low and trivial. Aliases rank with their word
+// (urgent = critical, p1 = high, 2 = high). An empty or unrecognised priority
+// never matches.
+func comparePriority(have string, o op, values []string) bool {
+	r := task.PriorityRank(have)
+	if r == task.UnknownPriority {
+		return false
+	}
+	for _, v := range values {
+		w := task.PriorityRank(v)
+		if w == task.UnknownPriority {
+			continue
+		}
+		// a lower rank is more urgent: the order of the operators flips
+		if o == opLess && r > w || o == opLessEq && r >= w || o == opGreater && r < w || o == opGreaterEq && r <= w {
+			return true
+		}
+	}
+	return false
 }
 
 // sortedUnique returns the distinct, sorted names.

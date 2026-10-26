@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 // Codec turns the content of a whole file into tasks and back.
@@ -21,6 +21,11 @@ type Codec interface {
 	// for none) so a codec can keep its layout, e.g. the shape of the document.
 	Encode(tasks []task.Task, prev []byte) ([]byte, error)
 }
+
+// Written is implemented by a codec that must know when the content it last
+// encoded reached the file, to adopt the layout it chose (CSV adds a column
+// for a field that gained a value).
+type Written interface{ Written() }
 
 // Store implements backend.Backend, backend.Watcher and backend.Reloader over
 // one file read and written through a Codec. Writes re-read the file first
@@ -173,7 +178,7 @@ func (s *Store) Changed() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	changed := cur != s.stamp
+	changed := !cur.Same(s.stamp)
 	if changed {
 		s.stale = true
 	}
@@ -192,8 +197,8 @@ func (s *Store) Reload() error {
 }
 
 func (s *Store) mutate(fn func() error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The file lock first, then the mutex: waiting for another process to let go
+	// of the file must not keep List and Changed from answering from the cache.
 	timeout := s.LockTimeout
 	if timeout <= 0 {
 		timeout = LockTimeout
@@ -203,6 +208,8 @@ func (s *Store) mutate(fn func() error) error {
 		return fmt.Errorf("lock %s: %w", s.path, err)
 	}
 	defer unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.refresh(); err != nil {
 		return err
 	}
@@ -225,7 +232,7 @@ func (s *Store) refresh() error {
 	if err != nil {
 		return err
 	}
-	if cur == s.stamp {
+	if cur.Same(s.stamp) {
 		return nil
 	}
 	return s.reload()
@@ -271,6 +278,9 @@ func (s *Store) write() error {
 		return err
 	}
 	s.raw, s.stamp = data, cur
+	if w, ok := s.codec.(Written); ok {
+		w.Written()
+	}
 	return nil
 }
 

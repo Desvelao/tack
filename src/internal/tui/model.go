@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -15,14 +14,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/backend"
-	"tkan/internal/board"
-	"tkan/internal/hook"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/backend"
+	"tack/internal/board"
+	"tack/internal/hook"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 type mode int
@@ -32,6 +31,7 @@ const (
 	modeDetail
 	modeNew
 	modeConfirmDelete
+	modeConfirmRelease // `C` on a claim somebody else holds: asks before taking it away
 	modeFilter
 	modeHelp
 	modeEdit
@@ -40,7 +40,7 @@ const (
 	modeActions   // `x`: the action picker
 	modeRuns      // `R`: the background runs
 	modeRunOutput // output of one run
-	modeFleet     // `F`: agents and the tasks they hold
+	modeWorkers   // `W`: agents and the tasks they hold
 	modeMoveTo    // `m`: waiting for the column number to move the card(s) to
 )
 
@@ -48,24 +48,6 @@ const pollEvery = time.Second
 
 // liveEvery is the tick while a running action's output is on screen.
 const liveEvery = 250 * time.Millisecond
-
-// undoOp reverses one change: restore the task as it was (move, edit), or
-// create it again (delete, which may give it a new ID).
-type undoOp struct {
-	what     string
-	prev     task.Task
-	recreate bool
-	group    []task.Task // recreate: all the cards of a delete of marked cards (prev is the first)
-}
-
-const maxUndo = 30
-
-func (m *Model) pushUndo(op undoOp) {
-	m.undo = append(m.undo, op)
-	if len(m.undo) > maxUndo {
-		m.undo = m.undo[1:]
-	}
-}
 
 type noticeKind int
 
@@ -89,69 +71,6 @@ func (m *Model) fail(text string) { m.setNotice(noticeFail, text) }
 
 func (m *Model) clearNotice() { m.notice, m.noticeKind = "", noticeInfo }
 
-// undoLast reverses the most recent move, edit or delete.
-func (m *Model) undoLast() tea.Cmd {
-	if len(m.undo) == 0 {
-		m.notice = "nothing to undo"
-		return nil
-	}
-	op := m.undo[len(m.undo)-1]
-	m.undo = m.undo[:len(m.undo)-1]
-	ctx := backend.WithSource(backend.WithNote(context.Background(), "undo of "+op.what), "undo")
-	be := m.be
-	if op.recreate && len(op.group) > 1 {
-		return m.recreateGroup(ctx, op)
-	}
-	if op.recreate {
-		var t task.Task
-		return m.write(func() (err error) { t, err = be.Create(ctx, op.prev); return }, func(m *Model, err error) {
-			if err != nil {
-				m.fail("undo failed: " + err.Error())
-				return
-			}
-			if m.async != nil {
-				m.showLocal(t, false)
-			} else if m.reload() != nil {
-				return
-			}
-			m.selectID(t.Backend, t.ID)
-			m.ok("undid " + op.what)
-			if t.ID != op.prev.ID {
-				m.notice += fmt.Sprintf(" (restored as #%s, the old #%s is gone)", t.ID, op.prev.ID)
-			}
-		})
-	}
-	if len(op.group) > 1 {
-		return m.restoreGroup(ctx, op)
-	}
-	cur, shown := m.cardOf(op.prev)
-	hidden := false
-	if m.async != nil { // show the old card at once; the write confirms it
-		m.showLocal(op.prev, false)
-		hidden = !m.selectID(op.prev.Backend, op.prev.ID) && m.filter != ""
-	}
-	return m.write(func() error { return be.Update(ctx, op.prev) }, func(m *Model, err error) {
-		if err != nil {
-			m.fail("undo failed: " + err.Error())
-			if shown {
-				m.showLocal(cur, false)
-			}
-			return
-		}
-		if m.async == nil {
-			if m.reload() != nil {
-				return
-			}
-			hidden = !m.selectID(op.prev.Backend, op.prev.ID) && m.filter != ""
-		}
-		if hidden {
-			m.ok("undid " + op.what + hiddenHint)
-			return
-		}
-		m.ok("undid " + op.what)
-	})
-}
-
 type tickMsg time.Time
 
 // Model is the Bubble Tea model. Backend calls are synchronous: fine for
@@ -165,7 +84,8 @@ type Model struct {
 	tasks      []task.Task
 	spec       board.Spec
 	board      board.Board
-	deps       board.Deps // which cards are blocked (blocked_by), from the last load
+	deps       board.Deps    // which cards are blocked (blocked_by), from the last load
+	cycles     []board.Cycle // blocked_by cycles among the open cards, from the last load
 	col, row   int
 	mode       mode
 	input      textinput.Model
@@ -196,18 +116,22 @@ type Model struct {
 	audit        *audit.Log  // nil = no audit view
 	auditQ       query.Query // filter of the audit view
 	auditFilter  string
+	auditC       *auditCache
 	auditY       int    // first visible line of the audit view
 	auditEditing bool   // the audit filter prompt is open
 	reloadErr    string // last reload failure recorded, to log a repeating one once
 
 	allActions []action.Spec    // configured actions, of every backend (action.For picks a card's)
 	actions    []action.Spec    // the `x` picker's list, for the cards it was opened on
-	actionDir  string           // directory their relative cwd resolves against
+	actionDir  string           // directory their relative workdir resolves against
 	actionIdx  int              // highlighted action in the picker
 	actionTTY  bool             // `i` in the picker: run the next action with the terminal
 	actionBack mode             // mode the picker returns to (board or detail)
 	lastAction action.Spec      // the action started last (`.` repeats it; Name "" = none yet)
 	lastTTY    bool             // it ran with the terminal because of `i`
+	actionWD   string           // `w` in the picker: workdir for the next action ("" = the configured one)
+	actionWDIn *textinput.Model // the `w` prompt while it is open
+	lastWD     string           // the workdir the last action ran in (`.` repeats it)
 	unseen     int              // background runs that ended since the runs view (R) was last opened
 	term       io.Writer        // where notify writes the bell / desktop notification; nil = os.Stdout
 	marks      map[cardKey]bool // cards marked with space (by backend and ID); x runs on them
@@ -228,45 +152,21 @@ type Model struct {
 	runQ       query.Query
 	runEditing bool // the runs filter prompt is open
 
-	fleetIdx int // highlighted row of the fleet view
+	workersIdx int // highlighted row of the workers view
 
 	alog *actionlog.Log // optional detailed log of action runs (nil = off)
 
-	partial       map[string]bool // backends whose last list was incomplete (see diffHooks)
-	pending       []func(*Model)  // work an action run left for when the user leaves a form (see finishAction)
-	deleteTargets []task.Task     // the cards the open delete confirmation is about (the marked ones, else the selected)
+	pending       []func(*Model) // work an action run left for when the user leaves a form (see finishAction)
+	relTarget     task.Task      // the card the open release confirmation is about
+	deleteTargets []task.Task    // the cards the open delete confirmation is about (the marked ones, else the selected)
 
-	hooks       *hook.Runner // optional event hooks (nil = none)
-	loaded      bool         // a first load happened (its tasks are not "appeared")
-	async       *asyncLoad   // background listing (NewAsync); nil = every load is synchronous
-	writing     int          // backend writes running in the background (interactive board only)
-	wantRefresh string       // why a background list is waiting for the board to be idle ("" = none)
-}
-
-// editForm is the state of the card edit form (modeEdit).
-type editForm struct {
-	orig   task.Task
-	inputs []textinput.Model // parallel to editFields
-	loaded []string          // input values as loaded, to detect which fields were edited
-	idx    int
-	armed  bool // esc was pressed once with unsaved changes
-}
-
-// editFields are the card fields the form edits; id, status and backend are not editable.
-var editFields = []struct {
-	name string
-	ptr  func(*task.Task) *string
-}{
-	{"title", func(t *task.Task) *string { return &t.Title }},
-	{"description", func(t *task.Task) *string { return &t.Description }},
-	{"priority", func(t *task.Task) *string { return &t.Priority }},
-	{"type", func(t *task.Task) *string { return &t.Type }},
-	{"assignee", func(t *task.Task) *string { return &t.Assignee }},
-	{"due", func(t *task.Task) *string { return &t.Due }},
-	{"start", func(t *task.Task) *string { return &t.Start }},
-	{"labels", func(t *task.Task) *string { return &t.Labels }},
-	{"blocked_by", func(t *task.Task) *string { return &t.BlockedBy }},
-	{"notes", func(t *task.Task) *string { return &t.Notes }},
+	hooks       *hook.Runner  // optional event hooks (nil = none)
+	watch       *hook.Watcher // turns the lists into hook events (nil without hooks)
+	loaded      bool          // a first load happened (its tasks are not "appeared")
+	async       *asyncLoad    // background listing (NewAsync); nil = every load is synchronous
+	writing     int           // backend writes running in the background (interactive board only)
+	quitWarned  bool          // ctrl+c was held back by a pending write; the next one quits anyway
+	wantRefresh string        // why a background list is waiting for the board to be idle ("" = none)
 }
 
 // New builds a model for the backends in be; name is shown in the header and spec defines the columns.
@@ -279,12 +179,12 @@ func New(be *backend.Set, name string, spec board.Spec) Model {
 func bareModel(be *backend.Set, name string, spec board.Spec) Model {
 	in := textinput.New()
 	in.CharLimit = 200
-	return Model{be: be, name: name, spec: spec, input: in, width: 80, height: 24, groupBy: query.Normalize(spec.Group)}
+	return Model{be: be, name: name, spec: spec, input: in, width: 80, height: 24, groupBy: query.Normalize(spec.Group), auditC: &auditCache{}}
 }
 
 // WithAudit gives the model the audit trail shown by `A`.
 func (m Model) WithAudit(l *audit.Log) Model {
-	m.audit = l
+	m.audit, m.auditC = l, &auditCache{}
 	m.be.SetAuditor(l)
 	return m
 }
@@ -299,14 +199,14 @@ func (m *Model) refresh(reason string) {
 func (m *Model) auditReload(reason string, err error) {
 	if err == nil {
 		m.reloadErr = ""
-		m.hooks.Fire(hook.Event{Name: hook.ReloadOK, Source: "tui"})
+		m.watch.Reload(nil)
 		m.be.Audit(audit.OpReload, "", "", nil, fmt.Sprintf("%s: %d tasks", reason, len(m.tasks)))
 		return
 	}
 	if err.Error() != m.reloadErr {
 		m.reloadErr = err.Error()
 		m.be.Audit(audit.OpReload, "", "", err, reason)
-		m.hooks.Fire(hook.Event{Name: hook.ReloadFail, Source: "tui", Err: err.Error()})
+		m.watch.Reload(err)
 	}
 }
 
@@ -341,6 +241,7 @@ func (m *Model) applyTasks(tasks []task.Task, b board.Board, perr *backend.Parti
 	m.pruneMarks(perr)
 	m.board = b
 	m.deps = b.Deps(tasks)
+	m.cycles = m.deps.Cycles()
 	m.fields = query.KnownFields(tasks)
 	m.clamp()
 	// Keep the cursor on the same card when the data changed underneath it.
@@ -575,7 +476,7 @@ func (m Model) tickEvery() time.Duration {
 		return spinEvery
 	}
 	switch m.mode {
-	case modeFleet:
+	case modeWorkers:
 		return animEvery
 	case modeRunOutput:
 		if _, running := m.recordOf(m.runCur); running {
@@ -630,7 +531,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fail("error: " + err.Error())
 			}
 		}
-		if m.mode == modeBoard || m.mode == modeFleet {
+		if m.mode == modeBoard || m.mode == modeWorkers {
 			changed, err := m.be.Changed()
 			if err != nil {
 				if m.notice == "" {
@@ -654,6 +555,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case writeDoneMsg:
 		m.writing--
+		m.quitWarned = false
 		msg.done(&m, msg.err)
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -664,6 +566,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := k.String()
 	if key == "ctrl+c" {
+		if m.writing > 0 && !m.quitWarned { // quitting now would drop the write
+			m.quitWarned = true
+			m.notice = "still saving, ctrl+c again to quit"
+			return m, nil
+		}
 		m.runs.cancelAll()
 		return m, tea.Quit
 	}
@@ -685,8 +592,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleRunsKey(k)
 	case modeRunOutput:
 		return m.handleRunOutputKey(k)
-	case modeFleet:
-		return m.handleFleetKey(k)
+	case modeWorkers:
+		return m.handleWorkersKey(k)
 	case modeMoveTo:
 		m.mode = modeBoard
 		if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
@@ -705,6 +612,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quickFilter(key)
 		}
 		return m, nil
+	case modeConfirmRelease:
+		return m.handleConfirmRelease(key)
 	case modeConfirmDelete:
 		if key == "y" || key == "Y" {
 			// The cards the question was about, not whatever is selected now.
@@ -779,6 +688,10 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "q":
+		if m.writing > 0 { // quitting now would drop the write
+			m.notice = m.busyNotice()
+			return m, nil
+		}
 		m.runs.cancelAll()
 		return m, tea.Quit
 	case "left", "h":
@@ -832,6 +745,12 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "u":
 		cmd := m.undoLast()
+		return m, cmd
+	case "c":
+		cmd := m.claimSelected()
+		return m, cmd
+	case "C":
+		cmd := m.releaseSelected()
 		return m, cmd
 	case "f":
 		if _, ok := m.selected(); ok {
@@ -908,164 +827,12 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openActions()
 	case "R":
 		m.openRuns()
-	case "F":
-		m.openFleet()
+	case "W":
+		m.openWorkers()
 	case "?":
 		m.helpPage, m.helpBack, m.mode, m.helpDocs = 0, modeBoard, modeHelp, nil
 	}
 	return m, nil
-}
-
-func (m Model) handleInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if k.String() == "?" && m.mode == modeFilter && m.input.Value() == "" {
-		m.helpPage, m.helpBack, m.mode, m.helpDocs = 1, modeFilter, modeHelp, nil
-		return m, nil
-	}
-	switch k.String() {
-	case "esc":
-		m.input.Blur()
-		m.mode = modeBoard
-		return m, nil
-	case "enter":
-		val := strings.TrimSpace(m.input.Value())
-		m.input.Blur()
-		if m.mode == modeFilter {
-			q, err := query.Parse(val)
-			if err == nil {
-				err = q.Check(m.fields)
-			}
-			if err != nil { // keep the prompt open and the previous filter
-				m.notice = "filter: " + err.Error()
-				m.input.Focus()
-				return m, nil
-			}
-			m.filter, m.query, m.view = val, q, ""
-			m.remember(val)
-			m.row = 0
-			m.clamp()
-		} else if val != "" {
-			m.mode = modeBoard
-			if !m.idle() { // the new card must not meet a list that started before it
-				m.notice = m.busyNotice()
-				return m, nil
-			}
-			be, nt := m.be, task.Task{Title: val, Status: m.board.WriteValue(m.col), Backend: m.be.Names()[m.target]}
-			var t task.Task
-			cmd := m.write(func() (err error) { t, err = be.Create(context.Background(), nt); return }, func(m *Model, err error) {
-				if err != nil {
-					m.fail("error: " + err.Error())
-					return
-				}
-				if m.async != nil {
-					m.showLocal(t, false)
-				} else if m.reload() != nil {
-					return
-				}
-				m.ok("created #" + t.ID)
-				if !m.selectID(t.Backend, t.ID) && m.filter != "" {
-					m.notice += hiddenHint
-				}
-			})
-			return m, cmd
-		}
-		m.mode = modeBoard
-		return m, nil
-	}
-	if m.mode == modeFilter && (k.String() == "up" || k.String() == "down") {
-		m.browseHistory(k.String() == "up")
-		return m, nil
-	}
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(k)
-	return m, cmd
-}
-
-// remember keeps applied filters (newest last, no repeats) for up/down recall.
-func (m *Model) remember(f string) {
-	if f == "" {
-		return
-	}
-	for i, h := range m.history {
-		if h == f {
-			m.history = append(m.history[:i], m.history[i+1:]...)
-			break
-		}
-	}
-	m.history = append(m.history, f)
-	if len(m.history) > 20 {
-		m.history = m.history[1:]
-	}
-	m.histPos = len(m.history)
-}
-
-// browseHistory puts an earlier (up) or later (down) filter into the prompt.
-func (m *Model) browseHistory(older bool) {
-	if len(m.history) == 0 {
-		return
-	}
-	if m.histPos > len(m.history) {
-		m.histPos = len(m.history)
-	}
-	if older && m.histPos > 0 {
-		m.histPos--
-	} else if !older && m.histPos < len(m.history) {
-		m.histPos++
-	}
-	val := ""
-	if m.histPos < len(m.history) {
-		val = m.history[m.histPos]
-	}
-	m.input.SetValue(val)
-	m.input.CursorEnd()
-}
-
-// quickFilter filters the board by one property of the selected card:
-// t type, a assignee, p priority, l first label.
-func (m *Model) quickFilter(key string) {
-	t, ok := m.selected()
-	if !ok {
-		return
-	}
-	var field, val, op string
-	switch key {
-	case "t":
-		field, val, op = "type", t.Type, "="
-	case "a":
-		field, val, op = "assignee", t.Assignee, "="
-	case "p":
-		field, val, op = "priority", t.Priority, "="
-	case "l":
-		field, op = "labels", ":"
-		if l := t.LabelList(); len(l) > 0 {
-			val = l[0]
-		}
-	default:
-		m.notice = "f then t (type) a (assignee) p (priority) l (label); esc cancels"
-		return
-	}
-	if strings.TrimSpace(val) == "" {
-		m.notice = fmt.Sprintf("this card has no %s to filter by", field)
-		return
-	}
-	expr := field + op + quoteValue(strings.TrimSpace(val))
-	q, err := query.Parse(expr)
-	if err != nil {
-		m.notice = "filter: " + err.Error()
-		return
-	}
-	m.filter, m.query, m.view = expr, q, ""
-	m.remember(expr)
-	m.row = 0
-	m.clamp()
-	m.notice = "filter " + expr + " (esc clears)"
-}
-
-// quoteValue quotes a filter value when it has spaces, commas or quotes.
-func quoteValue(v string) string {
-	if !strings.ContainsAny(v, " \t,\"") {
-		return v
-	}
-	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 }
 
 // cycleView applies the next saved view (board.views), then none again.
@@ -1084,26 +851,35 @@ func (m *Model) cycleView() {
 	if next == 0 {
 		next = 1
 	}
-	if next > len(views) {
-		m.filter, m.query, m.view = "", query.Query{}, ""
+	// A view whose query does not parse, or names a field this backlog lacks, is
+	// skipped (and said so) instead of stopping the cycle on it.
+	var skipped []string
+	for ; next <= len(views); next++ {
+		v := views[next-1]
+		q, err := query.Parse(v.Query)
+		if err == nil {
+			err = q.Check(m.fields)
+		}
+		if err != nil {
+			skipped = append(skipped, fmt.Sprintf("view %s: %v", v.Name, err))
+			continue
+		}
+		m.filter, m.query, m.view = v.Query, q, v.Name
 		m.row = 0
 		m.clamp()
-		m.notice = "view cleared"
+		m.notice = fmt.Sprintf("view %s (%d/%d): %s", v.Name, next, len(views), v.Query)
+		if len(skipped) > 0 {
+			m.notice += " (skipped " + strings.Join(skipped, "; ") + ")"
+		}
 		return
 	}
-	v := views[next-1]
-	q, err := query.Parse(v.Query)
-	if err == nil {
-		err = q.Check(m.fields)
-	}
-	if err != nil {
-		m.notice = fmt.Sprintf("view %s: %v", v.Name, err)
-		return
-	}
-	m.filter, m.query, m.view = v.Query, q, v.Name
+	m.filter, m.query, m.view = "", query.Query{}, ""
 	m.row = 0
 	m.clamp()
-	m.notice = fmt.Sprintf("view %s (%d/%d): %s", v.Name, next, len(views), v.Query)
+	m.notice = "view cleared"
+	if len(skipped) > 0 {
+		m.notice += " (skipped " + strings.Join(skipped, "; ") + ")"
+	}
 }
 
 // pageSize is how many cards pgup/pgdn jump: as many as fit in the visible
@@ -1191,7 +967,7 @@ func (m *Model) moveTo(target int) tea.Cmd {
 			m.showLocal(before, false)
 			return
 		}
-		m.pushUndo(undoOp{what: "move of #" + t.ID, prev: before})
+		m.pushUndo(undoOp{what: "move of #" + t.ID, prev: before, after: t})
 		if m.async == nil {
 			if m.reload() != nil {
 				return
@@ -1224,360 +1000,18 @@ func (m *Model) selectID(backend, id string) bool {
 
 const hiddenHint = " (hidden by the filter, esc clears it)"
 
-// startEdit opens the edit form for the selected card.
-func (m *Model) startEdit() {
-	t, ok := m.selected()
-	if !ok {
-		return
-	}
-	m.edit = editForm{orig: t, inputs: make([]textinput.Model, len(editFields)), loaded: make([]string, len(editFields))}
-	for i, f := range editFields {
-		in := textinput.New()
-		in.CharLimit = 0 // no cap: a limit would truncate long descriptions/notes on save
-		in.Width = m.editWidth()
-		in.SetValue(*f.ptr(&t))
-		m.edit.inputs[i] = in
-		m.edit.loaded[i] = in.Value()
-	}
-	m.edit.inputs[0].Focus()
-	m.mode = modeEdit
-}
-
-func (m Model) handleEdit(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	e := &m.edit
-	wasArmed := e.armed
-	e.armed = false
-	switch k.String() {
-	case "esc":
-		if !wasArmed && e.dirty() {
-			e.armed = true
-			m.notice = "unsaved changes: esc again to discard, enter to save"
-			return m, nil
-		}
-		m.mode = modeBoard
-		return m, nil
-	case "tab", "down", "shift+tab", "up":
-		e.inputs[e.idx].Blur()
-		step := 1
-		if s := k.String(); s == "shift+tab" || s == "up" {
-			step = len(e.inputs) - 1
-		}
-		e.idx = (e.idx + step) % len(e.inputs)
-		e.inputs[e.idx].Focus()
-		return m, nil
-	case "enter":
-		cmd := m.saveEdit()
-		return m, cmd
-	}
-	var cmd tea.Cmd
-	e.inputs[e.idx], cmd = e.inputs[e.idx].Update(k)
-	return m, cmd
-}
-
-// dirty reports whether any field differs from what was loaded.
-func (e editForm) dirty() bool {
-	for i := range e.inputs {
-		if e.inputs[i].Value() != e.loaded[i] {
-			return true
-		}
-	}
-	return false
-}
-
-// editWidth is the width of each input: what is left after the 12-column label
-// and the prompt, capped at 50 so the form stays compact on wide terminals.
-func (m Model) editWidth() int {
-	w := m.width - 12 - 3
-	if w > 50 {
-		w = 50
-	}
-	if w < 10 {
-		w = 10
-	}
-	return w
-}
-
-// saveEdit validates the form and writes the card through the backend. On a
-// validation or backend error the form stays open with a notice.
-func (m *Model) saveEdit() tea.Cmd {
-	t := m.edit.orig.Clone()
-	for i, f := range editFields {
-		// Untouched fields keep their stored value; the input flattens newlines.
-		if v := m.edit.inputs[i].Value(); v != m.edit.loaded[i] {
-			*f.ptr(&t) = strings.TrimSpace(v)
-		}
-	}
-	if t.Title == "" {
-		m.fail("title cannot be empty")
-		return nil
-	}
-	for name, v := range map[string]string{"due": t.Due, "start": t.Start} {
-		if _, err := time.Parse("2006-01-02", v); v != "" && err != nil {
-			m.fail(fmt.Sprintf("%s: use YYYY-MM-DD", name))
-			return nil
-		}
-	}
-	ctx := backend.WithOld(backend.WithNote(context.Background(), "edited"), m.edit.orig)
-	be, orig := m.be, m.edit.orig
-	if m.async != nil { // the card changes now and the form closes; the write confirms it
-		m.showLocal(t, false)
-		m.selectID(t.Backend, t.ID)
-		m.mode = modeBoard
-	}
-	return m.write(func() error { return be.Update(ctx, t) }, func(m *Model, err error) {
-		if err != nil {
-			m.fail("error: " + err.Error())
-			if m.async != nil { // give the user their edit back
-				m.showLocal(orig, false)
-				if m.mode == modeBoard {
-					m.mode = modeEdit
-				}
-			}
-			return
-		}
-		m.pushUndo(undoOp{what: "edit of #" + t.ID, prev: orig})
-		m.mode = modeBoard
-		if m.async == nil {
-			if m.reload() != nil {
-				return
-			}
-			m.selectID(t.Backend, t.ID)
-		}
-		m.ok("saved #" + t.ID)
-	})
-}
-
 // diffHooks fires task.appeared / task.disappeared for what changed since
 // the last list, leaving out the first load, the Set's own writes (their
 // events fired when they were made) and backends that failed to load.
 func (m *Model) diffHooks(tasks []task.Task, perr *backend.PartialError) {
 	own := m.be.TakeWritten()
-	// A backend that did not load completely misses tasks in that list; the list
-	// where it recovers would show all of them as new. So a backend is left out
-	// of the comparison when it was incomplete in either of the two lists.
-	skip := map[string]bool{}
-	for n := range m.partial {
-		skip[n] = true
-	}
-	m.partial = map[string]bool{}
-	if perr != nil {
-		for _, n := range perr.Names {
-			skip[n], m.partial[n] = true, true
-		}
-	}
-	first := !m.loaded
 	m.loaded = true
-	if !m.hooks.Active() {
-		return
-	}
-	if !first {
-		m.hooks.Diff(m.tasks, tasks, own, skip)
-	}
-	m.hooks.Tick(tasks, time.Now())
+	m.watch.Observe(tasks, perr, own)
 }
 
 // WithHooks gives the model the runner that starts the configured hooks.
 func (m Model) WithHooks(r *hook.Runner) Model {
 	m.hooks = r
+	m.watch = hook.NewWatcher(r, "tui")
 	return m
-}
-
-// nextHelpPage steps through the help pages. Outside the board the keys page
-// does not apply, so only syntax and fields turn.
-func (m Model) nextHelpPage(step int) int {
-	first := 0
-	if m.helpDocs != nil {
-		first = 1
-	}
-	n := 3 - first
-	return first + ((m.helpPage-first+step)%n+n)%n
-}
-
-// openFilterHelp shows the syntax and fields of another view's filter (the
-// audit trail or the runs); esc returns to back, with its prompt open.
-func (m *Model) openFilterHelp(back mode, title string, docs []query.FieldDoc, search []string) {
-	m.helpPage, m.helpBack, m.mode = 1, back, modeHelp
-	m.helpDocs, m.helpTitle, m.helpSearch = docs, title, search
-}
-
-// deleteMany deletes the cards one by one in one background write. The ones
-// that fail come back on the board (and stay marked); the others are one undo.
-func (m *Model) deleteMany(ts []task.Task) tea.Cmd {
-	be := m.be
-	m.showLocalMany(ts, true)
-	errs := make([]error, len(ts))
-	return m.write(func() error {
-		for i, t := range ts {
-			errs[i] = be.Delete(context.Background(), t.Backend, t.ID)
-		}
-		return nil
-	}, func(m *Model, _ error) {
-		var gone, failed []task.Task
-		var firstErr error
-		marks := map[cardKey]bool{}
-		for i, t := range ts {
-			if errs[i] != nil {
-				failed = append(failed, t)
-				marks[keyOf(t)] = true
-				if firstErr == nil {
-					firstErr = fmt.Errorf("#%s: %w", t.ID, errs[i])
-				}
-				continue
-			}
-			gone = append(gone, t)
-		}
-		if len(marks) == 0 {
-			marks = nil
-		}
-		m.marks = marks
-		if len(failed) > 0 {
-			m.showLocalMany(failed, false)
-		}
-		if len(gone) > 0 {
-			m.pushUndo(undoOp{what: fmt.Sprintf("delete of %d cards", len(gone)), prev: gone[0], recreate: true, group: gone})
-			if m.async == nil && m.reload() != nil {
-				return
-			}
-		}
-		if len(failed) > 0 {
-			m.fail(fmt.Sprintf("deleted %d of %d cards; %v", len(gone), len(ts), firstErr))
-			return
-		}
-		m.ok(fmt.Sprintf("deleted %d cards (u undoes)", len(gone)))
-	})
-}
-
-// recreateGroup is the undo of deleteMany: it creates the cards again.
-func (m *Model) recreateGroup(ctx context.Context, op undoOp) tea.Cmd {
-	be := m.be
-	made := make([]task.Task, len(op.group))
-	errs := make([]error, len(op.group))
-	return m.write(func() error {
-		for i, t := range op.group {
-			made[i], errs[i] = be.Create(ctx, t)
-		}
-		return nil
-	}, func(m *Model, _ error) {
-		var failed []task.Task
-		renamed := false
-		for i, t := range op.group {
-			if errs[i] != nil {
-				failed = append(failed, t)
-				continue
-			}
-			if made[i].ID != t.ID {
-				renamed = true
-			}
-			if m.async != nil {
-				m.showLocal(made[i], false)
-			}
-		}
-		if m.async == nil && m.reload() != nil {
-			return
-		}
-		if len(failed) > 0 {
-			m.pushUndo(undoOp{what: fmt.Sprintf("delete of %d cards", len(failed)), prev: failed[0], recreate: true, group: failed})
-			m.fail(fmt.Sprintf("undo restored %d of %d cards: %v", len(op.group)-len(failed), len(op.group), errs[slices.IndexFunc(errs, func(e error) bool { return e != nil })]))
-			return
-		}
-		m.ok("undid " + op.what)
-		if renamed {
-			m.notice += " (some got new IDs)"
-		}
-	})
-}
-
-// moveMany moves the cards to column target in one background write. The ones
-// that fail go back (and stay marked); the others are one undo.
-func (m *Model) moveMany(ts []task.Task, target int) tea.Cmd {
-	be := m.be
-	name := m.board.Columns[target].Name
-	moved := make([]task.Task, len(ts))
-	for i, t := range ts {
-		moved[i] = t
-		moved[i].Status = m.board.WriteValue(target)
-	}
-	m.showLocalMany(moved, false)
-	errs := make([]error, len(ts))
-	return m.write(func() error {
-		for i := range ts {
-			ctx := backend.WithOld(backend.WithNote(context.Background(), "moved to "+name), ts[i])
-			errs[i] = be.Update(ctx, moved[i])
-		}
-		return nil
-	}, func(m *Model, _ error) {
-		var done, failed []task.Task
-		var firstErr error
-		marks := map[cardKey]bool{}
-		for i, t := range ts {
-			if errs[i] != nil {
-				failed = append(failed, t)
-				marks[keyOf(t)] = true
-				if firstErr == nil {
-					firstErr = fmt.Errorf("#%s: %w", t.ID, errs[i])
-				}
-				continue
-			}
-			done = append(done, t)
-		}
-		if len(marks) == 0 {
-			marks = nil
-		}
-		m.marks = marks
-		if len(failed) > 0 {
-			m.showLocalMany(failed, false)
-		}
-		if len(done) > 0 {
-			m.pushUndo(undoOp{what: fmt.Sprintf("move of %d cards", len(done)), prev: done[0], group: done})
-			if m.async == nil && m.reload() != nil {
-				return
-			}
-		}
-		if len(failed) > 0 {
-			m.fail(fmt.Sprintf("moved %d of %d cards to %s; %v", len(done), len(ts), name, firstErr))
-			return
-		}
-		m.ok(fmt.Sprintf("moved %d cards to %s (u undoes)", len(done), name))
-		if lim, over := m.board.Over(target, m.columnTotal(target)); over {
-			m.notice += fmt.Sprintf(" (over its limit of %d)", lim)
-		}
-	})
-}
-
-// restoreGroup is the undo of moveMany: it writes the earlier versions back.
-func (m *Model) restoreGroup(ctx context.Context, op undoOp) tea.Cmd {
-	be := m.be
-	if m.async != nil {
-		m.showLocalMany(op.group, false)
-	}
-	errs := make([]error, len(op.group))
-	return m.write(func() error {
-		for i, t := range op.group {
-			errs[i] = be.Update(ctx, t)
-		}
-		return nil
-	}, func(m *Model, _ error) {
-		var failed []task.Task
-		var firstErr error
-		for i, t := range op.group {
-			if errs[i] != nil {
-				failed = append(failed, t)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("#%s: %w", t.ID, errs[i])
-				}
-			}
-		}
-		if len(failed) > 0 {
-			m.pushUndo(undoOp{what: fmt.Sprintf("move of %d cards", len(failed)), prev: failed[0], group: failed})
-			if m.async == nil {
-				m.reload()
-			}
-			m.fail(fmt.Sprintf("undo restored %d of %d cards; %v", len(op.group)-len(failed), len(op.group), firstErr))
-			return
-		}
-		if m.async == nil && m.reload() != nil {
-			return
-		}
-		m.ok("undid " + op.what)
-	})
 }

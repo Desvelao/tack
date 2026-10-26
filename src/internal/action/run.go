@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"tkan/internal/proc"
-	"tkan/internal/task"
+	"tack/internal/proc"
+	"tack/internal/task"
 )
 
 // busy holds the cards (action name, backend, id) with a running `exclusive`
@@ -209,24 +209,26 @@ func (s Spec) Run(ctx context.Context, t task.Task, baseDir string) (Result, err
 
 // Cmd builds the command for an interactive run: it inherits the terminal
 // (tea.ExecProcess or the CLI wires stdin/stdout). The stdin option is not
-// used here, so an action that needs it cannot run interactively.
-func (s Spec) Cmd(t task.Task, baseDir string) (*exec.Cmd, error) {
+// used here, so an action that needs it cannot run interactively. done
+// releases the timeout timer: call it once the command has ended (it is a
+// no-op without interactive_timeout, and nil only together with an error).
+func (s Spec) Cmd(t task.Task, baseDir string) (cmd *exec.Cmd, done func(), err error) {
 	if s.Stdin != StdinNone && s.Stdin != "" {
-		return nil, fmt.Errorf("%s: reads the task on stdin (stdin: %s), which cannot be combined with interactive mode", s.Name, s.Stdin)
+		return nil, nil, fmt.Errorf("%s: reads the task on stdin (stdin: %s), which cannot be combined with interactive mode", s.Name, s.Stdin)
 	}
 	p := s.Expand(t, baseDir)
 	if p.Err == nil {
 		p.Err = s.checkDir(p.Dir)
 	}
 	if p.Err != nil {
-		return nil, p.Err
+		return nil, nil, p.Err
 	}
-	cmd := exec.Command(p.Argv[0], p.Argv[1:]...)
+	done = func() {}
 	if d, err := time.ParseDuration(s.InteractiveTimeout); err == nil && d > 0 {
 		// No process group: the command must stay in the terminal's foreground
 		// group. SIGTERM goes to the command itself; Wait kills it after the grace.
-		ctx, release := context.WithTimeout(context.Background(), d)
-		_ = release // the context frees itself when the timeout passes
+		var ctx context.Context
+		ctx, done = context.WithTimeout(context.Background(), d)
 		cmd = exec.CommandContext(ctx, p.Argv[0], p.Argv[1:]...)
 		cmd.Cancel = func() error {
 			cmd.WaitDelay = s.Grace()
@@ -235,17 +237,25 @@ func (s Spec) Cmd(t task.Task, baseDir string) (*exec.Cmd, error) {
 			}
 			return cmd.Process.Kill()
 		}
+	} else {
+		cmd = exec.Command(p.Argv[0], p.Argv[1:]...)
 	}
 	cmd.Dir = p.Dir
 	cmd.Env = p.environ()
-	return cmd, nil
+	return cmd, done, nil
 }
 
-// checkDir names a missing working directory; exec reports it as the program
+// checkDir creates the working directory when create_workdir is set, else names a missing one; exec reports it as the program
 // not being found, which sends people looking in the wrong place.
 func (s Spec) checkDir(dir string) error {
+	if s.CreateWorkdir {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("%s: cannot create working directory %q: %w", s.Name, dir, err)
+		}
+		return nil
+	}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return fmt.Errorf("%s: working directory %q does not exist (cwd is relative to the config file)", s.Name, dir)
+		return fmt.Errorf("%s: working directory %q does not exist (workdir is relative to the config file)", s.Name, dir)
 	}
 	return nil
 }

@@ -163,3 +163,39 @@ func TestMergeAppliesOnlyWhatTheEditChanged(t *testing.T) {
 		t.Errorf("%+v", same)
 	}
 }
+
+func TestMergeKeepsConcurrentClaimOnEditAndEditOnClaim(t *testing.T) {
+	base := Task{ID: "1", Title: "t", Status: "todo"}
+
+	// An edit that does not touch the claim leaves a claim made meanwhile intact.
+	edited := base.Clone()
+	edited.Title = "renamed"
+	cur := base.Clone()
+	cur.Assignee, cur.Lease, cur.ClaimedAt = "ann", "2026-10-18T12:30:00Z", "2026-10-18T12:00:00Z"
+	got := Merge(cur, base, edited)
+	if got.Title != "renamed" || got.Assignee != "ann" || got.Lease != cur.Lease || got.ClaimedAt != cur.ClaimedAt {
+		t.Errorf("edit over a claim: %+v", got)
+	}
+
+	// A claim written from a stale read leaves an edit made meanwhile intact.
+	claimed := base.Clone()
+	claimed.Assignee, claimed.Lease, claimed.ClaimedAt = "bob", "2026-10-18T13:00:00Z", "2026-10-18T12:30:00Z"
+	cur = base.Clone()
+	cur.Title, cur.Notes = "renamed", "by someone else"
+	got = Merge(cur, base, claimed)
+	if got.Title != "renamed" || got.Notes != "by someone else" || got.Assignee != "bob" || got.Lease != claimed.Lease || got.ClaimedAt != claimed.ClaimedAt {
+		t.Errorf("claim over an edit: %+v", got)
+	}
+}
+
+func TestMergeKeepsCurOverlaid(t *testing.T) {
+	base := Task{ID: "1", Status: "todo", Overlaid: []string{"status"}}
+	edited := base.Clone()
+	edited.Overlaid = []string{"notes"}
+	edited.Title = "renamed"
+	cur := base.Clone()
+	got := Merge(cur, base, edited)
+	if got.Title != "renamed" || len(got.Overlaid) != 1 || got.Overlaid[0] != "status" {
+		t.Errorf("%+v", got)
+	}
+}

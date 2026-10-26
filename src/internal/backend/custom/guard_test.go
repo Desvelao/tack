@@ -12,8 +12,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 // guardScript keeps the assignee of task 7 in $PWD/state and applies an update's

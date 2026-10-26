@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 var now = time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
@@ -97,6 +97,18 @@ func TestRelease(t *testing.T) {
 	}
 }
 
+func TestReleaseClearsOrphanLeftovers(t *testing.T) {
+	for name, orphan := range map[string]task.Task{
+		"lease only":      {ID: "1", Status: "doing", Lease: "2026-10-18T12:30:00Z"},
+		"claimed_at only": {ID: "1", Status: "doing", ClaimedAt: "2026-10-18T12:00:00Z"},
+	} {
+		out, g, changed, err := Release(orphan, "bob", false, "")
+		if err != nil || !changed || g != (Guard{"assignee", ""}) || out.Lease != "" || out.ClaimedAt != "" {
+			t.Errorf("%s: %+v %+v %v %v", name, out, g, changed, err)
+		}
+	}
+}
+
 func TestClaimedAtIsSetKeptOnRenewalAndCleared(t *testing.T) {
 	t0 := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	got, _, err := Claim(task.Task{ID: "1"}, Request{Agent: "ann", Lease: time.Hour}, t0)
@@ -114,5 +126,22 @@ func TestClaimedAtIsSetKeptOnRenewalAndCleared(t *testing.T) {
 	out, _, _, err := Release(taken, "bob", false, "")
 	if err != nil || out.ClaimedAt != "" || out.Assignee != "" {
 		t.Fatalf("release: %+v %v", out, err)
+	}
+}
+
+func TestAgentNamesIgnoreCase(t *testing.T) {
+	held := task.Task{ID: "1", Status: "doing", Assignee: "claude", Lease: "2026-10-18T12:10:00Z", ClaimedAt: "2026-10-18T11:00:00Z"}
+	out, g, err := Claim(held, Request{Agent: "Claude", Lease: 30 * time.Minute}, now)
+	if err != nil || g != (Guard{"assignee", "claude"}) || out.Assignee != "claude" || out.ClaimedAt != held.ClaimedAt {
+		t.Errorf("renewal as Claude: %+v %+v %v, want the stored spelling and start kept", out, g, err)
+	}
+	if _, _, err := Claim(held, Request{Agent: "ann"}, now); !errors.Is(err, backend.ErrPrecondition) {
+		t.Errorf("claim by another agent: %v, want ErrPrecondition", err)
+	}
+	if out, _, changed, err := Release(held, "CLAUDE", false, ""); err != nil || !changed || out.Assignee != "" {
+		t.Errorf("release as CLAUDE: %+v %v %v", out, changed, err)
+	}
+	if _, _, _, err := Release(held, "ann", false, ""); !errors.Is(err, backend.ErrPrecondition) {
+		t.Errorf("release by another agent: %v, want ErrPrecondition", err)
 	}
 }

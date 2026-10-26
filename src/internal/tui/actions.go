@@ -8,15 +8,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/backend"
-	"tkan/internal/claim"
-	"tkan/internal/outcome"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/backend"
+	"tack/internal/claim"
+	"tack/internal/outcome"
+	"tack/internal/task"
 )
 
 // actionDoneMsg reports that an action finished (or could not start). run is
@@ -34,7 +35,7 @@ type actionDoneMsg struct {
 }
 
 // WithActions gives the model the configured actions (the `x` picker); dir is
-// the config directory their relative cwd resolves against.
+// the config directory their relative workdir resolves against.
 func (m Model) WithActions(specs []action.Spec, dir string) Model {
 	m.allActions, m.actionDir = specs, dir
 	m.runs = &runLog{}
@@ -64,7 +65,7 @@ func (m *Model) openActions() {
 		return
 	}
 	m.actionBack, m.mode = m.mode, modeActions
-	m.actionIdx, m.actionTTY = 0, false
+	m.actionIdx, m.actionTTY, m.actionWD, m.actionWDIn = 0, false, "", nil
 }
 
 // targetBackends are the backends of the cards an action would run on (the
@@ -109,7 +110,30 @@ func (m Model) actionFor(backend, name string) (action.Spec, bool) {
 
 func (m Model) handleActionsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := k.String()
+	if in := m.actionWDIn; in != nil { // the workdir prompt is open
+		switch key {
+		case "esc":
+			m.actionWDIn = nil
+		case "enter":
+			m.actionWD, m.actionWDIn = strings.TrimSpace(in.Value()), nil
+		default:
+			v, cmd := in.Update(k)
+			m.actionWDIn = &v
+			return m, cmd
+		}
+		return m, nil
+	}
 	switch key {
+	case "w": // workdir for the next action
+		in := textinput.New()
+		in.CharLimit = 0
+		in.Width = max(m.width-20, 10)
+		in.Prompt = "workdir: "
+		in.SetValue(m.actionWD)
+		in.CursorEnd()
+		in.Focus()
+		m.actionWDIn = &in
+		return m, textinput.Blink
 	case "esc", "q", "x":
 		m.mode = m.actionBack
 		return m, nil
@@ -152,6 +176,7 @@ func (m Model) handleActionsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // pick starts the chosen action: on the marked cards when there are any,
 // otherwise on the selected one.
 func (m Model) pick(s action.Spec) (tea.Model, tea.Cmd) {
+	m.lastWD = m.actionWD
 	if len(m.marks) > 0 {
 		return m.startBatch(s)
 	}
@@ -187,6 +212,7 @@ func (m Model) startAction(s action.Spec) (tea.Model, tea.Cmd) {
 		m.fail(fmt.Sprintf("error: %s does not apply to the tasks of %s", m.lastAction.Name, t.Backend))
 		return m, nil
 	}
+	s = s.WithWorkdir(m.lastWD) // set by the picker; `.` repeats it
 	interactive := m.actionTTY || s.Mode == action.ModeInteractive
 	s = s.WithRun(actionlog.NewRunID(), m.alog.Path())
 	if !m.confirmDuplicate(s, t, interactive) {
@@ -198,7 +224,7 @@ func (m Model) startAction(s action.Spec) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if interactive {
-		cmd, err := s.Cmd(t, m.actionDir)
+		cmd, release, err := s.Cmd(t, m.actionDir)
 		if err != nil {
 			m.releaseAfterRun(t, claimed)
 			m.fail("error: " + err.Error())
@@ -207,6 +233,7 @@ func (m Model) startAction(s action.Spec) (tea.Model, tea.Cmd) {
 		m.hooks.FireAction(t, s.Name, "tui", nil)
 		plan, started := s.Expand(t, m.actionDir), m.clock()
 		return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+			release()
 			if err != nil {
 				err = fmt.Errorf("%s: %w", s.Name, err)
 			}
@@ -217,10 +244,10 @@ func (m Model) startAction(s action.Spec) (tea.Model, tea.Cmd) {
 	return m, m.startBackground(s, t, false, claimed)
 }
 
-// claimAgent is who the board claims tasks as for s: $TKAN_AGENT, else the
-// action's name (so the fleet view tells the agents apart), else "tui".
+// claimAgent is who the board claims tasks as for s: $TACK_AGENT, else the
+// action's name (so the workers view tells the agents apart), else "tui".
 func claimAgent(s action.Spec) string {
-	if a := strings.TrimSpace(os.Getenv("TKAN_AGENT")); a != "" {
+	if a := strings.TrimSpace(os.Getenv("TACK_AGENT")); a != "" {
 		return a
 	}
 	if n := strings.TrimSpace(s.Name); n != "" {
@@ -379,13 +406,14 @@ func (m Model) markedTasks() []task.Task {
 // runs go at once, the other cards wait in queue, and one notice sums up when
 // the last run ends.
 type batch struct {
-	spec   action.Spec
-	queue  []task.Task // cards still to start, in board order
-	active int         // runs going
-	total  int
-	failed []string // "#ID" of the runs that failed
-	gone   []string // "#ID" of the cards that disappeared before their turn
-	busy   []string // "#ID" of the cards skipped: the action was already running on them
+	spec    action.Spec
+	queue   []task.Task // cards still to start, in board order
+	active  int         // runs going
+	total   int
+	failed  []string // "#ID" of the runs that failed
+	gone    []string // "#ID" of the cards that disappeared before their turn
+	busy    []string // "#ID" of the cards skipped: the action was already running on them
+	workdir string   // `w` override for every run ("" = the configured workdir)
 }
 
 // startBatch starts s on the marked cards in the background and clears the marks.
@@ -404,7 +432,7 @@ func (m Model) startBatch(s action.Spec) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	cards := m.markedTasks()
-	m.batch = &batch{spec: s, queue: cards, total: len(cards)}
+	m.batch = &batch{spec: s.WithWorkdir(m.lastWD), queue: cards, total: len(cards), workdir: m.lastWD}
 	m.marks = nil
 	m.lastAction, m.lastTTY = s, false
 	m.notice = fmt.Sprintf("started %s on %d cards, %d at a time (R: runs)", s.Name, len(cards), m.batchLimit())
@@ -443,6 +471,7 @@ func (m *Model) fillBatch() tea.Cmd {
 		if !ok { // the picker offered it for every marked card's backend
 			spec = b.spec
 		}
+		spec = spec.WithWorkdir(b.workdir)
 		cur, claimed, err := m.claimForRun(spec, cur, false)
 		if err != nil { // claimed by somebody else: like a card that is busy
 			b.busy = append(b.busy, "#"+t.ID)
@@ -548,7 +577,7 @@ func (m *Model) finishAction(msg actionDoneMsg) {
 	}
 	var outcomeErr error
 	if outcome.Wants(spec) {
-		_, outcomeErr = outcome.Apply(context.Background(), m.be, m.board, spec, msg.task, rec, canceled)
+		_, outcomeErr = outcome.Apply(context.Background(), m.be, m.board, spec, msg.task, rec, canceled, m.actionDir)
 	}
 	// The command may have changed the card behind an older copy of it: undoing a
 	// move or edit of it now would put that copy back over the changes.
@@ -592,7 +621,7 @@ func (m *Model) finishAction(msg actionDoneMsg) {
 // the cards as they are: typing, editing or confirming a delete.
 func (m Model) formOpen() bool {
 	switch m.mode {
-	case modeNew, modeEdit, modeFilter, modeQuick, modeConfirmDelete, modeMoveTo:
+	case modeNew, modeEdit, modeFilter, modeQuick, modeConfirmDelete, modeConfirmRelease, modeMoveTo:
 		return true
 	}
 	return false
@@ -680,11 +709,16 @@ func (m Model) actionsView() string {
 	if m.actionTTY {
 		b.WriteString(noteSty.Render("next action runs with the terminal (i toggles)") + "\n")
 	}
+	if in := m.actionWDIn; in != nil {
+		b.WriteString(in.View() + "\n")
+	} else if m.actionWD != "" {
+		b.WriteString(noteSty.Render("workdir: "+sanitize(m.actionWD)+" (w changes)") + "\n")
+	}
 	pos := ""
 	if len(m.actions) > room {
 		pos = fmt.Sprintf(" (%d-%d of %d)", start+1, end, len(m.actions))
 	}
-	b.WriteString(helpSty.Render("key or enter run · ↑↓ choose · i run with the terminal · esc cancel" + pos))
+	b.WriteString(helpSty.Render("key or enter run · ↑↓ choose · i run with the terminal · w workdir · esc cancel" + pos))
 	return b.String()
 }
 

@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"tkan/internal/board"
+	"tack/internal/board"
 )
 
 // lastLine is the status line at the bottom of the board view.

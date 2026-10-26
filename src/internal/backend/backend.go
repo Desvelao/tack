@@ -1,4 +1,4 @@
-// Package backend defines how tkan talks to a task store, a registry that
+// Package backend defines how tack talks to a task store, a registry that
 // selects the implementation by type name, and Set, which combines several
 // configured backends into one.
 package backend
@@ -13,7 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 var (
@@ -36,6 +36,12 @@ type expectation struct{ field, value string }
 // "guard":true).
 func WithExpect(ctx context.Context, field, value string) context.Context {
 	return context.WithValue(ctx, expectKey{}, expectation{field, value})
+}
+
+// WithoutExpect drops the guard of WithExpect, for a wrapper that has checked
+// it itself on data the wrapped backend does not hold.
+func WithoutExpect(ctx context.Context) context.Context {
+	return context.WithValue(ctx, expectKey{}, nil)
 }
 
 // Expected returns the guard set by WithExpect.
@@ -160,7 +166,7 @@ type registration struct {
 var registry = map[string]registration{}
 
 // RegisterType binds a backend type name ("csv") to a factory. exts are the
-// lowercase file extensions or URL schemes (".csv", "gh://") `tkan init`
+// lowercase file extensions or URL schemes (".csv", "gh://") `tack init`
 // uses to guess the type of a source. Call it from the backend's init().
 func RegisterType(typ string, f Factory, exts ...string) {
 	typ = strings.ToLower(typ)
@@ -234,7 +240,7 @@ type ExampleFunc func(location string) (Example, error)
 var examples = map[string]ExampleFunc{}
 
 // RegisterExample binds an example generator to a backend name ("csv").
-// Every backend should register one; `tkan init` uses it.
+// Every backend should register one; `tack init` uses it.
 func RegisterExample(name string, f ExampleFunc) {
 	name = strings.ToLower(name)
 	if _, dup := examples[name]; dup {

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 const item = "{id: 1, title: a, status: todo}"

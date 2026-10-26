@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/actionlog"
-	"tkan/internal/task"
+	"tack/internal/actionlog"
+	"tack/internal/task"
 )
 
 func TestTestEventDefaultsAndChecks(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -25,15 +26,23 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"tkan/internal/action"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/backend/filestore"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 // Spec is the `action_log:` section; set at most one of file and dir.
 type Spec struct {
 	File string `yaml:"file,omitempty"` // .jsonl, relative to the config file
 	Dir  string `yaml:"dir,omitempty"`  // one JSON file per run, relative to the config file
+	// MaxSize (KiB, file only): past it the file is moved to FILE.1 (replacing
+	// the one before), so the log on disk stays under about twice this. 0 = grows
+	// for ever.
+	MaxSize int `yaml:"max_size,omitempty"`
+	// Keep (dir only): how many run files to keep, the newest; older ones are
+	// deleted as new ones are written. 0 = keep all.
+	Keep int `yaml:"keep,omitempty"`
 }
 
 // Enabled reports whether any destination is set.
@@ -47,7 +56,7 @@ type Record struct {
 	Ended      time.Time `json:"ended"` // when it ended
 	DurationMS int64     `json:"duration_ms"`
 	Session    string    `json:"session"`
-	RunID      string    `json:"run_id,omitempty"` // the child's $TKAN_RUN_ID; `tkan report` records carry it too
+	RunID      string    `json:"run_id,omitempty"` // the child's $TACK_RUN_ID; `tack report` records carry it too
 	Source     string    `json:"source"`           // tui | cli | hook
 	Event      string    `json:"event,omitempty"`  // hook runs: the event that fired it (task.moved, ...); Action is then the hook's name
 	Action     string    `json:"action"`
@@ -59,12 +68,12 @@ type Record struct {
 	Error      string    `json:"error,omitempty"`
 	ExitCode   *int      `json:"exit_code,omitempty"`
 	Command    []string  `json:"command"`
-	Cwd        string    `json:"cwd,omitempty"`
+	Workdir    string    `json:"workdir,omitempty"`
 	Stdin      string    `json:"stdin,omitempty"`
 	Stdout     string    `json:"stdout,omitempty"`
 	Stderr     string    `json:"stderr,omitempty"`
 	Truncated  bool      `json:"truncated,omitempty"` // output was cut at the capture limit
-	// Report records (source "report", written by `tkan report`): what the agent said.
+	// Report records (source "report", written by `tack report`): what the agent said.
 	ReportStatus string `json:"report_status,omitempty"`
 	ReportNote   string `json:"report_note,omitempty"`
 }
@@ -80,9 +89,9 @@ func (r Record) Duration() time.Duration { return time.Duration(r.DurationMS) * 
 
 // Summary is the one line the audit trail keeps: action, time, exit status and
 // output sizes. It never holds what the command printed: the audit file is
-// less protected than the action log (0644 against 0600), and a token or a
-// prompt echoed by an agent must not end up there. An error is only included
-// when tkan made it up (timed out, canceled, could not start); a command that
+// kept for good (and may be shipped to a log collector, unlike the opt-in action
+// log), and a token or a prompt echoed by an agent must not end up there. An error is only included
+// when tack made it up (timed out, canceled, could not start); a command that
 // exited by itself is described by its exit status.
 func (r Record) Summary() string {
 	var b strings.Builder
@@ -144,7 +153,7 @@ func Interactive(s action.Spec, t task.Task, p action.Plan, started, ended time.
 func base(s action.Spec, t task.Task, p action.Plan, started, ended time.Time, err error, source string) Record {
 	r := Record{Time: started, Ended: ended, DurationMS: ended.Sub(started).Milliseconds(), Source: source,
 		Action: s.Name, Mode: s.Mode, Backend: t.Backend, ID: t.ID, Title: t.Title, Result: ResultOK,
-		Command: p.Argv, Cwd: p.Dir, Stdin: p.Stdin, RunID: s.Env["TKAN_RUN_ID"]} // p.Env is never stored
+		Command: p.Argv, Workdir: p.Dir, Stdin: p.Stdin, RunID: s.Env["TACK_RUN_ID"]} // p.Env is never stored
 	if len(r.Stdin) > maxStdin {
 		r.Stdin, r.Truncated = cutUTF8(r.Stdin, maxStdin), true
 	}
@@ -166,6 +175,9 @@ func NewRunID() string {
 type Log struct {
 	file, dir string
 	session   string
+	maxSize   int64 // bytes; 0 = no rotation
+	keep      int
+	appends   int // dir: appends so far, to prune now and then
 	mu        sync.Mutex
 }
 
@@ -182,13 +194,21 @@ func New(s Spec, baseDir, session string) (*Log, error) {
 	case file != "" && !strings.EqualFold(filepath.Ext(file), ".jsonl"):
 		return nil, fmt.Errorf("action_log.file %q: use a .jsonl file (or set dir for one JSON file per run)", file)
 	}
+	switch {
+	case s.MaxSize < 0 || s.Keep < 0:
+		return nil, errors.New("action_log: max_size and keep cannot be negative")
+	case s.MaxSize > 0 && file == "":
+		return nil, errors.New("action_log.max_size is for file; use keep with dir")
+	case s.Keep > 0 && dir == "":
+		return nil, errors.New("action_log.keep is for dir; use max_size with file")
+	}
 	abs := func(p string) string {
 		if filepath.IsAbs(p) {
 			return p
 		}
 		return filepath.Join(baseDir, p)
 	}
-	l := &Log{session: session}
+	l := &Log{session: session, maxSize: int64(s.MaxSize) << 10, keep: s.Keep}
 	if file != "" {
 		l.file = abs(file)
 	} else {
@@ -232,6 +252,19 @@ func (l *Log) Append(r Record) error {
 		if err := os.MkdirAll(filepath.Dir(l.file), 0o700); err != nil {
 			return fmt.Errorf("action log: %w", err)
 		}
+		if l.maxSize > 0 {
+			// Under a lock, so two tack processes do not rotate over each other.
+			unlock, err := filestore.LockFile(l.file+".lock", rotateLockWait)
+			if err != nil {
+				return fmt.Errorf("action log: %w", err)
+			}
+			defer unlock()
+			if st, err := os.Stat(l.file); err == nil && st.Size() > l.maxSize {
+				if err := os.Rename(l.file, l.file+".1"); err != nil {
+					return fmt.Errorf("action log: rotate: %w", err)
+				}
+			}
+		}
 		f, err := os.OpenFile(l.file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fmt.Errorf("action log: %w", err)
@@ -267,7 +300,48 @@ func (l *Log) Append(r Record) error {
 			f.Close()
 			return fmt.Errorf("action log: %w", err)
 		}
-		return f.Close()
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if l.appends++; l.keep > 0 && (l.appends == 1 || l.appends%pruneEvery == 0) {
+			l.prune()
+		}
+		return nil
+	}
+}
+
+// rotateLockWait is how long a rotating append waits for another tack.
+const rotateLockWait = 5 * time.Second
+
+// pruneEvery is how many appends pass between two prunes of a dir log (and the
+// first append prunes), so keeping the directory small costs a walk now and then.
+const pruneEvery = 20
+
+// runFiles lists the run files of a dir log, newest first (their names start
+// with the UTC start time).
+func (l *Log) runFiles() ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(l.dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".json") {
+			paths = append(paths, p)
+		}
+		return nil // skip what cannot be read
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	sort.Slice(paths, func(i, j int) bool { return filepath.Base(paths[i]) > filepath.Base(paths[j]) })
+	return paths, nil
+}
+
+// prune deletes the run files beyond the newest l.keep. Best effort. l.mu held.
+func (l *Log) prune() {
+	paths, err := l.runFiles()
+	if err != nil || len(paths) <= l.keep {
+		return
+	}
+	for _, p := range paths[l.keep:] {
+		_ = os.Remove(p)
 	}
 }
 
@@ -312,47 +386,43 @@ func (l *Log) Recent(includeOwn bool, n int) (recs []Record, older int, err erro
 		out = append(out, r)
 	}
 	if l.file != "" {
-		data, err := os.ReadFile(l.file)
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, 0, nil
-		}
-		if err != nil {
-			return nil, 0, err
-		}
-		// Line by line without a size limit: a huge record must not hide the later ones.
-		// Newest lines first, so the older ones need not be parsed.
-		for len(data) > 0 && (n <= 0 || len(out) < n) {
-			var line []byte
-			if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
-				data, line = data[:i], data[i+1:]
-			} else {
-				data, line = nil, data
+		// The current file, then FILE.1 (what a rotation moved aside), newest line
+		// first, each read from its end in chunks: the older lines are never parsed.
+		stopped := false
+		for _, p := range []string{l.file, l.file + ".1"} {
+			f, err := os.Open(p)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
 			}
-			var r Record
-			if line = bytes.TrimSpace(line); len(line) > 0 && json.Unmarshal(line, &r) == nil {
-				keep(r)
+			if err != nil {
+				return nil, 0, err
 			}
-		}
-		for len(data) > 0 {
-			var line []byte
-			line, data, _ = bytes.Cut(data, []byte{'\n'})
-			if len(bytes.TrimSpace(line)) > 0 {
-				older++
+			if stopped {
+				older += countLines(f, -1)
+				f.Close()
+				continue
+			}
+			unread, early, err := reverseLines(f, func(line []byte) bool {
+				var r Record
+				if line = bytes.TrimSpace(line); len(line) > 0 && json.Unmarshal(line, &r) == nil {
+					keep(r)
+				}
+				return n <= 0 || len(out) < n
+			})
+			if err == nil && early {
+				older += countLines(f, unread)
+				stopped = true
+			}
+			f.Close()
+			if err != nil {
+				return nil, 0, err
 			}
 		}
 	} else {
-		var paths []string
-		err := filepath.WalkDir(l.dir, func(p string, d fs.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && strings.HasSuffix(p, ".json") {
-				paths = append(paths, p)
-			}
-			return nil // skip what cannot be read
-		})
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		paths, err := l.runFiles()
+		if err != nil {
 			return nil, 0, err
 		}
-		// File names start with the UTC start time: newest first without reading them.
-		sort.Slice(paths, func(i, j int) bool { return filepath.Base(paths[i]) > filepath.Base(paths[j]) })
 		for i, p := range paths {
 			if n > 0 && len(out) >= n {
 				older = len(paths) - i
@@ -372,8 +442,84 @@ func (l *Log) Recent(includeOwn bool, n int) (recs []Record, older int, err erro
 	return out, older, nil
 }
 
+// chunk is how much of a log file is read at a time from its end.
+const chunk = 64 << 10
+
+// reverseLines calls visit with the lines of f, last first, reading backwards in
+// chunks. It stops when visit returns false; early then says that lines remain
+// and unread is the length of the part of the file before them (the lines in
+// [0, unread) were not visited).
+func reverseLines(f *os.File, visit func(line []byte) (more bool)) (unread int64, early bool, err error) {
+	off, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, false, err
+	}
+	var carry []byte // the start of the first line seen so far: its beginning is in an earlier chunk
+	buf := make([]byte, chunk)
+	for off > 0 {
+		n := int64(len(buf))
+		if off < n {
+			n = off
+		}
+		off -= n
+		if _, err := f.ReadAt(buf[:n], off); err != nil {
+			return 0, false, err
+		}
+		data := append(append([]byte(nil), buf[:n]...), carry...)
+		for {
+			i := bytes.LastIndexByte(data, '\n')
+			if i < 0 {
+				break
+			}
+			line := data[i+1:]
+			data = data[:i]
+			if !visit(line) {
+				return off + int64(len(data)), true, nil
+			}
+		}
+		carry = data
+	}
+	if len(carry) > 0 {
+		if !visit(carry) {
+			return 0, false, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// countLines is the number of lines in the first upto bytes of f (all of it when
+// upto < 0), counted without parsing: an estimate, as blank or damaged lines count.
+func countLines(f *os.File, upto int64) int {
+	if upto == 0 {
+		return 0
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0
+	}
+	r := io.Reader(f)
+	if upto > 0 {
+		r = io.LimitReader(f, upto)
+	}
+	buf := make([]byte, chunk)
+	lines, last := 0, byte('\n')
+	for {
+		n, err := r.Read(buf)
+		lines += bytes.Count(buf[:n], []byte{'\n'})
+		if n > 0 {
+			last = buf[n-1]
+		}
+		if err != nil {
+			break
+		}
+	}
+	if last != '\n' {
+		lines++ // the last line has no newline
+	}
+	return lines
+}
+
 // Fields are the names usable in a filter over records.
-var Fields = []string{"action", "mode", "result", "date", "time", "source", "event", "backend", "id", "title", "exit"}
+var Fields = []string{"action", "mode", "result", "date", "time", "source", "event", "backend", "id", "title", "exit", "run", "report_status"}
 
 // SearchFields are what a plain word of a filter is matched against.
 var SearchFields = []string{"action", "title", "id", "error"}
@@ -391,6 +537,8 @@ var FieldDocs = []query.FieldDoc{
 	{Name: "id", Desc: "id of the task it ran on"},
 	{Name: "title", Desc: "title of that task when it ran"},
 	{Name: "exit", Desc: "exit status of the command (not set when killed)"},
+	{Name: "run", Desc: "run id: run=ID lists a run and the tack report records made inside it"},
+	{Name: "report_status", Desc: "status a tack report record moved the task to"},
 }
 
 // Lookup exposes a record's fields to the query matcher.
@@ -424,6 +572,10 @@ func Lookup(r Record) query.Lookup {
 				return fmt.Sprint(*r.ExitCode), true
 			}
 			return "", true
+		case "run":
+			return r.RunID, true
+		case "report_status":
+			return r.ReportStatus, true
 		}
 		return "", false
 	}

@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/backend"
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/backend"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 type mem struct{ tasks []task.Task }
@@ -292,6 +292,25 @@ func TestDedupe(t *testing.T) {
 	eq(t, lines(), "task.appeared:1::poll", "task.appeared:1::poll", "task.disappeared:1::poll", "task.disappeared:1::poll")
 }
 
+// An event this process drops (a limit) must not keep the marker, or no other process could run it.
+func TestDedupeMarkerIsRemovedWhenTheEventIsDropped(t *testing.T) {
+	dd := spec("a", "", "task.appeared")
+	dd.Dedupe, dd.Unique = true, UniqueTask
+	run, _, lines, r := setup(t, dd)
+	other := New(append([]Spec(nil), run.specs...), run.baseDir, "tui", nil, r)
+	a := task.Task{ID: "1", Title: "a", Backend: "m"}
+
+	run.inflight[inflightKey{&run.specs[0], backend.Key("m", "1")}] = 1 // already running here
+	run.Diff([]task.Task{}, []task.Task{a}, nil, nil)
+	eq(t, lines())
+	if entries, _ := os.ReadDir(filepath.Join(run.baseDir, DedupeDir)); len(entries) != 0 {
+		t.Fatalf("marker of a dropped event kept: %v", entries)
+	}
+	other.Diff([]task.Task{}, []task.Task{a}, nil, nil)
+	other.Wait()
+	eq(t, lines(), "task.appeared:1::poll")
+}
+
 func TestReloadAndActionEvents(t *testing.T) {
 	run, _, lines, _ := setup(t,
 		spec("r", "", "reload.fail"),
@@ -368,7 +387,7 @@ func TestHugeOldTaskDoesNotBreakTheLaunch(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.txt")
 	s := spec("env", "", "task.moved")
-	s.Command = []string{"sh", "-c", `echo "${TKAN_OLD_TASK_JSON_OMITTED:-has-json}|${TKAN_TASK_JSON_OMITTED:-has-json}" >> ` + out}
+	s.Command = []string{"sh", "-c", `echo "${TACK_OLD_TASK_JSON_OMITTED:-has-json}|${TACK_TASK_JSON_OMITTED:-has-json}" >> ` + out}
 	if err := ValidateAll([]Spec{s}); err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +611,7 @@ func TestChildGetsDepthAndChain(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "env.txt")
 	s := spec("b", "", "task.update")
-	s.Command = []string{"sh", "-c", `echo "$TKAN_HOOK_DEPTH $TKAN_HOOK_CHAIN" > ` + out}
+	s.Command = []string{"sh", "-c", `echo "$TACK_HOOK_DEPTH $TACK_HOOK_CHAIN" > ` + out}
 	if err := ValidateAll([]Spec{s}); err != nil {
 		t.Fatal(err)
 	}
@@ -989,7 +1008,7 @@ func TestColumnPlaceholders(t *testing.T) {
 	}
 	run := New([]Spec{s}, t.TempDir(), "cli", (*actionlog.Log)(nil), &rec{})
 	run.SetBoard(columnSpec())
-	p := run.plan(&run.specs[0], Event{Name: TaskMoved, HasOld: true, Old: task.Task{Status: "backlog"}, New: task.Task{Status: "doing"}}, task.Task{Status: "doing"})
+	_, p := run.plan(&run.specs[0], Event{Name: TaskMoved, HasOld: true, Old: task.Task{Status: "backlog"}, New: task.Task{Status: "doing"}}, task.Task{Status: "doing"})
 	if got := strings.Join(p.Argv, " "); got != "true Doing Todo doing" {
 		t.Fatalf("argv %q", got)
 	}
@@ -1038,5 +1057,72 @@ func TestColumnEventNamesValidate(t *testing.T) {
 	w.Command = []string{"true"}
 	if err := ValidateAll([]Spec{w}); err == nil {
 		t.Error("when: accepted on an event without a task")
+	}
+}
+
+func TestDiffMovedAndChanged(t *testing.T) {
+	run, _, lines, _ := setup(t, spec("m", "", "task.moved"), spec("c", "", "task.changed"))
+	a := task.Task{ID: "1", Title: "a", Status: "x", Backend: "m"}
+
+	moved := a
+	moved.Status = "y"
+	run.Diff([]task.Task{a}, []task.Task{moved}, nil, nil)
+	eq(t, lines(), "task.moved:1:x:poll", "task.changed:1:x:poll")
+
+	labelled := a
+	labelled.Labels = "bug"
+	run.Diff([]task.Task{a}, []task.Task{labelled}, nil, nil)
+	eq(t, lines(), "task.moved:1:x:poll", "task.changed:1:x:poll", "task.changed:1:x:poll")
+
+	// a lease renewal, an own write and an incomplete backend are not news
+	leased := a
+	leased.Lease = "2030-01-01T00:00:00Z"
+	run.Diff([]task.Task{a}, []task.Task{leased}, nil, nil)
+	run.Diff([]task.Task{a}, []task.Task{labelled}, map[string]bool{backend.Key("m", "1"): true}, nil)
+	run.Diff([]task.Task{a}, []task.Task{labelled}, nil, map[string]bool{"m": true})
+	eq(t, lines(), "task.moved:1:x:poll", "task.changed:1:x:poll", "task.changed:1:x:poll")
+}
+
+// Cancel is final: what is fired afterwards does not run (see its doc comment).
+func TestFiringAfterCancelDoesNotRun(t *testing.T) {
+	s := spec("slow", "", "task.moved")
+	run, r, _ := slowRunner(t, s, "0")
+	run.Cancel()
+	fireIDs(run, TaskMoved, "late")
+	run.Wait()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.entries {
+		if e.Result == audit.ResultOK {
+			t.Errorf("a hook fired after Cancel ran fine: %+v", e)
+		}
+	}
+}
+
+// A hook run gets a run id like an action run: in its environment, in its
+// record, and with the action log's path.
+func TestHookRunHasARunID(t *testing.T) {
+	t.Setenv(DepthEnv, "")
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	s := spec("ids", "", "task.moved")
+	s.Command = []string{"sh", "-c", `echo "$TACK_RUN_ID $TACK_ACTION_LOG" >> ` + out}
+	if err := ValidateAll([]Spec{s}); err != nil {
+		t.Fatal(err)
+	}
+	alog, err := actionlog.New(actionlog.Spec{File: "actions.jsonl"}, dir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := New([]Spec{s}, dir, "cli", alog, &rec{})
+	rec1 := run.Test(&run.specs[0], Event{Name: TaskMoved, New: task.Task{ID: "1", Backend: "m"}})
+	rec2 := run.Test(&run.specs[0], Event{Name: TaskMoved, New: task.Task{ID: "2", Backend: "m"}})
+	if rec1.RunID == "" || rec2.RunID == "" || rec1.RunID == rec2.RunID {
+		t.Fatalf("run ids %q %q", rec1.RunID, rec2.RunID)
+	}
+	b, _ := os.ReadFile(out)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2 || lines[0] != rec1.RunID+" "+alog.Path() {
+		t.Errorf("environment: %q (want %q first)", lines, rec1.RunID+" "+alog.Path())
 	}
 }

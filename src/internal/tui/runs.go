@@ -8,10 +8,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 const (
@@ -153,7 +153,7 @@ func (m Model) runMarker(t task.Task, width int) string {
 	return lipgloss.NewStyle().MaxWidth(width).Render(line)
 }
 
-// cancelAll kills every run still going (tkan is quitting).
+// cancelAll kills every run still going (tack is quitting).
 func (l *runLog) cancelAll() {
 	if l == nil {
 		return
@@ -392,7 +392,7 @@ func (m Model) runsView() string {
 	if m.alog.Enabled() {
 		where = "this session + " + m.alog.Path()
 	}
-	head := titleSty.Render("tkan runs") + metaSty.Render(fmt.Sprintf("  %d runs · %s", len(items), where))
+	head := titleSty.Render("tack runs") + metaSty.Render(fmt.Sprintf("  %d runs · %s", len(items), where))
 	if m.runOlder > 0 {
 		head += noteSty.Render(fmt.Sprintf("  +%d older, A loads", m.runOlder))
 	}
@@ -483,7 +483,7 @@ func (m Model) runOutputLines(rec actionlog.Record) []string {
 	}
 	wrap := lipgloss.NewStyle().Width(w)
 	var text strings.Builder
-	text.WriteString("--- command (in " + sanitize(rec.Cwd) + ") ---\n" + sanitize(action.Plan{Argv: rec.Command}.Line()))
+	text.WriteString("--- command (in " + sanitize(rec.Workdir) + ") ---\n" + sanitize(action.Plan{Argv: rec.Command}.Line()))
 	if rec.Stdin != "" {
 		text.WriteString("\n\n--- stdin ---\n" + strings.TrimRight(sanitize(rec.Stdin), "\n"))
 	}

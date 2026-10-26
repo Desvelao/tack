@@ -111,7 +111,7 @@ func TestExclusiveAllowsOneRunPerCard(t *testing.T) {
 func TestInteractiveTimeoutEndsTheCommand(t *testing.T) {
 	s := spec("sh", "-c", "sleep 30")
 	s.InteractiveTimeout, s.KillGrace = "200ms", "0s"
-	cmd, err := s.Cmd(sample, t.TempDir())
+	cmd, done, err := s.Cmd(sample, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,9 +119,30 @@ func TestInteractiveTimeoutEndsTheCommand(t *testing.T) {
 	if err := cmd.Run(); err == nil {
 		t.Fatal("no error")
 	}
+	done()
 	if time.Since(start) > 3*time.Second {
 		t.Fatalf("took %s", time.Since(start))
 	}
+}
+
+func TestCmdDoneReleasesTheTimeout(t *testing.T) {
+	s := spec("sh", "-c", "exit 0")
+	s.InteractiveTimeout = "1h"
+	cmd, done, err := s.Cmd(sample, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	done()
+	done() // safe to repeat
+	// done cancelled the command's context, so it cannot start any more.
+	if err := cmd.Start(); err == nil {
+		t.Error("the timeout context should be released after done")
+	}
+	_, none, err := spec("true").Cmd(sample, t.TempDir())
+	if err != nil || none == nil {
+		t.Fatalf("without a timeout done must still be callable: err=%v", err)
+	}
+	none()
 }
 
 func TestValidateNewKeys(t *testing.T) {

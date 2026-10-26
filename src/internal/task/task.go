@@ -49,6 +49,35 @@ type Task struct {
 	// Extra holds backend-specific fields the model does not know about.
 	// Backends must round-trip them untouched.
 	Extra map[string]string `json:"extra,omitempty"`
+
+	// Overlaid names the logical fields whose value comes from a local overlay
+	// (see internal/backend/overlay), not from the store. Set on read by the
+	// overlay only; backends neither store nor compare it.
+	Overlaid []string `json:"overlaid,omitempty"`
+}
+
+// OverlayMark follows a value that comes from a local overlay, wherever it is
+// shown as text.
+const OverlayMark = "⌂"
+
+// Marked is text (the display of the logical field) with the OverlayMark
+// appended when the field's value comes from a local overlay.
+func (t Task) Marked(field, text string) string {
+	if text != "" && t.IsOverlaid(field) {
+		return text + OverlayMark
+	}
+	return text
+}
+
+// IsOverlaid reports whether the value of the logical field comes from a local
+// overlay.
+func (t Task) IsOverlaid(field string) bool {
+	for _, f := range t.Overlaid {
+		if f == field {
+			return true
+		}
+	}
+	return false
 }
 
 // Clone returns a deep copy.
@@ -59,6 +88,9 @@ func (t Task) Clone() Task {
 			m[k] = v
 		}
 		t.Extra = m
+	}
+	if t.Overlaid != nil {
+		t.Overlaid = append([]string(nil), t.Overlaid...)
 	}
 	return t
 }
@@ -221,7 +253,8 @@ var FieldNames = []string{"id", "title", "description", "status", "priority", "n
 // Merge applies to cur only what edited changed relative to base: each logical
 // field and extra key whose value differs between the two. Whatever someone
 // else changed in cur meanwhile, and edited did not touch, is kept. The ID and
-// the Backend are cur's.
+// the Backend are cur's. So is Overlaid: it only says where cur's values came
+// from, and edited's copy is never consulted.
 func Merge(cur, base, edited Task) Task {
 	out := cur.Clone()
 	for _, f := range FieldNames {

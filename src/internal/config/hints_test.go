@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/board"
-	"tkan/internal/hook"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/board"
+	"tack/internal/hook"
 )
 
 // yamlKeys lists the yaml keys of a struct type, following inlined structs.
@@ -39,6 +39,7 @@ func TestValidKeysMatchTheStructs(t *testing.T) {
 		"config.Config":    reflect.TypeOf(Config{}),
 		"config.Entry":     reflect.TypeOf(Entry{}),
 		"config.AuditSpec": reflect.TypeOf(AuditSpec{}),
+		"config.Overlay":   reflect.TypeOf(Overlay{}),
 		"board.Spec":       reflect.TypeOf(board.Spec{}),
 		"board.ColumnSpec": reflect.TypeOf(board.ColumnSpec{}),
 		"board.ViewSpec":   reflect.TypeOf(board.ViewSpec{}),
@@ -47,7 +48,7 @@ func TestValidKeysMatchTheStructs(t *testing.T) {
 		"hook.Spec":        reflect.TypeOf(hook.Spec{}),
 	}
 	// Decoded but refused by validation, so not worth suggesting.
-	notSuggested := map[string][]string{"hook.Spec": {"label", "key", "mode", "show", "notify", "interactive_timeout", "claim"}}
+	notSuggested := map[string][]string{"hook.Spec": {"label", "title", "labels", "key", "mode", "show", "notify", "interactive_timeout", "claim"}}
 	for name, typ := range types {
 		info, ok := validKeys[name]
 		if !ok {

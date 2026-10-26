@@ -14,10 +14,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/backendtest"
-	"tkan/internal/backend/filestore"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/backend/backendtest"
+	"tack/internal/backend/filestore"
+	"tack/internal/task"
 )
 
 const sample = `id,title,description,status,priority,notes,type,owner
@@ -184,6 +184,29 @@ func TestCRLFPreserved(t *testing.T) {
 	want := "id,title,status\r\n1,\"a\nb\",done\r\n2,c,done\r\n"
 	if string(got) != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// Excel writes \r\n inside quoted cells too; encoding/csv reads them as \n, so
+// they have to be put back.
+func TestCRLFInsideCellsPreserved(t *testing.T) {
+	for name, in := range map[string]string{
+		"crlf file": "id,title,status\r\n1,\"a\r\nb\",pending\r\n2,c,done\r\n",
+		"lf file":   "id,title,status\n1,\"a\r\nb\",pending\n2,c,done\n",
+	} {
+		p := write(t, in)
+		b, _ := Open(mk(p))
+		ctx := context.Background()
+		tasks, _ := b.List(ctx)
+		tasks[1].Status = "pending"
+		if err := b.Update(ctx, tasks[1]); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := os.ReadFile(p)
+		want := strings.Replace(in, "2,c,done", "2,c,pending", 1)
+		if string(got) != want {
+			t.Errorf("%s: got %q want %q", name, got, want)
+		}
 	}
 }
 
@@ -674,16 +697,16 @@ func TestLockTimesOutWithAClearErrorInsteadOfHanging(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := be.(*Backend)
-	b.lockTimeout = 150 * time.Millisecond
+	b.LockTimeout = 150 * time.Millisecond
 
-	release, err := filestore.LockFile(p+".lock", time.Second) // another tkan holds the lock
+	release, err := filestore.LockFile(p+".lock", time.Second) // another tack holds the lock
 	if err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
 	_, err = b.Create(context.Background(), task.Task{Title: "blocked", Status: "pending"})
 	took := time.Since(start)
-	if err == nil || !strings.Contains(err.Error(), "locked by another tkan") {
+	if err == nil || !strings.Contains(err.Error(), "locked by another tack") {
 		t.Fatalf("got %v", err)
 	}
 	if took < 100*time.Millisecond || took > 2*time.Second {

@@ -1,7 +1,7 @@
 # Filtering
 
 Press `/` on the board, type a query and press `enter`. The same language is available on the
-command line as `tkan list -q QUERY`, and `tkan help filter` prints this reference.
+command line as `tack list -q QUERY`, and `tack help filter` prints this reference.
 In the board, `?` shows the keys and `tab` flips to the filter syntax; typing `?` in an empty
 filter prompt jumps straight to it.
 
@@ -20,11 +20,13 @@ Terms are separated by spaces and **all** must match. Matching is case-insensiti
 | `field!=value` | field is **not** equal to value |
 | `field^value` | field **starts with** value |
 | `field~regex` | field matches the regular expression (Go/RE2 syntax, case-insensitive) |
-| `field<value` | field sorts before value; also `>`, `<=`, `>=` (numbers compare as numbers, so `story_points>=5` works; otherwise text order, so ISO dates work: `due<2026-12-01`; empty fields never match). Dates may be relative: `today`, `tomorrow`, `yesterday`, `today+7d`, `today-2w`, `today+1m` (`d` days, `w` weeks, `m` months, `y` years; a malformed one such as `today+7` or `due<tomorow` is an error, not text), also with `=` and `!=` |
+| `field<value` | field sorts before value; also `>`, `<=`, `>=` (numbers compare as numbers, so `story_points>=5` works; otherwise text order, so ISO dates work: `due<2026-12-01`; empty fields never match). On `priority` they order by urgency, a greater priority being a more urgent one: `priority>=high` is high and critical, `priority<medium` is low and trivial (aliases rank with their word, `p1` = `high`; an unknown value is an error; a card with no priority never matches). Dates may be relative: `today`, `tomorrow`, `yesterday`, `today+7d`, `today-2w`, `today+1m` (`d` days, `w` weeks, `m` months, `y` years; a malformed one such as `today+7` or `due<tomorow` is an error, not text), also with `=` and `!=`, but only on date fields (`due`, `start`, `lease`, `claimed_at`; a label or title named `today` is plain text); `+1m` / `+1y` stop at the end of a shorter month (Jan 31 + 1m is Feb 28) |
 | `field=` | field is **empty** |
 | `field!=` | field **has a value** |
 | `a OR b` | either side matches (also `\|`); terms bind tighter than `OR`, so `priority=high col:doing OR type=fix` is *(high and doing)* or *fix*. A quoted `"OR"` is plain text, lower-case `or` too. No parentheses |
 | `a,b` | in a value: any of them (`priority=high,medium`). With `!:`/`!=`: none of them. Not split for `~` |
+
+Only `!=` and `!:` negate a field; `field!~regex` and `field!^prefix` are errors (use `-text` to exclude plain text).
 
 `labels` is a list: `labels=ops`, `labels!=ops` and `labels^op` test the single labels (whole label, or label starting with the value), so `labels=ops` does not match `devops`; `labels:ops` still searches the whole text, `labels=` means no labels.
 
@@ -32,7 +34,7 @@ Terms are separated by spaces and **all** must match. Matching is case-insensiti
 
 ### Fields
 
-The same text is on the third page of the board's help (`?`, then `tab` twice) and in `tkan help filter`.
+The same text is on the third page of the board's help (`?`, then `tab` twice) and in `tack help filter`.
 
 | Field | Meaning |
 |---|---|
@@ -43,7 +45,7 @@ The same text is on the third page of the board's help (`?`, then `tab` twice) a
 | `priority` | free text, usually low / medium / high |
 | `notes` | free text added while working on it |
 | `type` | kind of task, for example fix, feature, chore |
-| `assignee`, `lease`, `claimed_at` | claim: who, until when, since when (`tkan claim`) |
+| `assignee`, `lease`, `claimed_at` | claim: who, until when, since when (`tack claim`) |
 | `due`, `start` | due and start dates, `YYYY-MM-DD`: `due<today+7d` |
 | `labels` | comma separated; `labels=ops` is one whole label |
 | `blocked_by` | ids of tasks to finish first, comma separated |
@@ -55,22 +57,30 @@ The same text is on the third page of the board's help (`?`, then `tab` twice) a
 
 `blocked` and `ready` are computed from the whole task list: a task is **blocked** (`blocked=yes`,
 `ready=no`) while one of the ids in its `blocked_by` names a task of the same backend that is not in
-a finished column (Done, Closed, Released, ... as for overdue dates; `failed` is not finished). An id
+a finished column (Done, Closed, Released, ... guessed from the name as for overdue dates, or set with `finished:` on the column in [config.md](config.md); `failed` is not finished). An id
 that names no task (deleted, a typo, a backend that failed to load) and the task's own id do not
-block. They work in the board, `list`, `count` and `labels`, but not in a hook's `when:` (an event
+block. Tasks that block each other in a ring (`A` by `B`, `B` by `A`) can never become ready: `list`, `count` and `next` warn on stderr (`blocked_by cycle csv1:1 -> csv1:2 -> csv1:1`), the board header names the ring, and `run` says so when it refuses one. They work in the board, `list`, `count` and `labels`, but not in a hook's `when:` (an event
 carries one task); test `blocked_by` there.
 
 `running` is `yes` while a background action started from this board (`x`, `.`, marked cards) is
 going on the card, `no` otherwise; it follows the runs live, so `running=yes` is a view of the cards
 being worked on. Only the board knows its runs: in `list`, `count` and `labels` the field is empty
-(`running=yes` matches nothing) and a hook's `when:` rejects it. Runs started by `tkan run` in
+(`running=yes` matches nothing) and a hook's `when:` rejects it. Runs started by `tack run` in
 another process or by hooks are not counted.
+
+### Quoting rules
+
+- Spaces separate terms unless they are inside double quotes; `\"` is a literal quote only *inside* quotes. A quote must close: `"open` is an error.
+- Quotes are removed from the value wherever they sit (`title:"a b"`, `"fix login"`, `-"fix login"`), and `\"` becomes `"`.
+- An empty term (`""`, `-""`, `title~""`) is an error.
+- A comma inside quotes is part of the value (`title:"a,b"`); outside quotes it separates alternatives (`priority=high,medium`).
+- `~` takes its whole value as one pattern, unquoted of `"` and `\"` only: commas are not alternatives (use `|`: `title~"bug|fix"`), and a pattern with spaces needs quotes. A literal `"` in a pattern is written `\"`.
 
 An unknown field is rejected with the list of valid ones. To search for text that looks like a field, quote it: `"http://x"`.
 
-#### Audit fields (`tkan audit -q`, `A` in the board)
+#### Audit fields (`tack audit -q`, `A` in the board)
 
-`?` in the filter prompt of the audit view opens the same help for these; `tkan help filter audit` prints it.
+`?` in the filter prompt of the audit view opens the same help for these; `tack help filter audit` prints it.
 
 | Field | Meaning |
 |---|---|
@@ -86,9 +96,9 @@ An unknown field is rejected with the list of valid ones. To search for text tha
 
 A plain word matches `details`, `op` and `date`.
 
-#### Action run fields (`tkan runs -q`, `R` in the board)
+#### Action run fields (`tack runs -q`, `R` in the board)
 
-`?` in the filter prompt of the runs view, or `tkan help filter runs`.
+`?` in the filter prompt of the runs view, or `tack help filter runs`.
 
 | Field | Meaning |
 |---|---|
@@ -103,6 +113,8 @@ A plain word matches `details`, `op` and `date`.
 | `id` | id of the task it ran on |
 | `title` | title of that task when it ran |
 | `exit` | exit status of the command (not set when killed) |
+| `run` | run id (`TACK_RUN_ID`): `run=ID` lists a run together with the `tack report` records made inside it |
+| `report_status` | status a `tack report` record moved the task to |
 
 A plain word matches `action`, `title`, `id` and `error`.
 

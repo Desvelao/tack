@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"strings"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/filestore"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/backend/filestore"
+	"tack/internal/task"
 )
 
 func init() {
@@ -99,6 +99,7 @@ func toRecord(ms []member) (filestore.Record, error) {
 
 // Records parses the content of a json/jsonl file into records.
 func Records(data []byte, lines bool, path []string) ([]filestore.Record, error) {
+	data, _ = filestore.StripBOM(data)
 	if lines {
 		var out []filestore.Record
 		for n, line := range bytes.Split(data, []byte("\n")) {
@@ -118,7 +119,7 @@ func Records(data []byte, lines bool, path []string) ([]filestore.Record, error)
 		}
 		return out, nil
 	}
-	data = bytes.TrimSpace(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")))
+	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -223,7 +224,7 @@ func setAt(doc []byte, path []string, val []byte) ([]byte, error) {
 		if w.Len() > 1 {
 			w.WriteByte(',')
 		}
-		k, _ := json.Marshal(key)
+		k := quote(key)
 		w.Write(k)
 		w.WriteByte(':')
 		w.Write(raw)
@@ -257,7 +258,7 @@ func setAt(doc []byte, path []string, val []byte) ([]byte, error) {
 }
 
 // ArrayPaths lists the dotted paths of the arrays of objects in a JSON
-// document (objects are followed up to four levels), for `tkan init`.
+// document (objects are followed up to four levels), for `tack init`.
 func ArrayPaths(data []byte) []string {
 	var out []string
 	var walk func(raw []byte, prefix []string)
@@ -310,33 +311,45 @@ func (c *codec) Decode(data []byte) ([]task.Task, error) {
 	return tasks, nil
 }
 
+// quote is s as a JSON string. Unlike json.Marshal it leaves & < > as they are,
+// so saving a file does not rewrite "A & B" as "A \u0026 B" in a hand-edited
+// or git-tracked backlog.
+func quote(s string) []byte {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s) // a string always encodes
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
+}
+
 func writeRecord(buf *bytes.Buffer, r filestore.Record) {
 	buf.WriteByte('{')
 	for i, f := range r {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		k, _ := json.Marshal(f.Key)
+		k := quote(f.Key)
 		buf.Write(k)
 		buf.WriteByte(':')
 		if f.Typed && json.Valid([]byte(f.Text)) {
 			buf.WriteString(f.Text)
 			continue
 		}
-		v, _ := json.Marshal(f.Text)
+		v := quote(f.Text)
 		buf.Write(v)
 	}
 	buf.WriteByte('}')
 }
 
 func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
+	prev, bom := filestore.StripBOM(prev)
 	var out bytes.Buffer
 	if c.lines {
 		for _, t := range tasks {
 			writeRecord(&out, c.m.Record(t))
 			out.WriteByte('\n')
 		}
-		return out.Bytes(), nil
+		return filestore.WithBOM(out.Bytes(), bom), nil
 	}
 	var arr bytes.Buffer
 	arr.WriteByte('[')
@@ -351,14 +364,14 @@ func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
 	doc := arr.Bytes()
 	if c.path != nil {
 		var err error
-		if doc, err = setAt(bytes.TrimPrefix(prev, []byte("\xef\xbb\xbf")), c.path, doc); err != nil {
+		if doc, err = setAt(prev, c.path, doc); err != nil {
 			return nil, err
 		}
 		prev = nil
 	}
 	// Keep the shape of the document: an object with a `tasks` key stays one,
 	// with its other keys.
-	if p := bytes.TrimSpace(bytes.TrimPrefix(prev, []byte("\xef\xbb\xbf"))); len(p) > 0 && p[0] == '{' {
+	if p := bytes.TrimSpace(prev); len(p) > 0 && p[0] == '{' {
 		ms, err := objectMembers(json.NewDecoder(bytes.NewReader(p)))
 		if err != nil {
 			return nil, err
@@ -369,7 +382,7 @@ func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
 			if i > 0 {
 				w.WriteByte(',')
 			}
-			k, _ := json.Marshal(m.key)
+			k := quote(m.key)
 			w.Write(k)
 			w.WriteByte(':')
 			if m.key == "tasks" {
@@ -388,5 +401,5 @@ func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
 		}
 		doc = ind.Bytes()
 	}
-	return append(append([]byte(nil), doc...), '\n'), nil
+	return filestore.WithBOM(append(append([]byte(nil), doc...), '\n'), bom), nil
 }

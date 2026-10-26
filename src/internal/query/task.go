@@ -3,8 +3,8 @@ package query
 import (
 	"strings"
 
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 // DerivedFields are computed from the whole task list, not stored: blocked

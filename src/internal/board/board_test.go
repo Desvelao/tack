@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 func spec() Spec {
@@ -91,11 +91,12 @@ func TestLookupPrefersNameThenValue(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	cases := map[string]Spec{
-		"duplicate column":               {Columns: []ColumnSpec{{Name: "a"}, {Name: "A"}}},
-		"mapped to both":                 {Columns: []ColumnSpec{{Name: "a", Values: []string{"x"}}, {Name: "b", Values: []string{"X"}}}},
-		"name is required":               {Columns: []ColumnSpec{{Name: " "}}},
-		"unmapped":                       {Unmapped: "nope"},
-		"board.agents[1]: name is empty": {Agents: []string{"claude", " "}},
+		"duplicate column":                            {Columns: []ColumnSpec{{Name: "a"}, {Name: "A"}}},
+		"mapped to both":                              {Columns: []ColumnSpec{{Name: "a", Values: []string{"x"}}, {Name: "b", Values: []string{"X"}}}},
+		"name is required":                            {Columns: []ColumnSpec{{Name: " "}}},
+		"unmapped":                                    {Unmapped: "nope"},
+		`"Bot" and "bot" are the same agent`:          {Avatars: map[string][]string{"bot": {"b"}, "Bot": {"B"}}},
+		"board.agents[1]: name is empty":              {Agents: []string{"claude", " "}},
 		`write "inprogress" is not one of its values`: {Columns: []ColumnSpec{{Name: "Doing", Values: []string{"in_progress", "wip"}, Write: "inprogress"}}},
 	}
 	for want, s := range cases {
@@ -232,5 +233,83 @@ func TestDeps(t *testing.T) {
 	}
 	if !d.Blocked(tasks[3]) || d.Blocked(tasks[2]) || (Deps{}).Blocked(tasks[3]) {
 		t.Error("Blocked")
+	}
+}
+
+func TestFinishedColumnsFollowTheNameUnlessConfigured(t *testing.T) {
+	yes, no := true, false
+	b, err := New(Spec{Columns: []ColumnSpec{
+		{Name: "Todo"},
+		{Name: "Done"},                    // guessed from the name
+		{Name: "Hecho", Finished: &yes},   // not an English name: configured
+		{Name: "Released", Finished: &no}, // a name that would be guessed, switched off
+		{Name: "Live", Values: []string{"live", "prod"}, Finished: &yes},
+	}}, []string{"closed", "weird"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range b.Columns {
+		got[c.Name] = c.Done
+	}
+	want := map[string]bool{"Todo": false, "Done": true, "Hecho": true, "Released": false, "Live": true, "closed": true, "weird": false}
+	for n, w := range want {
+		if got[n] != w {
+			t.Errorf("%s: finished %v, want %v", n, got[n], w)
+		}
+	}
+	// blocked_by follows the configuration: a card in "Hecho" no longer blocks.
+	tasks := []task.Task{
+		{ID: "1", Backend: "b", Status: "hecho"},
+		{ID: "2", Backend: "b", Status: "todo", BlockedBy: "1"},
+		{ID: "3", Backend: "b", Status: "released"},
+		{ID: "4", Backend: "b", Status: "todo", BlockedBy: "3"},
+	}
+	d := b.Deps(tasks)
+	if len(d.Blockers(tasks[1])) != 0 {
+		t.Errorf("a card in a finished:true column still blocks: %v", d.Blockers(tasks[1]))
+	}
+	if len(d.Blockers(tasks[3])) != 1 {
+		t.Errorf("a card in a finished:false column must block: %v", d.Blockers(tasks[3]))
+	}
+}
+
+func TestDepsCycles(t *testing.T) {
+	b, _ := New(DefaultSpec(), nil)
+	mk := func(id, status, blockedBy string) task.Task {
+		return task.Task{ID: id, Backend: "b", Status: status, BlockedBy: blockedBy}
+	}
+	tasks := []task.Task{
+		mk("A", "pending", "B"), mk("B", "pending", "C"), mk("C", "pending", "A"), // A -> B -> C -> A
+		mk("D", "pending", "E"), mk("E", "pending", "D"), // a second ring
+		mk("F", "pending", "F"),          // names itself: ignored, not a cycle
+		mk("G", "pending", "H"),          // chain into a finished card: no cycle
+		mk("H", "done", "G"),             // finished: breaks the ring
+		mk("I", "pending", "A"),          // blocked by a ring but not on it
+		mk("J", "pending", "J2,missing"), // unknown ids are ignored
+	}
+	d := b.Deps(tasks)
+	var got []string
+	for _, c := range d.Cycles() {
+		got = append(got, c.String())
+	}
+	want := []string{"b:A -> b:B -> b:C -> b:A", "b:D -> b:E -> b:D"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cycles %q, want %q", got, want)
+	}
+	if c, ok := d.CycleOf(tasks[1]); !ok || c.String() != "b:B -> b:C -> b:A -> b:B" {
+		t.Errorf("CycleOf(B) = %v %v", c, ok)
+	}
+	for _, id := range []string{"F", "G", "I", "J"} {
+		for _, tk := range tasks {
+			if tk.ID == id {
+				if c, ok := d.CycleOf(tk); ok {
+					t.Errorf("%s is not on a cycle but got %v", id, c)
+				}
+			}
+		}
+	}
+	if len(b.Deps(nil).Cycles()) != 0 {
+		t.Error("no tasks, no cycles")
 	}
 }

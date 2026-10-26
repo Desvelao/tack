@@ -4,14 +4,17 @@
 package filestore
 
 import (
+	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"time"
 )
 
-// LockTimeout is how long a write waits for another tkan holding the file lock.
+// LockTimeout is how long a write waits for another tack holding the file lock.
 const LockTimeout = 5 * time.Second
 
 // hashWindow and hashMax bound the content hash: only files that are small and
@@ -34,6 +37,18 @@ type Stamp struct {
 	Ino   uint64
 	Ctime int64
 	Hash  uint64
+}
+
+// Same reports whether b is the same version of the file as s. The content hash
+// is taken only while a file is fresh (hashWindow), so a stamp taken right after
+// a write has one and the same file stamped later does not: the hash decides
+// only when both stamps have one.
+func (s Stamp) Same(b Stamp) bool {
+	if s.Hash != 0 && b.Hash != 0 && s.Hash != b.Hash {
+		return false
+	}
+	s.Hash, b.Hash = 0, 0
+	return s == b
 }
 
 // StatFile returns the current Stamp of path (following symlinks).
@@ -61,6 +76,21 @@ func StampOf(path string, st os.FileInfo) Stamp {
 	return s
 }
 
+// createTemp makes the temporary file next to the target. Unlike os.CreateTemp
+// (always 0600) it asks for 0666, so a file created for the first time gets the
+// mode the umask gives any file, like the backlog itself.
+func createTemp(dir string) (*os.File, error) {
+	for i := 0; i < 100; i++ {
+		name := filepath.Join(dir, fmt.Sprintf(".tack-%d.tmp", rand.Uint64()))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, fmt.Errorf("cannot create a temporary file in %s", dir)
+}
+
 // WriteAtomic replaces path with data through a temp file + rename in the same
 // directory (writing through a symlink instead of replacing it). It returns the
 // Stamp of the new file (content taken before the rename so that an external
@@ -71,7 +101,7 @@ func WriteAtomic(path string, data []byte) (Stamp, error) {
 		target = real
 	}
 	dir := filepath.Dir(target)
-	tmp, err := os.CreateTemp(dir, ".tkan-*.tmp")
+	tmp, err := createTemp(dir)
 	if err != nil {
 		return Stamp{}, err
 	}
@@ -92,7 +122,10 @@ func WriteAtomic(path string, data []byte) (Stamp, error) {
 		return Stamp{}, err
 	}
 	if st, err := os.Stat(target); err == nil {
+		// Replacing a file keeps its mode and, as far as we are allowed to, its
+		// owner and group (a backlog shared by users or containers).
 		_ = os.Chmod(tmpName, st.Mode().Perm())
+		copyOwner(tmpName, st)
 	}
 	cur, err := StatFile(tmpName)
 	if err != nil {

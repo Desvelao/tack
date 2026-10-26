@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -11,7 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 var sample = task.Task{ID: "7", Title: "Fix \"quotes\" & $(rm -rf /)", Description: "line1\nline2 {id}", Status: "todo", Backend: "csv1", Labels: "a,b"}
@@ -69,24 +70,39 @@ func TestHugeTaskDoesNotBreakTheEnvironment(t *testing.T) {
 		if len(e) > maxEnvLen+64 {
 			t.Errorf("variable %.30q... is %d bytes", e, len(e))
 		}
-		omitted = omitted || strings.HasPrefix(e, "TKAN_TASK_JSON_OMITTED=") && strings.Contains(e, "stdin")
-		if strings.HasPrefix(e, "TKAN_TASK_JSON=") {
-			t.Error("the oversized TKAN_TASK_JSON must be left out")
+		omitted = omitted || strings.HasPrefix(e, "TACK_TASK_JSON_OMITTED=") && strings.Contains(e, "stdin")
+		if strings.HasPrefix(e, "TACK_TASK_JSON=") {
+			t.Error("the oversized TACK_TASK_JSON must be left out")
 		}
 	}
 	if !omitted {
-		t.Errorf("no TKAN_TASK_JSON_OMITTED in %d variables", len(p.Env))
+		t.Errorf("no TACK_TASK_JSON_OMITTED in %d variables", len(p.Env))
 	}
 	// The small variables survive, and the whole task still reaches stdin.
 	s := spec("cat")
 	s.Stdin = StdinJSON
-	if p := s.Expand(big, "/cfg"); !strings.Contains(p.Stdin, "log line") || !slices.Contains(p.Env, "TKAN_TASK_ID=7") {
+	if p := s.Expand(big, "/cfg"); !strings.Contains(p.Stdin, "log line") || !slices.Contains(p.Env, "TACK_TASK_ID=7") {
 		t.Errorf("stdin %d bytes, env %v", len(p.Stdin), p.Env)
 	}
 	// The job really starts: exec would fail with "argument list too long" otherwise.
 	r, err := spec("sh", "-c", "echo ok").Run(context.Background(), big, t.TempDir())
 	if err != nil || r.Stdout != "ok" {
 		t.Fatalf("%v %q", err, r.Stdout)
+	}
+}
+
+func TestOversizedUserEnvIsReportedNotExecuted(t *testing.T) {
+	big := sample
+	big.Notes = strings.Repeat("x", 200<<10)
+	s := spec("echo", "{id}")
+	s.Env = map[string]string{"NOTES": "{notes}"}
+	p := s.Expand(big, "/cfg")
+	if p.Err == nil || !strings.Contains(p.Err.Error(), "env NOTES") || !strings.Contains(p.Err.Error(), "{notes} is 200 KiB") || !strings.Contains(p.Err.Error(), "stdin") {
+		t.Fatalf("%v", p.Err)
+	}
+	// A small value is fine.
+	if p := s.Expand(sample, "/cfg"); p.Err != nil {
+		t.Fatal(p.Err)
 	}
 }
 
@@ -103,7 +119,7 @@ func TestOversizedArgumentIsReportedNotExecuted(t *testing.T) {
 	if snap := j.Snapshot(); snap.Running || snap.Err == nil || !strings.Contains(snap.Err.Error(), "{notes}") {
 		t.Fatalf("%+v", snap)
 	}
-	if _, err := s.Cmd(big, "/cfg"); err == nil {
+	if _, _, err := s.Cmd(big, "/cfg"); err == nil {
 		t.Error("Cmd must refuse it too")
 	}
 	// Many mid-size arguments add up.
@@ -129,22 +145,22 @@ func TestNULBytesAreStripped(t *testing.T) {
 			t.Errorf("NUL in %q", e)
 		}
 	}
-	r, err := spec("sh", "-c", "echo \"$TKAN_TASK_TITLE\"", "sh").Run(context.Background(), n, t.TempDir())
+	r, err := spec("sh", "-c", "echo \"$TACK_TASK_TITLE\"", "sh").Run(context.Background(), n, t.TempDir())
 	if err != nil || r.Stdout != "ab" {
 		t.Fatalf("%v %q", err, r.Stdout)
 	}
 }
 
-func TestExpandCwdEnvSlug(t *testing.T) {
+func TestExpandWorkdirEnvSlug(t *testing.T) {
 	s := spec("true")
-	s.Cwd = "wt/{id}-{slug}"
+	s.Workdir = "wt/{id}-{slug}"
 	s.Env = map[string]string{"WORK": "{backend}/{slug}", "LIT": "{{id}}"}
 	p := s.Expand(sample, "/cfg")
 	if want := filepath.Join("/cfg", "wt", "7-fix-quotes-rm-rf"); p.Dir != want {
 		t.Errorf("dir = %q, want %q", p.Dir, want)
 	}
 	env := strings.Join(p.Env, "\n")
-	for _, w := range []string{"WORK=csv1/fix-quotes-rm-rf", "LIT={id}", "TKAN_WORKDIR=" + p.Dir} {
+	for _, w := range []string{"WORK=csv1/fix-quotes-rm-rf", "LIT={id}", "TACK_WORKDIR=" + p.Dir} {
 		if !strings.Contains(env, w) {
 			t.Errorf("env lacks %q:\n%s", w, env)
 		}
@@ -157,9 +173,9 @@ func TestExpandCwdEnvSlug(t *testing.T) {
 	if got := slug("!!!"); got != "task" {
 		t.Errorf("slug = %q", got)
 	}
-	s.Cwd = "wt/{title}"
-	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "cwd") {
-		t.Errorf("{title} in cwd: err = %v", err)
+	s.Workdir = "wt/{title}"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "workdir") {
+		t.Errorf("{title} in workdir: err = %v", err)
 	}
 }
 
@@ -167,10 +183,10 @@ func TestExpandEnvAndStdin(t *testing.T) {
 	s := spec("cat")
 	s.Env = map[string]string{"FOO": "bar"}
 	s.Stdin = StdinMarkdown
-	s.Cwd = "sub"
+	s.Workdir = "sub"
 	p := s.Expand(sample, "/cfg")
 	env := strings.Join(p.Env, "\n")
-	for _, w := range []string{"FOO=bar", "TKAN_TASK_ID=7", "TKAN_BACKEND=csv1", "TKAN_TASK_STATUS=todo", `TKAN_TASK_JSON={"id":"7"`} {
+	for _, w := range []string{"FOO=bar", "TACK_TASK_ID=7", "TACK_BACKEND=csv1", "TACK_TASK_STATUS=todo", `TACK_TASK_JSON={"id":"7"`} {
 		if !strings.Contains(env, w) {
 			t.Errorf("env lacks %q:\n%s", w, env)
 		}
@@ -194,7 +210,7 @@ func TestValidate(t *testing.T) {
 		want string // "" = valid
 	}{
 		{"ok", func(*Spec) {}, ""},
-		{"no name", func(s *Spec) { s.Name = "" }, "name is required"},
+		{"no id", func(s *Spec) { s.Name = "" }, "id is required"},
 		{"bad name", func(s *Spec) { s.Name = "a b" }, "may only contain"},
 		{"no command", func(s *Spec) { s.Command = nil }, "command is required"},
 		{"placeholder program", func(s *Spec) { s.Command = []string{"{title}"} }, "command[0]"},
@@ -240,7 +256,7 @@ func TestValidateAllDuplicates(t *testing.T) {
 
 func TestRunPassesTaskAndCapturesOutput(t *testing.T) {
 	dir := t.TempDir()
-	s := spec("sh", "-c", `printf '%s|%s|' "$1" "$TKAN_TASK_ID"; cat`, "sh", "{title}")
+	s := spec("sh", "-c", `printf '%s|%s|' "$1" "$TACK_TASK_ID"; cat`, "sh", "{title}")
 	s.Stdin = StdinJSON
 	res, err := s.Run(context.Background(), sample, dir)
 	if err != nil {
@@ -251,13 +267,38 @@ func TestRunPassesTaskAndCapturesOutput(t *testing.T) {
 	}
 }
 
-func TestRunUsesConfigDirAsCwd(t *testing.T) {
+func TestRunUsesConfigDirAsWorkdir(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "marker"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := spec("ls", "marker").Run(context.Background(), sample, dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCreateWorkdir(t *testing.T) {
+	base := t.TempDir()
+	s := spec("pwd")
+	s.Workdir = "wt/{slug}"
+	if _, err := s.Run(context.Background(), sample, base); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("without create_workdir: %v", err)
+	}
+	s.CreateWorkdir = true
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Run(context.Background(), sample, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := s.Expand(sample, base).Dir
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() || !strings.Contains(res.Stdout, filepath.Base(dir)) {
+		t.Fatalf("dir %q: %v, stdout %q", dir, err, res.Stdout)
+	}
+	s.Workdir = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "create_workdir") {
+		t.Errorf("create_workdir without workdir: %v", err)
 	}
 }
 
@@ -296,7 +337,7 @@ func TestRunOutputIsBounded(t *testing.T) {
 }
 
 func TestMissingProgram(t *testing.T) {
-	_, err := spec("definitely-not-a-program-tkan").Run(context.Background(), sample, t.TempDir())
+	_, err := spec("definitely-not-a-program-tack").Run(context.Background(), sample, t.TempDir())
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -306,12 +347,12 @@ func TestCmdRejectsStdinAndSetsEnv(t *testing.T) {
 	s := spec("claude", "{title}")
 	s.Mode = ModeInteractive
 	dir := t.TempDir()
-	cmd, err := s.Cmd(sample, dir)
+	cmd, _, err := s.Cmd(sample, dir)
 	if err != nil || cmd.Dir != dir || cmd.Args[1] != sample.Title {
 		t.Fatalf("cmd=%+v err=%v", cmd, err)
 	}
 	s.Stdin = StdinJSON
-	if _, err := s.Cmd(sample, dir); err == nil {
+	if _, _, err := s.Cmd(sample, dir); err == nil {
 		t.Fatal("expected stdin conflict")
 	}
 }
@@ -407,12 +448,12 @@ func TestCancelAfterExitIsANoOpAndASuccessIsNotCanceled(t *testing.T) {
 
 func TestMissingWorkingDirectoryIsAClearError(t *testing.T) {
 	s := spec("true")
-	s.Cwd = "nope/sub"
+	s.Workdir = "nope/sub"
 	_, err := s.Run(context.Background(), sample, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "working directory") || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("%v", err)
 	}
-	if _, err := s.Cmd(sample, t.TempDir()); err == nil || !strings.Contains(err.Error(), "working directory") {
+	if _, _, err := s.Cmd(sample, t.TempDir()); err == nil || !strings.Contains(err.Error(), "working directory") {
 		t.Fatalf("Cmd: %v", err)
 	}
 }
@@ -577,10 +618,10 @@ func TestWithRunAddsEnvWithoutTouchingTheOriginal(t *testing.T) {
 	r := s.WithRun("run-1", "/tmp/{a}/log.jsonl")
 	p := r.Expand(task.Task{ID: "1"}, "/")
 	got := strings.Join(p.Env, "\n")
-	if !strings.Contains(got, "TKAN_RUN_ID=run-1") || !strings.Contains(got, "TKAN_ACTION_LOG=/tmp/{a}/log.jsonl") || !strings.Contains(got, "X=1") {
+	if !strings.Contains(got, "TACK_RUN_ID=run-1") || !strings.Contains(got, "TACK_ACTION_LOG=/tmp/{a}/log.jsonl") || !strings.Contains(got, "X=1") {
 		t.Fatalf("%s", got)
 	}
-	if _, set := s.Env["TKAN_RUN_ID"]; set {
+	if _, set := s.Env["TACK_RUN_ID"]; set {
 		t.Fatal("original spec modified")
 	}
 }
@@ -595,12 +636,92 @@ func TestOutcomeYAMLAndValidation(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if s.OnSuccess != (Outcome{Status: "Done"}) || s.OnFailure != (Outcome{Status: "Todo", AppendNotes: NotesError}) {
+	if !reflect.DeepEqual(s.OnSuccess, Outcome{Status: "Done"}) || !reflect.DeepEqual(s.OnFailure, Outcome{Status: "Todo", AppendNotes: NotesError}) {
 		t.Fatalf("%+v", s)
 	}
 	bad := Spec{Name: "b", Command: []string{"true"}, OnSuccess: Outcome{AppendNotes: NotesError}}
 	bad.Normalize()
 	if err := bad.Validate(); err == nil {
 		t.Fatal("error is not a success source")
+	}
+}
+
+func TestOutcomeCommand(t *testing.T) {
+	var s Spec
+	src := "name: a\ncommand: [true]\non_success: {status: Done, command: [notify, '{title} {result} {exit}']}\non_failure: {command: [alert, '{id}']}\n"
+	if err := yaml.Unmarshal([]byte(src), &s); err != nil {
+		t.Fatal(err)
+	}
+	s.Normalize()
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.OnSuccess.Command) != 2 || s.OnFailure.IsZero() {
+		t.Fatalf("%+v", s)
+	}
+	for name, o := range map[string]Outcome{
+		"empty program":       {Command: []string{" "}},
+		"unknown placeholder": {Command: []string{"x", "{titel}"}},
+	} {
+		bad := Spec{Name: "b", Command: []string{"true"}, OnSuccess: o}
+		bad.Normalize()
+		if err := bad.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestNormalizeAliasesAndLabels(t *testing.T) {
+	s := Spec{LegacyName: " triage ", LegacyLabel: "Triage it", Labels: []string{" research ", "", "research", "code"}, Command: []string{"echo"}}
+	s.Normalize()
+	if s.Name != "triage" || s.Label != "Triage it" || s.Title() != "Triage it" {
+		t.Errorf("legacy keys not folded: %+v", s)
+	}
+	if len(s.Labels) != 2 || s.Labels[0] != "research" || s.Labels[1] != "code" {
+		t.Errorf("labels = %v", s.Labels)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("unexpected %v", err)
+	}
+	c := Spec{Name: "a", LegacyName: "b", Command: []string{"echo"}}
+	c.Normalize()
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "both set") {
+		t.Errorf("id/name conflict: got %v", err)
+	}
+}
+
+func TestWithWorkdir(t *testing.T) {
+	s := spec("true")
+	s.Workdir = "wt/{id}"
+	if got := s.WithWorkdir(""); got.Workdir != "wt/{id}" {
+		t.Errorf("empty override changed the workdir: %q", got.Workdir)
+	}
+	o := s.WithWorkdir("/else/{id}")
+	if p := o.Expand(sample, "/cfg"); p.Dir != filepath.Join("/else", "7") {
+		t.Errorf("dir = %q", p.Dir)
+	}
+	if s.Workdir != "wt/{id}" {
+		t.Errorf("the original changed: %q", s.Workdir)
+	}
+}
+
+func TestExpandWorkdirEnv(t *testing.T) {
+	t.Setenv("TACK_T_ROOT", "/srv/w")
+	s := spec("true")
+	s.Workdir = "$TACK_T_ROOT/{id}"
+	if p := s.Expand(sample, "/cfg"); p.Err != nil || p.Dir != "/srv/w/7" {
+		t.Errorf("dir = %q, err %v", p.Dir, p.Err)
+	}
+	evil := sample
+	evil.ID = "$TACK_T_ROOT"
+	if p := s.Expand(evil, "/cfg"); p.Dir != "/srv/w/$TACK_T_ROOT" {
+		t.Errorf("task text was expanded: %q", p.Dir)
+	}
+	s.Workdir = "$TACK_T_UNSET/x"
+	if p := s.Expand(sample, "/cfg"); p.Err == nil || !strings.Contains(p.Err.Error(), "$TACK_T_UNSET is not set") {
+		t.Errorf("unset: %v", p.Err)
+	}
+	if _, _, err := s.Cmd(sample, "/cfg"); err == nil {
+		t.Errorf("Cmd started with an unset variable")
 	}
 }

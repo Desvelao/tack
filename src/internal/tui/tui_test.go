@@ -14,10 +14,10 @@ import (
 	"github.com/muesli/termenv"
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	_ "tkan/internal/backend/csv"
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	_ "tack/internal/backend/csv"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 func newModel(t *testing.T) (Model, *backend.Set) {
@@ -1371,5 +1371,51 @@ func TestMoveMarkedCardsToColumn(t *testing.T) {
 	tasks, _ = be.List(context.Background())
 	if tasks[0].Status != "pending" || tasks[1].Status != "pending" {
 		t.Fatalf("undo: %q %q (notice %q)", tasks[0].Status, tasks[1].Status, m.notice)
+	}
+}
+
+// Undoing a move must not write over what somebody else changed on the card
+// since: only the fields the move changed go back.
+func TestUndoKeepsAChangeMadeElsewhereSince(t *testing.T) {
+	m, be := newModel(t)
+	ctx := context.Background()
+	get := func() task.Task {
+		ts, _ := be.List(ctx)
+		for _, x := range ts {
+			if x.Title == "Alpha" {
+				return x
+			}
+		}
+		t.Fatal("Alpha is gone")
+		return task.Task{}
+	}
+	m = press(m, "L") // Alpha pending -> in_progress
+	if get().Status != "in_progress" {
+		t.Fatal("setup: move failed")
+	}
+	other := get() // another process changes the priority
+	other.Priority = "low"
+	if err := be.Update(backend.WithOld(ctx, get()), other); err != nil {
+		t.Fatal(err)
+	}
+	m = press(m, "u")
+	if got := get(); got.Status != "pending" || got.Priority != "low" {
+		t.Fatalf("after undo: status %q priority %q, want pending and low (%s)", got.Status, got.Priority, m.notice)
+	}
+}
+
+func TestSavedViewsCycleSkipsAnInvalidView(t *testing.T) {
+	m, _ := newModel(t)
+	m.spec.Views = []board.ViewSpec{{Name: "high", Query: "priority=high"}, {Name: "bad", Query: "nofield=1"}, {Name: "done", Query: "col:done"}}
+	m = press(m, "v")
+	if m.view != "high" {
+		t.Fatalf("first: %q", m.view)
+	}
+	m = press(m, "v")
+	if m.view != "done" || !strings.Contains(m.notice, "skipped view bad") {
+		t.Fatalf("the bad view stopped the cycle: view %q notice %q", m.view, m.notice)
+	}
+	if m = press(m, "v"); m.view != "" || m.filter != "" {
+		t.Fatalf("cycle did not clear: %q %q", m.view, m.filter)
 	}
 }

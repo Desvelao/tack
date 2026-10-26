@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 type clocked interface{ SetClock(func() time.Time) }

@@ -11,9 +11,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/backendtest"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/backend/backendtest"
+	"tack/internal/task"
 )
 
 func spec(t *testing.T, typ, path, extra string) backend.Spec {
@@ -99,7 +99,7 @@ func TestCreateDeleteAndWrapperObject(t *testing.T) {
 	if !strings.Contains(string(data), `"version": 2`) || !strings.Contains(string(data), `"tasks"`) {
 		t.Fatalf("wrapper lost:\n%s", data)
 	}
-	if entries, _ := filepath.Glob(filepath.Join(filepath.Dir(p), ".tkan-*")); len(entries) != 0 {
+	if entries, _ := filepath.Glob(filepath.Join(filepath.Dir(p), ".tack-*")); len(entries) != 0 {
 		t.Fatalf("temp files left: %v", entries)
 	}
 }
@@ -373,5 +373,77 @@ func TestBlockedByList(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(strings.Fields(string(data)), ""), `"blocked_by":[2,3]`) {
 		t.Errorf("numeric ids not written as numbers:\n%s", data)
+	}
+}
+
+func TestBOMIsKeptOnWrite(t *testing.T) {
+	const bom = "\xef\xbb\xbf"
+	cases := []struct{ typ, name, content string }{
+		{"json", "t.json", `[{"id":"1","title":"a","status":"todo"}]` + "\n"},
+		{"jsonl", "t.jsonl", `{"id":"1","title":"a","status":"todo"}` + "\n"},
+	}
+	for _, c := range cases {
+		for _, with := range []bool{true, false} {
+			content := c.content
+			if with {
+				content = bom + content
+			}
+			p := tmp(t, c.name, content)
+			b, err := backend.OpenSpec(spec(t, c.typ, p, ""))
+			if err != nil {
+				t.Fatalf("%s bom=%v: %v", c.typ, with, err)
+			}
+			if _, err := b.Create(context.Background(), task.Task{Title: "b", Status: "todo"}); err != nil {
+				t.Fatalf("%s bom=%v: %v", c.typ, with, err)
+			}
+			data, _ := os.ReadFile(p)
+			s := string(data)
+			if strings.HasPrefix(s, bom) != with || strings.Contains(s[len(bom)*b2i(with):], bom) {
+				t.Fatalf("%s bom=%v: file starts %q", c.typ, with, s[:min(len(s), 8)])
+			}
+			if !strings.Contains(s, `"b"`) {
+				t.Fatalf("%s bom=%v: task not written:\n%s", c.typ, with, s)
+			}
+		}
+	}
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func TestRecordsStripsBOMFromJSONLines(t *testing.T) {
+	recs, err := Records([]byte("\xef\xbb\xbf{\"id\":\"1\"}\n"), true, nil)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("recs=%v err=%v", recs, err)
+	}
+}
+
+func TestWritesDoNotHTMLEscapeText(t *testing.T) {
+	for _, typ := range []string{"json", "jsonl"} {
+		p := tmp(t, "t."+typ, "")
+		b, err := backend.OpenSpec(spec(t, typ, p, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		c, err := b.Create(ctx, task.Task{Title: "Fix A & B <script>", Status: "todo"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Notes = "x > y"
+		if err := b.Update(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(p)
+		if !strings.Contains(string(data), "Fix A & B <script>") || !strings.Contains(string(data), "x > y") || strings.Contains(string(data), `\u00`) {
+			t.Errorf("%s escaped:\n%s", typ, data)
+		}
+		if got, _ := b.List(ctx); len(got) != 1 || got[0].Title != "Fix A & B <script>" {
+			t.Errorf("%s round trip: %+v", typ, got)
+		}
 	}
 }

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 const pollCSV = "id,title,status\n1,A,pending\n"
@@ -40,7 +40,7 @@ func TestPollOptionParsing(t *testing.T) {
 			t.Errorf("%q: %v", y, err)
 			continue
 		}
-		if got := b.(*Backend).sch.poll; got != want {
+		if got := b.(*Backend).c.sch.poll; got != want {
 			t.Errorf("%q: %+v, want %+v", y, got, want)
 		}
 	}
@@ -92,7 +92,7 @@ func TestPollIntervalChecksOncePerPeriod(t *testing.T) {
 	b, _ := Open(csvOpts(t, p, "poll: 10"))
 	be := b.(*Backend)
 	clock := time.Now()
-	be.now = func() time.Time { return clock }
+	be.SetClock(func() time.Time { return clock })
 	w := b.(backend.Watcher)
 	ctx := context.Background()
 

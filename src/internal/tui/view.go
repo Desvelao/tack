@@ -9,9 +9,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"tkan/internal/board"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 const colWidth = 30 // outer width of a board column
@@ -83,7 +82,7 @@ func (m Model) finishedTag() string {
 // boardScreen reports whether the board is drawn (alone or under a prompt).
 func (m Model) boardScreen() bool {
 	switch m.mode {
-	case modeBoard, modeNew, modeFilter, modeQuick, modeConfirmDelete, modeMoveTo:
+	case modeBoard, modeNew, modeFilter, modeQuick, modeConfirmDelete, modeConfirmRelease, modeMoveTo:
 		return true
 	}
 	return false
@@ -105,8 +104,8 @@ func (m Model) screen() string {
 		return m.runsView()
 	case modeRunOutput:
 		return m.runOutputView()
-	case modeFleet:
-		return m.fleetView()
+	case modeWorkers:
+		return m.workersView()
 	}
 	var b strings.Builder
 	count := fmt.Sprintf("%d tasks", len(m.tasks))
@@ -121,12 +120,18 @@ func (m Model) screen() string {
 		count = fmt.Sprintf("%d/%d tasks", shown, len(m.tasks))
 	}
 	var h strings.Builder
-	h.WriteString(titleSty.Render("tkan") + metaSty.Render(fmt.Sprintf("  %s · %s", m.name, count)))
+	h.WriteString(titleSty.Render("tack") + metaSty.Render(fmt.Sprintf("  %s · %s", m.name, count)))
 	if tag := m.loadingTag(); tag != "" {
 		h.WriteString(loadSty.Render("  " + tag))
 	}
 	if tag := m.failedTag(); tag != "" && !m.busy() {
 		h.WriteString(failSty.Render("  " + tag))
+	}
+	if len(m.cycles) > 0 { // these cards can never become ready
+		h.WriteString(failSty.Render("  blocked_by cycle: " + m.cycles[0].String()))
+		if n := len(m.cycles) - 1; n > 0 {
+			h.WriteString(failSty.Render(fmt.Sprintf(" (+%d)", n)))
+		}
 	}
 	if n := len(m.marks); n > 0 {
 		h.WriteString(markSty.Render(fmt.Sprintf("  %d marked", n)))
@@ -199,6 +204,9 @@ func (m Model) screen() string {
 		}
 		t := m.deleteTargets[0]
 		b.WriteString(failSty.Render(fmt.Sprintf("delete %s:%s %q? (y/N)", t.Backend, t.ID, t.Title)))
+	case modeConfirmRelease:
+		t := m.relTarget
+		b.WriteString(failSty.Render(fmt.Sprintf("take %s:%s from %s? (y/N)", t.Backend, t.ID, t.Assignee)))
 	default:
 		if m.notice != "" {
 			b.WriteString(m.renderNotice())
@@ -259,7 +267,7 @@ const (
 // dueLevelOf classifies a card's due date: overdue, within soonDays, or
 // neither. Cards in finished columns (Done, Closed...) are never flagged.
 func (m Model) dueLevelOf(t task.Task, c int) dueLevel {
-	if board.Finished(m.board.Columns[c].Name) {
+	if m.board.Columns[c].Done {
 		return dueNormal
 	}
 	now := m.clock()
@@ -535,23 +543,23 @@ func cardMeta(t task.Task, width int, dueStyle lipgloss.Style, agent bool) strin
 	}
 	if t.Priority != "" {
 		col := priorityColorOf(t.Priority)
-		parts = append(parts, part{"priority", t.Priority, lipgloss.NewStyle().Foreground(col)})
+		parts = append(parts, part{"priority", t.Marked("priority", t.Priority), lipgloss.NewStyle().Foreground(col)})
 	}
 	if t.Type != "" {
-		parts = append(parts, part{"type", t.Type, lipgloss.NewStyle().Foreground(typeColor(t.Type))})
+		parts = append(parts, part{"type", t.Marked("type", t.Type), lipgloss.NewStyle().Foreground(typeColor(t.Type))})
 	}
 	if t.Assignee != "" {
 		sty := metaSty
 		if agent {
 			sty = lipgloss.NewStyle().Bold(true).Foreground(agentColor)
 		}
-		parts = append(parts, part{"assignee", "@" + t.Assignee, sty})
+		parts = append(parts, part{"assignee", t.Marked("assignee", "@"+t.Assignee), sty})
 	}
 	if t.Due != "" {
-		parts = append(parts, part{"due", "due " + t.Due, dueStyle})
+		parts = append(parts, part{"due", t.Marked("due", "due "+t.Due), dueStyle})
 	}
 	if chip := labelChip(t); chip != "" {
-		parts = append(parts, part{"labels", chip, labelSty})
+		parts = append(parts, part{"labels", t.Marked("labels", chip), labelSty})
 	}
 	render := func() string {
 		out := make([]string, len(parts))
@@ -594,11 +602,11 @@ func (m Model) detailMeta(t task.Task) string {
 	}
 	var parts []string
 	for _, p := range []part{
-		{t.Backend, backendSty}, {t.Status, metaSty},
-		{t.Priority, lipgloss.NewStyle().Foreground(priorityColorOf(t.Priority))},
-		{t.Type, lipgloss.NewStyle().Foreground(typeColor(t.Type))},
-		{atName(t.Assignee), assignee}, {dateLabel("due", t.Due), due}, {dateLabel("start", t.Start), metaSty},
-		{t.Labels, labelSty},
+		{t.Backend, backendSty}, {t.Marked("status", t.Status), metaSty},
+		{t.Marked("priority", t.Priority), lipgloss.NewStyle().Foreground(priorityColorOf(t.Priority))},
+		{t.Marked("type", t.Type), lipgloss.NewStyle().Foreground(typeColor(t.Type))},
+		{t.Marked("assignee", atName(t.Assignee)), assignee}, {t.Marked("due", dateLabel("due", t.Due)), due}, {t.Marked("start", dateLabel("start", t.Start)), metaSty},
+		{t.Marked("labels", t.Labels), labelSty},
 	} {
 		if p.text != "" {
 			parts = append(parts, p.sty.Render(p.text))
@@ -623,6 +631,9 @@ func (m Model) detailView() string {
 	if m.isAgent(t.Assignee) {
 		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(agentColor).Render("  agent"))
 	}
+	if len(t.Overlaid) > 0 {
+		b.WriteString("\n" + metaSty.Render(task.OverlayMark+" local overlay (kept in a local file, not in "+t.Backend+")"))
+	}
 	b.WriteString("\n\n")
 	if going, ended := m.cardRuns(t); len(going)+len(ended) > 0 {
 		for _, r := range going {
@@ -636,6 +647,9 @@ func (m Model) detailView() string {
 	if ids := t.BlockedByList(); len(ids) > 0 {
 		line := "blocked by #" + strings.Join(ids, ", #")
 		if open := m.deps.Blockers(t); len(open) > 0 {
+			if c, ok := m.deps.CycleOf(t); ok {
+				line += "  circular: " + c.String()
+			}
 			b.WriteString(blockedSty.Render(line+"  (open: #"+strings.Join(open, ", #")+")") + "\n\n")
 		} else {
 			b.WriteString(okSty.Render(line+"  (all finished: ready)") + "\n\n")
@@ -645,7 +659,7 @@ func (m Model) detailView() string {
 		b.WriteString(wrap.Render(t.Description) + "\n\n")
 	}
 	if t.Notes != "" {
-		b.WriteString(headSty.Render("Notes") + "\n" + wrap.Render(t.Notes) + "\n\n")
+		b.WriteString(headSty.Render(t.Marked("notes", "Notes")) + "\n" + wrap.Render(t.Notes) + "\n\n")
 	}
 	keys := make([]string, 0, len(t.Extra))
 	for k, v := range t.Extra {
@@ -706,9 +720,9 @@ func (m Model) helpView() string {
 	foot := helpSty.Render("tab/←→ other page · esc back")
 	switch m.helpPage {
 	case 1:
-		return titleSty.Render(fmt.Sprintf("tkan help %d/%d", page, pages)) + "\n\n" + query.Help(search) + "\n" + foot
+		return titleSty.Render(fmt.Sprintf("tack help %d/%d", page, pages)) + "\n\n" + query.Help(search) + "\n" + foot
 	case 2:
-		return titleSty.Render(fmt.Sprintf("tkan help %d/%d", page, pages)) + "\n\n" + query.FieldsHelp(title, docs, search) + "\n" + foot
+		return titleSty.Render(fmt.Sprintf("tack help %d/%d", page, pages)) + "\n\n" + query.FieldsHelp(title, docs, search) + "\n" + foot
 	}
 	return keysHelp()
 }
@@ -729,18 +743,19 @@ func keysHelp() string {
 		{"m", "move the card, or the marked cards, to column 1-9"},
 		{"d", "delete card, or the marked cards (asks to confirm)"},
 		{"u", "undo the last move, edit or delete (a deleted card gets a new ID)"},
+		{"c / C", "claim the card for you ($TACK_AGENT or $USER) / release its claim (asks first for another's)"},
 		{"/", "filter: text or field:value (esc clears; up/down recall earlier filters)"},
 		{"f", "filter by the selected card: then t type, a assignee, p priority, l label"},
 		{"v", "cycle the saved views (board.views), then none"},
 		{"z", "group cards by priority / type / assignee / labels (cycle)"},
 		{"s / S", "sort cards: next field / reverse (display only)"},
 		{"r / A / R", "reload from the backend / audit trail / background action runs"},
-		{"F", "fleet: the agents, the task each holds, since when, lease left"},
+		{"W", "workers: the agents, the task each holds, since when, lease left"},
 		{"?", "this help (tab: filter syntax, then what each field means)"},
 		{"q / ctrl+c", "quit"},
 	}
 	var b strings.Builder
-	b.WriteString(titleSty.Render("tkan help 1/3: keys") + "\n\n")
+	b.WriteString(titleSty.Render("tack help 1/3: keys") + "\n\n")
 	for _, r := range rows {
 		b.WriteString("  " + keySty.Render(fmt.Sprintf("%-18s", r[0])) + " " + r[1] + "\n")
 	}
@@ -787,8 +802,8 @@ func (m Model) editView() string {
 // least important entries go first (the full list is behind ?), the way out
 // and the help key stay.
 func boardHelp(width int) string {
-	items := []string{"←→ column", "↑↓ card", "H/L move", "enter open", "e edit", "n new", "d delete", "m move to", "x actions", ". repeat", "space mark", "R runs", "/ filter", "r reload", "? help", "q quit"}
-	drop := []string{"space mark", ". repeat", "r reload", "R runs", "m move to", "d delete", "H/L move", "n new", "e edit", "x actions", "/ filter", "↑↓ card", "←→ column", "enter open"}
+	items := []string{"←→ column", "↑↓ card", "H/L move", "enter open", "e edit", "n new", "d delete", "m move to", "x actions", ". repeat", "space mark", "c claim", "C release", "R runs", "/ filter", "r reload", "? help", "q quit"}
+	drop := []string{"c claim", "C release", "space mark", ". repeat", "r reload", "R runs", "m move to", "d delete", "H/L move", "n new", "e edit", "x actions", "/ filter", "↑↓ card", "←→ column", "enter open"}
 	for ansi.StringWidth(strings.Join(items, "  ")) > width && len(drop) > 0 {
 		for i, it := range items {
 			if it == drop[0] {

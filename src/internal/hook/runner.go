@@ -15,29 +15,29 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/backend"
-	"tkan/internal/board"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/backend"
+	"tack/internal/board"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 // DepthEnv carries the nesting level to the commands a hook starts: a
-// `tkan` they run sees it and fires hooks only while the level is below the
+// `tack` they run sees it and fires hooks only while the level is below the
 // limit (DefaultMaxDepth unless configured), so a hook that moves a task
 // cannot loop forever.
-const DepthEnv = "TKAN_HOOK_DEPTH"
+const DepthEnv = "TACK_HOOK_DEPTH"
 
 // ChainEnv carries the names of the hooks that led to this process, joined
 // with ChainSep ("a>b"); a hook already in the chain never fires again.
-const ChainEnv = "TKAN_HOOK_CHAIN"
+const ChainEnv = "TACK_HOOK_CHAIN"
 
 // ChainSep joins the names in ChainEnv.
 const ChainSep = ">"
 
-// DefaultMaxDepth is the limit when none is configured: a tkan started by a
+// DefaultMaxDepth is the limit when none is configured: a tack started by a
 // hook fires nothing.
 const DefaultMaxDepth = 1
 
@@ -104,6 +104,8 @@ type Runner struct {
 	dueDay  string          // the day dueSeen belongs to
 	dueSeen map[string]bool // tasks task.due fired for on dueDay
 	wipOver map[string]bool // columns that were over their limit at the last Tick
+
+	observe func(Event) // sees every event fired, hooks or not (see Observing)
 }
 
 // inflightKey identifies the task a unique hook is running on.
@@ -122,8 +124,9 @@ type state struct {
 }
 
 type queued struct {
-	ev Event
-	t  task.Task
+	ev     Event
+	t      task.Task
+	marker string // the dedupe marker this event created, removed if the event is dropped
 }
 
 // New returns a Runner, or nil when there is nothing to run. source is the
@@ -143,6 +146,30 @@ func New(specs []Spec, baseDir, source string, alog *actionlog.Log, rec Recorder
 		st[&specs[i]] = &state{}
 	}
 	return &Runner{specs: specs, baseDir: baseDir, source: source, depth: depth, max: DefaultMaxDepth, chain: chain, alog: alog, rec: rec, ctx: ctx, cancel: cancel, st: st, inflight: map[inflightKey]int{}}
+}
+
+// SetSource sets the Event.Source of the events that do not name one.
+func (r *Runner) SetSource(s string) {
+	if r != nil {
+		r.source = s
+	}
+}
+
+// SetObserver makes fn see every event the Runner fires, before the hooks run
+// (`tack watch -json`); nil turns it off.
+func (r *Runner) SetObserver(fn func(Event)) {
+	if r != nil {
+		r.observe = fn
+	}
+}
+
+// Observing returns a Runner with no hooks that only reports its events to fn.
+// It lets a process without hooks use the same code paths as one with them.
+func Observing(source string, fn func(Event)) *Runner {
+	r := New([]Spec{{}}, "", source, nil, nil)
+	r.specs = nil
+	r.observe = fn
+	return r
 }
 
 // SetMaxDepth sets the global limit (0 = DefaultMaxDepth); a hook's own
@@ -215,8 +242,9 @@ func (r *Runner) Dropped(name string) int {
 }
 
 // Cancel kills the commands still running, with their child processes. Their
-// runs end as errors ("canceled") and are recorded like any other. Commands
-// fired later start normally; Cancel is for leaving.
+// runs end as errors ("canceled") and are recorded like any other. It is for
+// leaving: the Runner is finished afterwards, and a command fired later is
+// canceled at once (and never retried) instead of starting.
 func (r *Runner) Cancel() {
 	if r == nil {
 		return
@@ -229,7 +257,10 @@ func (r *Runner) Cancel() {
 			st.timer.Stop()
 			st.timer = nil
 		}
-		for range st.q {
+		for _, q := range st.q {
+			if q.marker != "" {
+				os.Remove(q.marker)
+			}
 			r.wg.Done()
 		}
 		st.q = nil
@@ -241,6 +272,9 @@ func (r *Runner) Cancel() {
 func (r *Runner) Active() bool {
 	if r == nil {
 		return false
+	}
+	if r.observe != nil {
+		return true
 	}
 	for i := range r.specs {
 		if r.canFire(&r.specs[i]) {
@@ -321,7 +355,7 @@ func (r *Runner) Tick(tasks []task.Task, now time.Time) {
 			continue
 		}
 		counts[c]++
-		if d, ok := t.DueTime(); !ok || board.Finished(b.Columns[c].Name) {
+		if d, ok := t.DueTime(); !ok || b.Columns[c].Done {
 			continue
 		} else if y, m, dd := now.Date(); d.After(time.Date(y, m, dd, 0, 0, 0, 0, time.UTC)) {
 			continue
@@ -359,7 +393,7 @@ func (r *Runner) NeedsOld() bool {
 	}
 	for i := range r.specs {
 		s := &r.specs[i]
-		if r.canFire(s) && (s.listens(TaskMoved) || s.listens(TaskUpdateSuccess) || s.listensColumns()) {
+		if r.canFire(s) && (s.listens(TaskMoved) || s.listens(TaskChanged) || s.listens(TaskUpdateSuccess) || s.listensColumns()) {
 			return true
 		}
 	}
@@ -435,6 +469,9 @@ func (r *Runner) Fire(ev Event) {
 	if ev.Source == "" {
 		ev.Source = r.source
 	}
+	if r.observe != nil {
+		r.observe(ev)
+	}
 	t := ev.subject()
 	for i := range r.specs {
 		s := &r.specs[i]
@@ -444,11 +481,12 @@ func (r *Runner) Fire(ev Event) {
 		if !s.when.Empty() && !s.when.Match(query.TaskLookup(t, "", board.Deps{}), nil) {
 			continue
 		}
-		if !r.claim(s, ev, t) {
-			r.auditSkipped(s, queued{ev, t}, "duplicate")
+		marker, ok := r.claim(s, ev, t)
+		if !ok {
+			r.auditSkipped(s, queued{ev: ev, t: t}, "duplicate")
 			continue
 		}
-		r.submit(s, ev, t)
+		r.submit(s, ev, t, marker)
 	}
 }
 
@@ -492,7 +530,7 @@ func (r *Runner) Preview(s *Spec, ev Event) action.Plan {
 	if ev.Source == "" {
 		ev.Source = r.source
 	}
-	p := r.plan(s, ev, ev.subject())
+	_, p := r.plan(s, ev, ev.subject())
 	for i, kv := range p.Env {
 		if k, _, _ := strings.Cut(kv, "="); s.Env[k] != "" {
 			p.Env[i] = k + "=" + Masked
@@ -510,7 +548,8 @@ func (r *Runner) Test(s *Spec, ev Event) actionlog.Record {
 		ev.Source = r.source
 	}
 	t := ev.subject()
-	j := r.launch(s, t, r.plan(s, ev, t))
+	spec, p := r.plan(s, ev, t)
+	j := r.launch(spec, t, p)
 	<-j.Done()
 	rec := actionlog.FromJob(j, "hook")
 	rec.Event = ev.Name
@@ -551,14 +590,14 @@ func (r *Runner) busy(s *Spec, t task.Task) bool {
 
 // submit starts the event, or applies the hook's queue mode when a limit
 // stops it.
-func (r *Runner) submit(s *Spec, ev Event, t task.Task) {
+func (r *Runner) submit(s *Spec, ev Event, t task.Task, marker string) {
 	now := time.Now()
 	r.mu.Lock()
 	st := r.st[s]
 	if r.busy(s, t) {
 		st.dropped++
 		r.mu.Unlock()
-		r.auditSkipped(s, queued{ev, t}, "already running")
+		r.auditSkipped(s, queued{ev, t, marker}, "already running")
 		return
 	}
 	reason := r.blocked(s, st, now)
@@ -576,18 +615,18 @@ func (r *Runner) submit(s *Spec, ev Event, t task.Task) {
 	switch s.queueMode() {
 	case QueueLatest:
 		lost = st.q
-		st.q = []queued{{ev, t}}
+		st.q = []queued{{ev, t, marker}}
 		r.wg.Add(1)
 		lostReason = "superseded"
 	case QueueAll:
 		if len(st.q) >= MaxQueue {
-			lost, lostReason = []queued{{ev, t}}, "queue full"
+			lost, lostReason = []queued{{ev, t, marker}}, "queue full"
 			break
 		}
-		st.q = append(st.q, queued{ev, t})
+		st.q = append(st.q, queued{ev, t, marker})
 		r.wg.Add(1)
 	default:
-		lost = []queued{{ev, t}}
+		lost = []queued{{ev, t, marker}}
 	}
 	st.dropped += len(lost)
 	for range lost {
@@ -605,6 +644,9 @@ func (r *Runner) submit(s *Spec, ev Event, t task.Task) {
 // auditSkipped records a dropped event, except for reload.* (every refresh
 // would flood the trail).
 func (r *Runner) auditSkipped(s *Spec, q queued, reason string) {
+	if q.marker != "" { // nobody runs it here: another process may take the event
+		os.Remove(q.marker)
+	}
 	if r.rec == nil || strings.HasPrefix(q.ev.Name, "reload.") {
 		return
 	}
@@ -655,8 +697,13 @@ func (r *Runner) pump(s *Spec) {
 }
 
 // plan is the command s runs for ev on t: the action's expansion plus the
-// event's placeholders, variables and stdin.
-func (r *Runner) plan(s *Spec, ev Event, t task.Task) action.Plan {
+// event's placeholders, variables and stdin. It returns the spec to run it
+// with: s's action carrying a run id of its own (TACK_RUN_ID, and
+// TACK_ACTION_LOG when the action log is on), as `tack run` gives its runs, so
+// an agent started by a hook can `tack report -run` and the record of the run
+// has a run_id. A retry of the run keeps the id: its records share it.
+func (r *Runner) plan(s *Spec, ev Event, t task.Task) (action.Spec, action.Plan) {
+	spec := s.Spec.WithRun(actionlog.NewRunID(), r.alog.Path())
 	oldJSON, _ := json.Marshal(ev.Old)
 	if !ev.HasOld {
 		oldJSON = nil
@@ -670,7 +717,7 @@ func (r *Runner) plan(s *Spec, ev Event, t task.Task) action.Plan {
 	}
 	extra := map[string]string{"event": ev.Name, "source": ev.Source, "error": ev.Err, "old_status": ev.Old.Status,
 		"old_json": string(oldJSON), "action": ev.Action, "column": col, "old_column": oldCol, "new_status": ev.New.Status}
-	p := s.Spec.ExpandWith(t, r.baseDir, extra)
+	p := spec.ExpandWith(t, r.baseDir, extra)
 	switch s.Stdin {
 	case action.StdinEvent:
 		p.Stdin = eventJSON(ev, t)
@@ -678,25 +725,25 @@ func (r *Runner) plan(s *Spec, ev Event, t task.Task) action.Plan {
 		p.Stdin = eventMarkdown(ev, t)
 	}
 	p.Env = append(p.Env,
-		action.EnvVar("TKAN_EVENT", ev.Name),
-		action.EnvVar("TKAN_EVENT_SOURCE", ev.Source),
-		action.EnvVar("TKAN_EVENT_ERROR", ev.Err),
-		action.EnvVar("TKAN_OLD_STATUS", ev.Old.Status),
-		action.EnvVar("TKAN_OLD_TASK_JSON", string(oldJSON)),
-		action.EnvVar("TKAN_ACTION", ev.Action),
-		action.EnvVar("TKAN_COLUMN", col),
-		action.EnvVar("TKAN_OLD_COLUMN", oldCol),
-		action.EnvVar("TKAN_NEW_STATUS", ev.New.Status),
+		action.EnvVar("TACK_EVENT", ev.Name),
+		action.EnvVar("TACK_EVENT_SOURCE", ev.Source),
+		action.EnvVar("TACK_EVENT_ERROR", ev.Err),
+		action.EnvVar("TACK_OLD_STATUS", ev.Old.Status),
+		action.EnvVar("TACK_OLD_TASK_JSON", string(oldJSON)),
+		action.EnvVar("TACK_ACTION", ev.Action),
+		action.EnvVar("TACK_COLUMN", col),
+		action.EnvVar("TACK_OLD_COLUMN", oldCol),
+		action.EnvVar("TACK_NEW_STATUS", ev.New.Status),
 		DepthEnv+"="+strconv.Itoa(r.depth+1),
 		ChainEnv+"="+strings.Join(append(slices.Clone(r.chain), s.Name), ChainSep),
 	)
-	return p
+	return spec, p
 }
 
 // start runs one event; queuedToken says it already holds a wg token.
 func (r *Runner) start(s *Spec, ev Event, t task.Task, queuedToken bool) {
-	p := r.plan(s, ev, t)
-	launch := func() *action.Job { return r.launch(s, t, p) }
+	spec, p := r.plan(s, ev, t)
+	launch := func() *action.Job { return r.launch(spec, t, p) }
 	j := launch()
 	if !queuedToken {
 		r.wg.Add(1)
@@ -745,9 +792,9 @@ func (r *Runner) start(s *Spec, ev Event, t task.Task, queuedToken bool) {
 	}()
 }
 
-// launch starts p, the plan of s for t.
-func (r *Runner) launch(s *Spec, t task.Task, p action.Plan) *action.Job {
-	return s.Spec.StartPlan(r.ctx, t, p)
+// launch starts p, the plan of spec for t.
+func (r *Runner) launch(spec action.Spec, t task.Task, p action.Plan) *action.Job {
+	return spec.StartPlan(r.ctx, t, p)
 }
 
 // pause waits d before a retry; false when the Runner was canceled meanwhile.
@@ -778,7 +825,7 @@ func (r *Runner) audit(s *Spec, ev Event, t task.Task, rec actionlog.Record, att
 	r.rec.Record(audit.Entry{Op: audit.HookOp(ev.Name), Backend: t.Backend, ID: t.ID, Result: res, Details: details})
 }
 
-// Diff compares two lists of one reload and fires appeared / disappeared. own
+// Diff compares two lists of one reload and fires appeared / disappeared / moved / changed. own
 // holds the tasks this process wrote itself (backend.Key -> the task exists
 // after that write), which are not news unless the list says otherwise. skip
 // names the backends whose list is incomplete. A key in both lists whose
@@ -794,7 +841,8 @@ func (r *Runner) Diff(before, after []task.Task, own map[string]bool, skip map[s
 	}
 	var reused []task.Task // the old tasks of reused ids, reported before the new ones
 	var appeared []task.Task
-	var moved []Event // same task, another status: a change made outside this run
+	var moved []Event   // same task, another status: a change made outside this run
+	var changed []Event // same task, any field differs: task.changed
 	for _, t := range after {
 		k := backend.Key(t.Backend, t.ID)
 		is[k] = true
@@ -808,8 +856,14 @@ func (r *Runner) Diff(before, after []task.Task, own map[string]bool, skip map[s
 		}
 		if !ok {
 			appeared = append(appeared, t)
-		} else if old.Status != t.Status {
-			moved = append(moved, Event{Source: "poll", Old: old, HasOld: true, New: t})
+		} else {
+			ev := Event{Source: "poll", Old: old, HasOld: true, New: t}
+			if old.Status != t.Status {
+				moved = append(moved, ev)
+			}
+			if !sameTask(old, t) {
+				changed = append(changed, ev)
+			}
 		}
 	}
 	for _, t := range before {
@@ -825,8 +879,25 @@ func (r *Runner) Diff(before, after []task.Task, own map[string]bool, skip map[s
 		r.Fire(Event{Name: TaskAppeared, Source: "poll", New: t})
 	}
 	for _, ev := range moved {
+		ev.Name = TaskMoved
+		r.Fire(ev)
 		r.fireMoved(ev)
 	}
+	for _, ev := range changed {
+		ev.Name = TaskChanged
+		r.Fire(ev)
+	}
+}
+
+// sameTask reports whether two versions of a task hold the same data. The
+// claim bookkeeping (lease, claimed_at) and the overlay marks are not a change
+// somebody made, so a lease renewal fires nothing.
+func sameTask(a, b task.Task) bool {
+	a.Lease, b.Lease, a.ClaimedAt, b.ClaimedAt = "", "", "", ""
+	a.Overlaid, b.Overlaid = nil, nil
+	ja, _ := json.Marshal(a) // map keys marshal sorted
+	jb, _ := json.Marshal(b)
+	return string(ja) == string(jb)
 }
 
 // fingerprint tells two tasks with one ID apart: the title, plus the created
@@ -834,7 +905,7 @@ func (r *Runner) Diff(before, after []task.Task, own map[string]bool, skip map[s
 func fingerprint(t task.Task) string { return t.Title + "\x00" + t.Extra["created"] }
 
 // DedupeDir is where dedupe markers live, in the config directory.
-const DedupeDir = ".tkan-dedupe"
+const DedupeDir = ".tack-dedupe"
 
 // dedupeTTL is how long a marker holds; older ones are pruned so the same
 // task can fire again later.
@@ -842,23 +913,26 @@ const dedupeTTL = 10 * time.Minute
 
 // claim reports whether this process may run s for ev: with dedupe on a poll
 // event it creates a marker file with O_EXCL, and another process that already
-// created it wins. Errors other than "exists" let the event through.
-func (r *Runner) claim(s *Spec, ev Event, t task.Task) bool {
+// created it wins. Errors other than "exists" let the event through. marker is
+// the file this call created ("" when none), for the caller to remove if the
+// event is then dropped by a limit, so that another process can still run it.
+func (r *Runner) claim(s *Spec, ev Event, t task.Task) (marker string, ok bool) {
 	if !s.Dedupe || (ev.Name != TaskAppeared && ev.Name != TaskDisappeared) {
-		return true
+		return "", true
 	}
 	dir := filepath.Join(r.baseDir, DedupeDir)
 	r.prune(dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return true
+		return "", true
 	}
 	h := sha256.Sum256([]byte(strings.Join([]string{s.Name, ev.Name, t.Backend, t.ID, fingerprint(t)}, "\x00")))
-	f, err := os.OpenFile(filepath.Join(dir, hex.EncodeToString(h[:16])), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	path := filepath.Join(dir, hex.EncodeToString(h[:16]))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err == nil {
 		f.Close()
-		return true
+		return path, true
 	}
-	return !os.IsExist(err)
+	return "", !os.IsExist(err)
 }
 
 // prune removes markers older than dedupeTTL, at most once a minute.
@@ -901,6 +975,9 @@ func eventJSON(ev Event, t task.Task) string {
 	}
 	return string(b) + "\n"
 }
+
+// EventJSON is the event as the hooks' `stdin: event` gets it: one JSON line.
+func EventJSON(ev Event) string { return eventJSON(ev, ev.subject()) }
 
 // eventMarkdown is stdin: event-markdown: the event as a list (empty fields
 // left out), a blank line, then the task as stdin: markdown renders it.

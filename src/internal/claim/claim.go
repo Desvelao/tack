@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/task"
 )
 
 // Holder says who holds t at now. A task with an assignee is held, for good
@@ -64,8 +64,9 @@ func Claim(t task.Task, r Request, now time.Time) (task.Task, Guard, error) {
 	switch {
 	case holder == "":
 		g = Guard{"assignee", t.Assignee}
-	case holder == agent:
+	case strings.EqualFold(holder, agent):
 		g = Guard{"assignee", t.Assignee}
+		agent = holder // names match ignoring case; keep the stored spelling
 	case held:
 		return t, Guard{}, fmt.Errorf("%w: %s:%s is claimed by %s%s", backend.ErrPrecondition, t.Backend, t.ID, holder, untilText(until))
 	default: // the lease ran out: take it over
@@ -89,15 +90,17 @@ func Claim(t task.Task, r Request, now time.Time) (task.Task, Guard, error) {
 // Release returns t without its claim (assignee and lease cleared, moved to
 // status unless that is "") and the guard for the write. Only agent may
 // release its own claim; with force anybody may, guarded on the current
-// assignee. changed is false when t holds no claim and no move is asked: then
+// assignee. A leftover lease or claimed_at with no assignee is cleared by anybody. changed is false when t holds no claim and no move is asked: then
 // there is nothing to write.
 func Release(t task.Task, agent string, force bool, status string) (out task.Task, g Guard, changed bool, err error) {
 	holder := strings.TrimSpace(t.Assignee)
 	agent = strings.TrimSpace(agent)
+	// A lease or claimed_at without an assignee is a leftover nobody holds.
+	orphan := holder == "" && (strings.TrimSpace(t.Lease) != "" || strings.TrimSpace(t.ClaimedAt) != "")
 	switch {
-	case holder == "" && strings.TrimSpace(t.Lease) == "" && (status == "" || status == t.Status):
+	case holder == "" && !orphan && (status == "" || status == t.Status):
 		return t, Guard{}, false, nil
-	case !force && holder != agent:
+	case !force && !orphan && !strings.EqualFold(holder, agent):
 		if holder == "" {
 			return t, Guard{}, false, fmt.Errorf("%w: %s:%s is not claimed by %s", backend.ErrPrecondition, t.Backend, t.ID, agent)
 		}

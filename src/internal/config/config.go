@@ -1,4 +1,4 @@
-// Package config loads tkan.yaml: the list of backends (type, name, options)
+// Package config loads tack.yaml: the list of backends (type, name, options)
 // and how raw statuses map to board columns.
 package config
 
@@ -16,23 +16,24 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/action"
-	"tkan/internal/actionlog"
-	"tkan/internal/audit"
-	"tkan/internal/backend"
-	"tkan/internal/board"
-	"tkan/internal/hook"
-	"tkan/internal/query"
+	"tack/internal/action"
+	"tack/internal/actionlog"
+	"tack/internal/audit"
+	"tack/internal/backend"
+	"tack/internal/backend/overlay"
+	"tack/internal/board"
+	"tack/internal/hook"
+	"tack/internal/query"
 )
 
 // DefaultFile is looked up in the working directory when no config is given.
-const DefaultFile = "tkan.yaml"
+const DefaultFile = "tack.yaml"
 
 // ConfigNames are the file names Locate accepts in each directory, in priority order.
-var ConfigNames = []string{".tkan.yaml", ".tkan.yml", DefaultFile, "tkan.yml"}
+var ConfigNames = []string{".tack.yaml", ".tack.yml", DefaultFile, "tack.yml"}
 
 // HomeConfigNames are the names looked up in the home directory.
-var HomeConfigNames = []string{".tkan.yaml", ".tkan.yml"}
+var HomeConfigNames = []string{".tack.yaml", ".tack.yml"}
 
 // Entry is one item of the `backend:` list.
 type Entry struct {
@@ -43,23 +44,26 @@ type Entry struct {
 	// Disabled keeps the entry in the file but skips it: it is validated, not
 	// opened, and its actions and hooks are ignored.
 	Disabled bool `yaml:"disabled,omitempty"`
+	// Overlay keeps some task fields (`claims`: assignee, lease, claimed_at) in
+	// a local file instead of the store, for a store that cannot hold them.
+	Overlay *Overlay `yaml:"overlay,omitempty"`
 	// Actions and Hooks apply to this backend's tasks only, besides the
 	// top-level ones; one with the name of a top-level one replaces it here.
 	Actions []action.Spec `yaml:"actions,omitempty"`
 	Hooks   []hook.Spec   `yaml:"hooks,omitempty"`
 }
 
-// Config is the parsed tkan.yaml.
+// Config is the parsed tack.yaml.
 type Config struct {
 	Backends []Entry    `yaml:"backend"`
 	Board    board.Spec `yaml:"board"`
 	// DefaultBackend names the backend used when a command gets no -b (and
-	// `add` creates there); $TKAN_BACKEND overrides it. Default: none, i.e.
+	// `add` creates there); $TACK_BACKEND overrides it. Default: none, i.e.
 	// the first backend for add and a search through all for IDs.
 	DefaultBackend string `yaml:"default_backend,omitempty"`
 	// Audit configures the audit trail of reloads and writes.
 	Audit AuditSpec `yaml:"audit"`
-	// Actions are commands the TUI picker and `tkan run` start on a task
+	// Actions are commands the TUI picker and `tack run` start on a task
 	// (every backend; see also Entry.Actions and AllActions).
 	Actions []action.Spec `yaml:"actions"`
 	// ActionMaxParallel is how many runs go at once when the board starts an
@@ -68,7 +72,7 @@ type Config struct {
 	// Hooks are commands started by events (task written, reload, action
 	// ended); see internal/hook. Entry.Hooks and AllHooks as for Actions.
 	Hooks []hook.Spec `yaml:"hooks"`
-	// HookMaxDepth is how deep hooks may chain: 1 (default) means a tkan
+	// HookMaxDepth is how deep hooks may chain: 1 (default) means a tack
 	// started by a hook fires nothing; at most hook.HardMaxDepth.
 	HookMaxDepth int `yaml:"hook_max_depth,omitempty"`
 	// HookMaxParallel caps the hook runs at once over all hooks (0 = unlimited,
@@ -198,6 +202,11 @@ func (c *Config) nameEntries() error {
 		if e.Type == "" {
 			return fmt.Errorf("backend[%d]: type or command is required (supported types: %s)", i+1, strings.Join(backend.Supported(), ", "))
 		}
+		if e.Overlay != nil {
+			if err := e.Overlay.check(); err != nil {
+				return fmt.Errorf("backend[%d]: %w", i+1, err)
+			}
+		}
 		e.Name = strings.TrimSpace(e.Name)
 		if e.Name == "" {
 			e.Name = e.Type + strconv.Itoa(i+1)
@@ -257,9 +266,9 @@ func (c *Config) ActionParallel() int {
 // Dir is the directory relative paths in the config resolve against.
 func (c *Config) Dir() string { return filepath.Dir(c.Path) }
 
-// Locate picks the config file: the explicit path (-c / $TKAN_CONFIG), else
-// the first of ConfigNames in the working directory, else ~/.tkan.yaml or
-// ~/.tkan.yml (HomeConfigNames).
+// Locate picks the config file: the explicit path (-c / $TACK_CONFIG), else
+// the first of ConfigNames in the working directory, else ~/.tack.yaml or
+// ~/.tack.yml (HomeConfigNames).
 func Locate(explicit string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
@@ -272,7 +281,7 @@ func Locate(explicit string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("no config: pass -c FILE, set $TKAN_CONFIG, or create %s (or %s) in this directory, or ~/%s (or ~/%s) (try `tkan init`)", ConfigNames[0], strings.Join(ConfigNames[1:], ", "), HomeConfigNames[0], HomeConfigNames[1])
+	return "", fmt.Errorf("no config: pass -c FILE, set $TACK_CONFIG, or create %s (or %s) in this directory, or ~/%s (or ~/%s) (try `tack init`)", ConfigNames[0], strings.Join(ConfigNames[1:], ", "), HomeConfigNames[0], HomeConfigNames[1])
 }
 
 // findIn returns the first existing file of names in dir.
@@ -309,6 +318,17 @@ func (c *Config) open(lazy bool) (*backend.Set, error) {
 				it.Backend.Close()
 			}
 			return nil, fmt.Errorf("backend %s: %w", e.Name, err)
+		}
+		if e.Overlay != nil {
+			ob, err := overlay.Wrap(be, e.Overlay.path(c.Dir(), e.Name), e.Overlay.Fields)
+			if err != nil {
+				be.Close()
+				for _, it := range items {
+					it.Backend.Close()
+				}
+				return nil, fmt.Errorf("backend %s: %w", e.Name, err)
+			}
+			be = ob
 		}
 		items = append(items, backend.Named{Name: e.Name, Type: e.Type, Backend: be})
 	}

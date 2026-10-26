@@ -5,7 +5,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 // pair is a colour with a 256-colour value and an ANSI-16 fallback for each

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"unicode"
 
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 // CompareBy orders two records by keys: negative when a sorts before b.

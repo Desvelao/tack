@@ -11,8 +11,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tkan/internal/backend"
-	"tkan/internal/board"
+	"tack/internal/backend"
+	"tack/internal/board"
 )
 
 // asyncModel is an interactive (NewAsync) board with its single backend loaded.
@@ -153,5 +153,52 @@ func TestColumnShowsWindowAroundSelection(t *testing.T) {
 	m.row = 0
 	if v := m.View(); !strings.Contains(v, "#1 Task 1") || strings.Contains(v, "#301 Task 301") || !strings.Contains(v, "↓ ") {
 		t.Fatalf("top of the column:\n%s", v)
+	}
+}
+
+func quits(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	_, ok := cmd().(tea.QuitMsg)
+	return ok
+}
+
+// q waits for a write that is still running: quitting would lose it.
+func TestQuitWaitsForPendingWrite(t *testing.T) {
+	m, _, _ := asyncModel(t, "1,Alpha,,pending,\n")
+	m, cmd := keyCmd(m, "L")
+	m, q := keyCmd(m, "q")
+	if quits(q) || !strings.Contains(m.notice, "still saving") {
+		t.Fatalf("q should wait for the write: quit=%v notice=%q", quits(q), m.notice)
+	}
+	m = doneWrite(t, m, cmd)
+	if _, q = keyCmd(m, "q"); !quits(q) {
+		t.Fatal("q should quit once the write is done")
+	}
+}
+
+// The first ctrl+c warns while a write is pending, the second quits anyway.
+func TestCtrlCTwiceQuitsDuringWrite(t *testing.T) {
+	m, _, _ := asyncModel(t, "1,Alpha,,pending,\n")
+	m, _ = keyCmd(m, "L")
+	nm, first := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = nm.(Model)
+	if quits(first) || !strings.Contains(m.notice, "still saving") {
+		t.Fatalf("first ctrl+c should warn: quit=%v notice=%q", quits(first), m.notice)
+	}
+	if _, second := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); !quits(second) {
+		t.Fatal("second ctrl+c should quit")
+	}
+}
+
+// With nothing pending, q and ctrl+c quit at once.
+func TestQuitWhenIdle(t *testing.T) {
+	m, _, _ := asyncModel(t, "1,Alpha,,pending,\n")
+	if _, q := keyCmd(m, "q"); !quits(q) {
+		t.Fatal("q should quit")
+	}
+	if _, c := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); !quits(c) {
+		t.Fatal("ctrl+c should quit")
 	}
 }

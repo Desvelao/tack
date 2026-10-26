@@ -8,9 +8,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tkan/internal/backend"
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 // spinEvery is the tick while a backend is loading, so its spinner turns.

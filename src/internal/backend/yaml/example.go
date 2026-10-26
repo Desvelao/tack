@@ -4,8 +4,8 @@ import (
 	"os"
 	"strings"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/filestore"
+	"tack/internal/backend"
+	"tack/internal/backend/filestore"
 )
 
 func init() { backend.RegisterExample("yaml", example) }

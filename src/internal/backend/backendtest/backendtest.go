@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/claim"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/claim"
+	"tack/internal/task"
 )
 
 // CheckPatch is the two-writer scenario: reader lists the first task, writer
@@ -66,7 +66,7 @@ func CheckPatch(t *testing.T, reader, writer backend.Backend, touch func()) {
 }
 
 // CheckConcurrentWriters runs n handles on one store (each in its own
-// goroutine, as separate tkan processes would) that each create `each` tasks,
+// goroutine, as separate tack processes would) that each create `each` tasks,
 // retitle every one of them and delete every third, then checks: unique IDs, no
 // lost task, every retitle kept, no temporary files left in dir, and no
 // leftover lock file blocking the next writer. open returns a new handle on
@@ -132,7 +132,7 @@ func CheckConcurrentWriters(t *testing.T, open func() backend.Backend, dir strin
 			t.Errorf("task %s was lost", id)
 		}
 	}
-	if tmp, _ := filepath.Glob(filepath.Join(dir, ".tkan-*.tmp")); len(tmp) > 0 {
+	if tmp, _ := filepath.Glob(filepath.Join(dir, ".tack-*.tmp")); len(tmp) > 0 {
 		t.Errorf("leftover temporary files: %v", tmp)
 	}
 	// Lock files stay (they are the lock), but without a holder they block nobody.
@@ -152,7 +152,7 @@ func CheckConcurrentWriters(t *testing.T, open func() backend.Backend, dir strin
 }
 
 // CheckCompareAndSet is the claim race: every handle (separate handles on one
-// store, each in its own goroutine, as separate tkan processes would be) tries
+// store, each in its own goroutine, as separate tack processes would be) tries
 // to move the first task from its current status to a status of its own, with
 // backend.WithExpect. Exactly one must win, the others get ErrPrecondition,
 // and the store holds the winner's status. It runs once with Update and, when
@@ -235,7 +235,7 @@ func (s handleStore) Stores(_, field string) bool {
 	return true
 }
 
-// CheckClaimRace races every handle (as separate tkan processes would) to
+// CheckClaimRace races every handle (as separate tack processes would) to
 // claim the first task with a lease, twice: while it is free, then after the
 // winner's lease ran out (a takeover, guarded on the lease). Each time exactly
 // one must win, the others get ErrPrecondition, and the store holds the

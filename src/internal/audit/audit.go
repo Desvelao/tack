@@ -1,4 +1,4 @@
-// Package audit records what tkan did (reloads and writes) in memory and,
+// Package audit records what tack did (reloads and writes) in memory and,
 // when configured, in a .jsonl or .csv file shared by every run. Entries are
 // filtered with the query language of internal/query.
 package audit
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tkan/internal/backend/filestore"
-	"tkan/internal/query"
+	"tack/internal/backend/filestore"
+	"tack/internal/query"
 )
 
 // Operations and results recorded in Entry.
@@ -28,7 +29,7 @@ const (
 	OpDelete = "delete"
 	OpReload = "reload"
 	OpRun    = "run"    // a configured action was started on a task
-	OpReport = "report" // an agent reported on a task (`tkan report`)
+	OpReport = "report" // an agent reported on a task (`tack report`)
 
 	// OpHookPrefix starts the op of a hook run; the event follows it
 	// (see HookOp), so `op:hook` finds every hook and
@@ -85,17 +86,21 @@ type Entry struct {
 // Log collects the entries of this run (a "session") and, with a file, reads
 // the ones earlier runs left there.
 type Log struct {
-	mu      sync.Mutex
-	path    string // "" = memory only
-	maxSize int64  // bytes; the file is rotated to path+".1" past it (0 = never)
-	csv     bool
-	session string
-	source  string
-	own     []Entry // this session, oldest first
-	others  []Entry // other sessions, from the file
-	stamp   [2]int64
-	loaded  bool
-	werr    error // first write failure, reported once through Err
+	mu       sync.Mutex
+	path     string // "" = memory only
+	maxSize  int64  // bytes; the file is rotated to path+".1" past it (0 = never)
+	csv      bool
+	session  string
+	source   string
+	own      []Entry         // this session, oldest first
+	others   []Entry         // other sessions, from the file
+	stamp    filestore.Stamp // of the file as last read
+	stamp1   filestore.Stamp // of FILE.1, the rotated half, as last read (zero: absent)
+	loaded   bool
+	werr     error   // first write failure, reported once through Err
+	merged   []Entry // others and own, oldest first; valid while mergedOK
+	mergedOK bool
+	gen      uint64 // counts the changes of the entries; see EntriesVersion
 }
 
 // New returns a log writing to path ("" keeps everything in memory). The
@@ -158,6 +163,7 @@ func (l *Log) Record(e Entry) {
 	if len(l.own) > maxMemory {
 		l.own = l.own[len(l.own)-maxMemory:]
 	}
+	l.changed()
 	if l.path == "" {
 		return
 	}
@@ -235,44 +241,82 @@ func (l *Log) appendFile(e Entry) error {
 // Entries returns every known entry, oldest first: the other sessions found
 // in the file (re-read when the file changed, so runs started meanwhile show
 // up) and this session's own.
+//
+// The slice is shared until the entries change; callers must not modify it.
 func (l *Log) Entries() ([]Entry, error) {
+	out, _, err := l.EntriesVersion()
+	return out, err
+}
+
+// EntriesVersion is Entries plus a number that changes whenever the entries do,
+// so a caller can keep what it derived from them (a rendered view of a trail
+// that grows without bound) until the number moves.
+func (l *Log) EntriesVersion() ([]Entry, uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var err error
 	if l.path != "" {
 		err = l.refresh()
 	}
-	out := make([]Entry, 0, len(l.others)+len(l.own))
-	out = append(out, l.others...)
-	out = append(out, l.own...)
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
-	return out, err
+	if !l.mergedOK {
+		out := make([]Entry, 0, len(l.others)+len(l.own))
+		out = append(out, l.others...)
+		out = append(out, l.own...)
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+		l.merged, l.mergedOK = out, true
+	}
+	return l.merged, l.gen, err
+}
+
+// changed drops the merged copy. l.mu is held.
+func (l *Log) changed() {
+	l.merged, l.mergedOK = nil, false
+	l.gen++
 }
 
 func (l *Log) refresh() error {
-	st, err := os.Stat(l.path)
-	if os.IsNotExist(err) {
-		l.others, l.loaded = nil, true
-		return nil
-	}
-	if err != nil {
+	// The stamp has the inode and change time next to mtime and size: a rotation
+	// that leaves a new file of the same size and mtime must not look unchanged.
+	stamp, err := filestore.StatFile(l.path)
+	missing := errors.Is(err, os.ErrNotExist)
+	if err != nil && !missing {
 		return err
 	}
-	stamp := [2]int64{st.ModTime().UnixNano(), st.Size()}
-	if l.loaded && stamp == l.stamp {
+	// FILE.1 (the half a rotation moved aside) is part of the trail too: without
+	// it the history would vanish at every rotation.
+	stamp1, err1 := filestore.StatFile(l.path + ".1")
+	if err1 != nil {
+		if !errors.Is(err1, os.ErrNotExist) {
+			return err1
+		}
+		stamp1 = filestore.Stamp{}
+	}
+	if l.loaded && stamp.Same(l.stamp) && stamp1.Same(l.stamp1) {
 		return nil
 	}
-	data, err := os.ReadFile(l.path)
-	if err != nil {
-		return err
-	}
-	l.others = l.others[:0:0]
-	for _, e := range parse(data, l.csv) {
-		if e.Session != l.session {
-			l.others = append(l.others, e)
+	var others []Entry
+	for _, f := range []struct {
+		path string
+		ok   bool
+	}{{l.path + ".1", err1 == nil}, {l.path, !missing}} { // oldest first
+		if !f.ok {
+			continue
+		}
+		data, err := os.ReadFile(f.path)
+		if errors.Is(err, os.ErrNotExist) { // rotated away since the stat
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, e := range parse(data, l.csv) {
+			if e.Session != l.session {
+				others = append(others, e)
+			}
 		}
 	}
-	l.stamp, l.loaded = stamp, true
+	l.others, l.stamp, l.stamp1, l.loaded = others, stamp, stamp1, true
+	l.changed()
 	return nil
 }
 

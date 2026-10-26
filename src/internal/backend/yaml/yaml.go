@@ -12,12 +12,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"tkan/internal/backend"
-	"tkan/internal/backend/filestore"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/backend/filestore"
+	"tack/internal/task"
 )
 
-func init() { backend.RegisterType("yaml", Open) } // no extension: .yaml is what tkan.yaml uses
+func init() { backend.RegisterType("yaml", Open) } // no extension: .yaml is what tack.yaml uses
 
 // Open opens the YAML file named by spec.
 func Open(spec backend.Spec) (backend.Backend, error) {
@@ -149,7 +149,7 @@ func setList(top *yaml.Node, path []string, seq *yaml.Node) {
 }
 
 // ListPaths lists the dotted paths of the lists of mappings in a YAML
-// document (mappings are followed up to four levels), for `tkan init`.
+// document (mappings are followed up to four levels), for `tack init`.
 func ListPaths(data []byte) []string {
 	_, top, err := root(data)
 	if err != nil || top == nil {
@@ -303,10 +303,150 @@ func valueNode(f filestore.Field) (*yaml.Node, error) {
 	return n, nil
 }
 
+// oldItem is a task mapping of the file being rewritten, kept so that a task
+// that did not change (or changed in a few fields) is written back with its
+// comments, anchors, quoting and key order.
+type oldItem struct {
+	node *yaml.Node
+	rec  filestore.Record
+	used bool
+}
+
+func hasAlias(n *yaml.Node) bool {
+	if n.Kind == yaml.AliasNode {
+		return true
+	}
+	for _, c := range n.Content {
+		if hasAlias(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// oldItems lists the plain task mappings of prev. An item that is an alias, has
+// an anchor, or uses an alias or a << merge key anywhere inside is left out:
+// it is rebuilt (flattened), because editing it in place would change what
+// the other items that share it mean.
+func (c *codec) oldItems(top *yaml.Node) []*oldItem {
+	if top == nil {
+		return nil
+	}
+	seq, err := taskList(top, c.path)
+	if err != nil || seq.Kind != yaml.SequenceNode {
+		return nil
+	}
+	var out []*oldItem
+	for _, n := range seq.Content {
+		if n.Kind != yaml.MappingNode || n.Anchor != "" || hasAlias(n) {
+			continue
+		}
+		rec, err := MappingRecord(n)
+		if err != nil {
+			continue
+		}
+		out = append(out, &oldItem{node: n, rec: rec})
+	}
+	return out
+}
+
+func sameRecord(a, b filestore.Record) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	by := make(map[string]filestore.Field, len(a))
+	for _, f := range a {
+		by[f.Key] = f
+	}
+	for _, f := range b {
+		if g, ok := by[f.Key]; !ok || g != f {
+			return false
+		}
+	}
+	return len(by) == len(a)
+}
+
+// itemFor returns the node to write for rec: the old mapping of the same task
+// when it is unchanged, that mapping with only the changed values replaced
+// when the task (same id) was edited, else a new mapping. A "<<" key
+// in the old mapping makes the edit rebuild it.
+func itemFor(old []*oldItem, rec filestore.Record) (*yaml.Node, error) {
+	for _, o := range old {
+		if !o.used && sameRecord(o.rec, rec) {
+			o.used = true
+			return o.node, nil
+		}
+	}
+	if len(rec) > 0 { // the id is the first field of a record
+		for _, o := range old {
+			if o.used || mappingGet(o.node, "<<") != nil {
+				continue
+			}
+			for _, f := range o.rec {
+				if f.Key == rec[0].Key && f.Text == rec[0].Text {
+					o.used = true
+					return editItem(o.node, o.rec, rec)
+				}
+			}
+		}
+	}
+	return RecordNode(rec)
+}
+
+// editItem replaces in n (whose fields are oldRec) the values that differ from
+// rec, drops the keys rec no longer has and appends the new ones.
+func editItem(n *yaml.Node, oldRec, rec filestore.Record) (*yaml.Node, error) {
+	want := make(map[string]filestore.Field, len(rec))
+	for _, f := range rec {
+		want[f.Key] = f
+	}
+	had := make(map[string]filestore.Field, len(oldRec))
+	for _, f := range oldRec {
+		had[f.Key] = f
+	}
+	out := *n
+	out.Content = nil
+	done := map[string]bool{}
+	for j := 0; j+1 < len(n.Content); j += 2 {
+		k, v := n.Content[j], n.Content[j+1]
+		f, ok := want[k.Value]
+		if !ok || done[k.Value] {
+			continue
+		}
+		done[k.Value] = true
+		if had[k.Value] != f {
+			nv, err := valueNode(f)
+			if err != nil {
+				return nil, err
+			}
+			nv.HeadComment, nv.LineComment, nv.FootComment = v.HeadComment, v.LineComment, v.FootComment
+			v = nv
+		}
+		out.Content = append(out.Content, k, v)
+	}
+	for _, f := range rec {
+		if done[f.Key] {
+			continue
+		}
+		nv, err := valueNode(f)
+		if err != nil {
+			return nil, err
+		}
+		out.Content = append(out.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: f.Key}, nv)
+	}
+	return &out, nil
+}
+
 func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
+	prev, bom := filestore.StripBOM(prev)
+	doc, top, err := root(prev)
+	if err != nil {
+		return nil, err
+	}
+	old := c.oldItems(top)
 	items := make([]*yaml.Node, 0, len(tasks))
 	for _, t := range tasks {
-		m, err := RecordNode(c.m.Record(t))
+		m, err := itemFor(old, c.m.Record(t))
 		if err != nil {
 			return nil, err
 		}
@@ -318,10 +458,6 @@ func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
 	}
 
 	// Keep the document around the list (comments, other keys) when there is one.
-	doc, top, err := root(prev)
-	if err != nil {
-		return nil, err
-	}
 	switch {
 	case top == nil && c.path != nil:
 		root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -361,5 +497,5 @@ func (c *codec) Encode(tasks []task.Task, prev []byte) ([]byte, error) {
 	if err := enc.Close(); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return filestore.WithBOM(buf.Bytes(), bom), nil
 }

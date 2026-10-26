@@ -5,10 +5,11 @@ package board
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
-	"tkan/internal/task"
+	"tack/internal/task"
 )
 
 // Modes for Spec.Unmapped.
@@ -28,6 +29,10 @@ type ColumnSpec struct {
 	Write  string   `yaml:"write,omitempty" json:"write,omitempty"`   // raw value written on move; default Values[0]
 	Limit  int      `yaml:"limit,omitempty" json:"limit,omitempty"`   // WIP limit: warn above this many cards; 0 = none
 	Color  string   `yaml:"color,omitempty" json:"color,omitempty"`   // header/selection colour: ANSI 0-255 or #rrggbb
+	// Finished says whether the column is an end state (work is over): tasks
+	// blocked by a card in it are unblocked and its cards are never overdue.
+	// Unset, the column name decides (Done, Closed, Released, ... see Finished).
+	Finished *bool `yaml:"finished,omitempty" json:"finished,omitempty"`
 	// Sort overrides board.sort inside this column (display only).
 	Sort []SortKey `yaml:"sort,omitempty" json:"-"`
 }
@@ -52,7 +57,7 @@ type Spec struct {
 	// highlights the cards assigned to one of them. Display only.
 	Agents []string `yaml:"agents,omitempty"`
 	// Avatars give an agent (a name as in Agents) the frames of its picture in
-	// the fleet view: emoji or short text, cycled while it is busy.
+	// the workers view: emoji or short text, cycled while it is busy.
 	Avatars map[string][]string `yaml:"avatars,omitempty"`
 }
 
@@ -91,6 +96,9 @@ type Column struct {
 	Color  string    `json:"color,omitempty" yaml:"color,omitempty"`
 	Sort   []SortKey `json:"-" yaml:"-"`
 	Extra  bool      `json:"extra,omitempty" yaml:"extra,omitempty"` // created for unmapped values
+	// Done is true for an end state: configured with `finished:`, else guessed
+	// from the name (Finished).
+	Done bool `json:"finished" yaml:"finished"`
 }
 
 // Board is the resolved, ordered set of columns.
@@ -130,10 +138,21 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("board.agents[%d]: name is empty", i)
 		}
 	}
-	for name, frames := range s.Avatars {
+	avatarNames := make([]string, 0, len(s.Avatars))
+	for name := range s.Avatars {
+		avatarNames = append(avatarNames, name)
+	}
+	sort.Strings(avatarNames) // a stable error when several entries are wrong
+	seenAvatar := map[string]string{}
+	for _, name := range avatarNames {
+		frames := s.Avatars[name]
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("board.avatars: agent name is empty")
 		}
+		if prev, dup := seenAvatar[key(name)]; dup { // names match ignoring case, so two would be ambiguous
+			return fmt.Errorf("board.avatars: %q and %q are the same agent (names are matched ignoring case)", prev, name)
+		}
+		seenAvatar[key(name)] = name
 		if len(frames) == 0 {
 			return fmt.Errorf("board.avatars.%s: needs at least one frame", name)
 		}
@@ -200,6 +219,13 @@ func (s Spec) Validate() error {
 			values[key(v)] = c.Name
 		}
 	}
+	// Lookup resolves a column name before a raw value, so a name that is also
+	// another column's value would send set-status somewhere else than the cards show.
+	for _, c := range s.Columns {
+		if owner := values[key(c.Name)]; owner != "" && key(owner) != key(c.Name) {
+			return fmt.Errorf("board.columns: column name %q is also a value of column %q", c.Name, owner)
+		}
+	}
 	return nil
 }
 
@@ -214,7 +240,10 @@ func New(s Spec, present []string) (Board, error) {
 	}
 	b := Board{byValue: map[string]valueRef{}}
 	for i, cs := range s.Columns {
-		c := Column{Name: cs.Name, Values: cs.Values, Write: cs.Write, Limit: cs.Limit, Color: strings.TrimSpace(cs.Color), Sort: cs.Sort}
+		c := Column{Name: cs.Name, Values: cs.Values, Write: cs.Write, Limit: cs.Limit, Color: strings.TrimSpace(cs.Color), Sort: cs.Sort, Done: Finished(cs.Name)}
+		if cs.Finished != nil {
+			c.Done = *cs.Finished
+		}
 		if len(c.Values) == 0 {
 			c.Values = []string{c.Name}
 		}
@@ -255,7 +284,7 @@ func New(s Spec, present []string) (Board, error) {
 				name = NoneName
 			}
 			b.byValue[k] = valueRef{len(b.Columns), raw}
-			b.Columns = append(b.Columns, Column{Name: b.freeName(name), Values: []string{raw}, Write: raw, Extra: true})
+			b.Columns = append(b.Columns, Column{Name: b.freeName(name), Values: []string{raw}, Write: raw, Extra: true, Done: Finished(name)})
 		}
 	}
 	return b, nil
@@ -348,7 +377,7 @@ var finishedNames = map[string]bool{
 }
 
 // Finished reports whether a column name looks like an end state (Done,
-// Closed, Released, ...). Used to avoid flagging finished cards as overdue.
+// Closed, Released, ...): the guess used for a column with no `finished:`.
 func Finished(name string) bool {
 	n := strings.NewReplacer(" ", "", "-", "", "_", "", "'", "").Replace(strings.ToLower(name))
 	return finishedNames[n]
@@ -357,20 +386,154 @@ func Finished(name string) bool {
 // Deps knows which tasks still block others (see Board.Deps). The zero value
 // knows nothing: Known is false and no task is blocked.
 type Deps struct {
-	open map[depKey]bool // every listed task -> true while it is not in a Finished column
+	open  map[depKey]bool     // every listed task -> true while it is not in a Finished column
+	edges map[depKey][]string // every listed task -> its blocked_by ids
 }
 
 type depKey struct{ backend, id string }
 
-// Deps records, for the listed tasks, which are finished: in a column whose
-// name Finished accepts (cards of hidden values count as not finished).
+// Deps records, for the listed tasks, which are finished: in a column that is
+// an end state (cards of hidden values count as not finished).
 func (b Board) Deps(tasks []task.Task) Deps {
-	d := Deps{open: make(map[depKey]bool, len(tasks))}
+	d := Deps{open: make(map[depKey]bool, len(tasks)), edges: map[depKey][]string{}}
 	for _, t := range tasks {
 		c := b.ColumnOf(t.Status)
-		d.open[depKey{t.Backend, t.ID}] = c < 0 || !Finished(b.Columns[c].Name)
+		k := depKey{t.Backend, t.ID}
+		d.open[k] = c < 0 || !b.Columns[c].Done
+		if ids := t.BlockedByList(); len(ids) > 0 {
+			d.edges[k] = ids
+		}
 	}
 	return d
+}
+
+// Cycle is a ring of open tasks that block one another (A blocked_by B,
+// B blocked_by A): none of them can ever become ready. Tasks lists the ids in
+// blocking order, each blocked by the next and the last by the first.
+type Cycle struct {
+	Backend string
+	Tasks   []string
+}
+
+// String is "A -> B -> A", with the backend in front of an id when there is one.
+func (c Cycle) String() string {
+	ref := func(id string) string {
+		if c.Backend == "" {
+			return id
+		}
+		return c.Backend + ":" + id
+	}
+	parts := make([]string, 0, len(c.Tasks)+1)
+	for _, id := range c.Tasks {
+		parts = append(parts, ref(id))
+	}
+	parts = append(parts, ref(c.Tasks[0]))
+	return strings.Join(parts, " -> ")
+}
+
+// Cycles lists the blocked_by cycles among the open tasks (a finished task
+// blocks nothing, so it breaks a ring). A task naming itself is not a cycle: it
+// is ignored (see Blockers). Each ring is reported once, starting at its
+// smallest id; the result is in a stable order.
+func (d Deps) Cycles() []Cycle {
+	var keys []depKey
+	for k := range d.edges {
+		if d.open[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].backend != keys[j].backend {
+			return keys[i].backend < keys[j].backend
+		}
+		return keys[i].id < keys[j].id
+	})
+	const (
+		unseen = iota
+		onPath
+		done
+	)
+	state := map[depKey]int{}
+	var path []string
+	var out []Cycle
+	seen := map[string]bool{}
+	var visit func(k depKey)
+	visit = func(k depKey) {
+		state[k] = onPath
+		path = append(path, k.id)
+		ids := append([]string(nil), d.edges[k]...)
+		sort.Strings(ids)
+		for _, id := range ids {
+			n := depKey{k.backend, id}
+			if id == k.id || !d.open[n] {
+				continue
+			}
+			switch state[n] {
+			case unseen:
+				visit(n)
+			case onPath:
+				i := len(path) - 1
+				for path[i] != id {
+					i--
+				}
+				ring := append([]string(nil), path[i:]...)
+				min := 0
+				for j := range ring {
+					if ring[j] < ring[min] {
+						min = j
+					}
+				}
+				ring = append(ring[min:], ring[:min]...)
+				if key := k.backend + "\x00" + strings.Join(ring, "\x00"); !seen[key] {
+					seen[key] = true
+					out = append(out, Cycle{Backend: k.backend, Tasks: ring})
+				}
+			}
+		}
+		path = path[:len(path)-1]
+		state[k] = done
+	}
+	for _, k := range keys {
+		if state[k] == unseen {
+			visit(k)
+		}
+	}
+	return out
+}
+
+// CycleOf returns a shortest cycle t takes part in, if it is on one: t blocked
+// by something that is, through open tasks, blocked by t.
+func (d Deps) CycleOf(t task.Task) (Cycle, bool) {
+	start := depKey{t.Backend, t.ID}
+	if !d.open[start] {
+		return Cycle{}, false
+	}
+	parent := map[string]string{} // id -> the id it was reached from
+	queue := []string{t.ID}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		ids := append([]string(nil), d.edges[depKey{t.Backend, id}]...)
+		sort.Strings(ids)
+		for _, next := range ids {
+			if next == id && id == t.ID {
+				continue // naming itself is ignored
+			}
+			if next == t.ID {
+				ring := []string{id}
+				for ring[0] != t.ID {
+					ring = append([]string{parent[ring[0]]}, ring...)
+				}
+				return Cycle{Backend: t.Backend, Tasks: ring}, true
+			}
+			if _, seen := parent[next]; seen || !d.open[depKey{t.Backend, next}] {
+				continue
+			}
+			parent[next] = id
+			queue = append(queue, next)
+		}
+	}
+	return Cycle{}, false
 }
 
 // Known reports whether d was built from a task list.

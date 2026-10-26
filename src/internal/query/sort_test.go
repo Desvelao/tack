@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 func order(tasks []task.Task, keys ...board.SortKey) string {

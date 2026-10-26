@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"tkan/internal/action"
+	"tack/internal/action"
 )
 
 // notify tells the user a background run of s ended, the way s.Notify asks:
@@ -20,7 +20,7 @@ func (m Model) notify(s action.Spec, text string) {
 		seq = "\a"
 	case action.NotifyDesktop:
 		text = strings.ReplaceAll(notifyText(text), ";", ",") // ; separates OSC 777 fields
-		seq = "\x1b]777;notify;tkan;" + text + "\a" + "\x1b]9;" + text + "\a"
+		seq = "\x1b]777;notify;tack;" + text + "\a" + "\x1b]9;" + text + "\a"
 	default:
 		return
 	}

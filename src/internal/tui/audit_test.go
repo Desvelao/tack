@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"tkan/internal/audit"
-	"tkan/internal/board"
+	"tack/internal/audit"
+	"tack/internal/board"
 )
 
 func auditModel(t *testing.T, file string) (Model, *audit.Log, string) {
@@ -91,7 +91,7 @@ func TestAuditViewOpensFiltersAndCloses(t *testing.T) {
 		t.Fatalf("mode %v", m.mode)
 	}
 	v := m.View()
-	for _, want := range []string{"tkan audit", "this session", "update", "delete", "2/2 entries"} {
+	for _, want := range []string{"tack audit", "this session", "update", "delete", "2/2 entries"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("missing %q:\n%s", want, v)
 		}
@@ -225,5 +225,27 @@ func TestAuditPromptHelpListsFieldsWithMeanings(t *testing.T) {
 	m = press(m, "esc")
 	if m.mode != modeAudit || !m.auditEditing {
 		t.Fatalf("back in the prompt expected: mode %v editing %v", m.mode, m.auditEditing)
+	}
+}
+
+func TestAuditViewReusesItsLinesUntilSomethingChanges(t *testing.T) {
+	m, l, _ := auditModel(t, "")
+	l.Record(audit.Entry{Op: "update", ID: "1", Details: "first"})
+	m.mode = modeAudit
+	if v := m.View(); !strings.Contains(v, "first") {
+		t.Fatalf("entry not shown:\n%s", v)
+	}
+	c := m.auditC
+	if !c.ok {
+		t.Fatal("nothing cached")
+	}
+	lines := c.lines
+	m.View()
+	if &c.lines[0] != &lines[0] {
+		t.Error("the lines were rendered again for an unchanged trail")
+	}
+	l.Record(audit.Entry{Op: "update", ID: "2", Details: "second"})
+	if v := m.View(); !strings.Contains(v, "second") {
+		t.Fatalf("new entry not shown:\n%s", v)
 	}
 }

@@ -10,8 +10,8 @@ import (
 )
 
 // LockFile takes an exclusive LockFileEx lock on the sidecar file path (created
-// if missing); it fails after timeout if another process keeps it. Compile-
-// checked only: it has not been run on Windows.
+// if missing); it fails after timeout if another process keeps it. The filestore tests
+// run on Windows in CI.
 func LockFile(path string, timeout time.Duration) (func(), error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -36,7 +36,7 @@ func LockFile(path string, timeout time.Duration) (func(), error) {
 		}
 		if time.Now().After(deadline) {
 			windows.CloseHandle(h)
-			return nil, fmt.Errorf("locked by another tkan for more than %s (%s)", timeout, path)
+			return nil, fmt.Errorf("locked by another tack for more than %s (%s)", timeout, path)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

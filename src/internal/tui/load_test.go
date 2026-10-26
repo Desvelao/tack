@@ -9,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tkan/internal/board"
-	"tkan/internal/task"
+	"tack/internal/board"
+	"tack/internal/task"
 )
 
 func writeCSV(t *testing.T, rows string) string {

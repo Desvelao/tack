@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"tkan/internal/action"
-	"tkan/internal/query"
-	"tkan/internal/task"
+	"tack/internal/action"
+	"tack/internal/query"
+	"tack/internal/task"
 )
 
 // Event names. A name with a .success / .fail (or .succeeded / .failed)
@@ -32,6 +32,7 @@ const (
 	TaskDeleteSuccess = "task.delete.success"
 	TaskDeleteFail    = "task.delete.fail"
 	TaskMoved         = "task.moved"
+	TaskChanged       = "task.changed"
 	TaskAppeared      = "task.appeared"
 	TaskDisappeared   = "task.disappeared"
 	TaskDue           = "task.due"
@@ -68,15 +69,16 @@ var events = []EventInfo{
 	{TaskDelete, "", true, "a task was deleted (success or failure)"},
 	{TaskDeleteSuccess, TaskDelete, true, "a task was deleted; the filter sees the task as it was"},
 	{TaskDeleteFail, TaskDelete, true, "deleting a task failed; {error} holds the reason"},
-	{TaskMoved, "", true, "an update changed the status; {old_status} is the previous one"},
+	{TaskMoved, "", true, "an update, or a change seen on a reload (made outside this run), changed the status; {old_status} is the previous one"},
+	{TaskChanged, "", true, "a reload found a task changed outside this run (any field); {old_json} is the previous version"},
 	{TaskAppeared, "", true, "a reload found a task that was not there before (made outside this run)"},
 	{TaskDisappeared, "", true, "a reload no longer finds a task (removed outside this run); the filter sees it as it was"},
-	{TaskDue, "", true, "a task that is not finished reached its due date or is overdue (TUI; once per task per day)"},
-	{ColumnWIPExceeded, "", false, "a column went over its WIP limit (TUI; once per excess); {column} is its name"},
+	{TaskDue, "", true, "a task that is not finished reached its due date or is overdue (TUI, watch; once per task per day)"},
+	{ColumnWIPExceeded, "", false, "a column went over its WIP limit (TUI, watch; once per excess); {column} is its name"},
 	{TaskEnteredPrefix + "COLUMN", "", true, "an update moved a task into the board column COLUMN; {column}, {old_column}, {new_status}"},
 	{TaskLeftPrefix + "COLUMN", "", true, "an update moved a task out of the board column COLUMN; {column}, {old_column}, {new_status}"},
-	{ReloadOK, "", false, "the board reloaded (TUI; every refresh)"},
-	{ReloadFail, "", false, "the board could not reload (TUI; once per distinct error); {error} holds it"},
+	{ReloadOK, "", false, "the board reloaded (TUI, watch; every refresh)"},
+	{ReloadFail, "", false, "the board could not reload (TUI, watch; once per distinct error); {error} holds it"},
 	{ActionStarted, "", true, "an action is about to start on a task; {action} is its name"},
 	{ActionFinished, "", true, "an action ended (success or failure)"},
 	{ActionSucceeded, ActionFinished, true, "an action ended without error"},
@@ -239,7 +241,7 @@ func (s Spec) WhenWarnings() []string {
 	return []string{"when: on task.delete.fail: the event often carries only the task id (the task could not be read), so a when: on other fields may never match"}
 }
 
-// TestEvent builds the event `tkan hooks test` fires for s on t: name ("" =
+// TestEvent builds the event `tack hooks test` fires for s on t: name ("" =
 // the first of on:, a parent event as its .success variant), the task as its
 // subject, oldStatus as the previous status of an update. A fail event gets
 // a made-up error.
@@ -279,7 +281,7 @@ func TestEvent(s *Spec, name string, t task.Task, oldStatus string) (Event, erro
 	switch name {
 	case TaskDeleteSuccess, TaskDeleteFail, TaskDisappeared:
 		ev.Old, ev.HasOld = t, true
-	case TaskUpdateSuccess, TaskMoved:
+	case TaskUpdateSuccess, TaskMoved, TaskChanged:
 		ev.Old, ev.HasOld, ev.New = t, true, t
 		if oldStatus != "" {
 			ev.Old.Status = oldStatus

@@ -47,7 +47,7 @@ func TaskFieldDocs(extra []string) []FieldDoc {
 
 // FieldsHelp renders the fields page: what each field is, then what a plain
 // word is matched against. It is one screen (24 rows, 80 columns) for the field
-// sets tkan has; Desc texts must stay under 60 characters.
+// sets tack has; Desc texts must stay under 60 characters.
 func FieldsHelp(title string, docs []FieldDoc, search []string) string {
 	if len(search) == 0 {
 		search = DefaultSearch

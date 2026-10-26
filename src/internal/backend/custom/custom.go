@@ -1,5 +1,5 @@
 // Package custom is a backend that delegates every operation to an external
-// command. tkan starts the command once per operation, writes one JSON
+// command. tack starts the command once per operation, writes one JSON
 // request to its stdin and reads one JSON response from its stdout.
 //
 //	{"op":"list"}                      -> {"tasks":[Task...], "statuses":["..."]}
@@ -8,7 +8,7 @@
 //	{"op":"delete","id":"7"}           -> {}
 //
 // Every request carries "version":1. An update made through backend.Patcher
-// (a move or edit from the board or `tkan edit`) also carries "base", the task as
+// (a move or edit from the board or `tack edit`) also carries "base", the task as
 // the caller read it; a command may write only the fields that differ between
 // base and task, so another writer's change to another field survives. An update made for a claim also carries
 // "expect":{"field":"assignee","value":""}: the command applies it only if the
@@ -19,7 +19,7 @@
 // {"error":"message","code":"..."}; code "not_found" (or exit status 3) maps to
 // "task not found", "unsupported" to "operation not supported" and
 // "precondition" to "precondition failed". Task is the JSON shape printed by
-// `tkan list -json` (id, title, description, status, priority, notes, type,
+// `tack list -json` (id, title, description, status, priority, notes, type,
 // assignee, due, start, labels, extra). IDs must be non-empty and unique within
 // one list. See docs/backends.md.
 package custom
@@ -37,9 +37,10 @@ import (
 	"sync"
 	"time"
 
-	"tkan/internal/backend"
-	"tkan/internal/proc"
-	"tkan/internal/task"
+	"tack/internal/backend"
+	"tack/internal/pathenv"
+	"tack/internal/proc"
+	"tack/internal/task"
 )
 
 func init() { backend.RegisterType("custom", Open) }
@@ -52,7 +53,7 @@ const (
 
 type options struct {
 	Command []string          `yaml:"command"`
-	Cwd     string            `yaml:"cwd"`
+	Workdir string            `yaml:"workdir"`
 	Timeout string            `yaml:"timeout"`
 	Poll    any               `yaml:"poll"`
 	Env     map[string]string `yaml:"env"`
@@ -107,7 +108,7 @@ type Backend struct {
 	seen     snapshot // what List last returned
 	hasSeen  bool
 	dirty    bool  // a poll saw something different from seen
-	writes   int   // successful writes by tkan itself
+	writes   int   // successful writes by tack itself
 	adopt    bool  // a write happened: the next poll refreshes seen without flagging
 	pollErr  error // the last poll failure, reported once
 	started  bool
@@ -141,8 +142,12 @@ func Open(spec backend.Spec) (backend.Backend, error) {
 		return nil, errors.New("custom: command is required (a list: program and arguments)")
 	}
 	b := &Backend{command: o.Command, dir: spec.BaseDir, timeout: defaultTimeout}
-	if o.Cwd != "" {
-		b.dir = spec.Resolve(o.Cwd)
+	if o.Workdir != "" {
+		w, err := pathenv.Expand(o.Workdir)
+		if err != nil {
+			return nil, fmt.Errorf("custom options: workdir: %w", err)
+		}
+		b.dir = spec.Resolve(w)
 	}
 	if o.Timeout != "" {
 		d, err := time.ParseDuration(o.Timeout)
@@ -260,11 +265,19 @@ func (b *Backend) List(ctx context.Context) ([]task.Task, error) {
 		return nil, err
 	}
 	b.mu.Lock()
-	b.statuses = snap.Statuses
-	b.guard, b.fields = snap.Guard, snap.Fields
+	b.takeMeta(snap)
 	b.seen, b.hasSeen, b.dirty, b.adopt = snap, true, false, false
 	b.mu.Unlock()
 	return snap.Tasks, nil
+}
+
+// takeMeta keeps what the command says about itself (statuses, whether it
+// guards writes, which fields it stores). The poller takes it too, so a command
+// that changes its answer is not trusted on the old one until the next List.
+// b.mu is held.
+func (b *Backend) takeMeta(snap snapshot) {
+	b.statuses = snap.Statuses
+	b.guard, b.fields = snap.Guard, snap.Fields
 }
 
 // fetch runs one `list` and validates the answer.
@@ -358,12 +371,14 @@ func (b *Backend) update(ctx context.Context, base *task.Task, t task.Task) erro
 	return err
 }
 
-// wrote records a successful write by tkan: the next poll adopts the new state
-// as seen instead of reporting it as an outside change.
+// wrote records a successful write by tack: the next poll adopts the new state
+// as seen instead of reporting it as an outside change. It also drops the list
+// Open primed, which no longer describes the store.
 func (b *Backend) wrote() {
 	b.mu.Lock()
 	b.writes++
 	b.adopt, b.dirty = true, false
+	b.primed, b.hasPrime = nil, false
 	b.mu.Unlock()
 }
 
@@ -434,8 +449,10 @@ func (b *Backend) pollLoop(ctx context.Context, done chan struct{}) {
 			// a write landed while this poll ran: it may predate it; ignore
 		case b.adopt:
 			b.seen, b.hasSeen, b.adopt = snap, true, false
+			b.takeMeta(snap)
 		case b.hasSeen && !reflect.DeepEqual(snap, b.seen):
 			b.dirty = true
+			b.takeMeta(snap)
 		}
 		b.mu.Unlock()
 	}

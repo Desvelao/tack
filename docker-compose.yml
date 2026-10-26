@@ -1,10 +1,10 @@
-name: tkan
+name: tack
 
 x-dev: &dev
   build:
     context: .
     target: dev
-  image: tkan-dev
+  image: tack-dev
   user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
   working_dir: /app/src
   volumes:
@@ -13,7 +13,7 @@ x-dev: &dev
     - gocache:/go-cache
 
 services:
-  # Interactive shell / TUI runs: `docker compose run --rm dev go run ./cmd/tkan /app/tasks.csv`
+  # Interactive shell / TUI runs: `docker compose run --rm dev go run ./cmd/tack /app/tasks.csv`
   dev:
     <<: *dev
     stdin_open: true
@@ -23,14 +23,15 @@ services:
     <<: *dev
     command: go test ./...
 
-  # Race detector over the packages that run goroutines (needs cgo, hence its own image).
+  # Race detector over every package, so a new one that starts goroutines is covered
+  # without editing this line (needs cgo, hence its own image).
   race:
     <<: *dev
     build:
       context: .
       target: race
-    image: tkan-race
-    command: go test -race ./internal/action ./internal/actionlog ./internal/audit ./internal/backend/... ./internal/proc ./internal/hook ./internal/tui ./cmd/tkan
+    image: tack-race
+    command: go test -race ./...
 
   # Static binary into ./bin. Cross-compile with GOOS/GOARCH/GOARM and OUT, see Makefile.
   build:
@@ -39,7 +40,7 @@ services:
       GOOS: ${GOOS:-linux}
       GOARCH: ${GOARCH:-amd64}
       GOARM: ${GOARM:-}
-    command: go build -trimpath -ldflags="-s -w -X main.version=${VERSION:-dev} -X main.buildDate=${BUILD_DATE:-}" -o /app/${OUT:-bin/tkan} ./cmd/tkan
+    command: go build -trimpath -ldflags="-s -w -X main.version=${VERSION:-dev} -X main.buildDate=${BUILD_DATE:-}" -o /app/${OUT:-bin/tack} ./cmd/tack
 
 volumes:
   gomod:
